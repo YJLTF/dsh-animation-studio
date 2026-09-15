@@ -3,15 +3,20 @@
  * 在真实 cordis Context + 真实 @deepseek-ai/dsh-tools 环境里把插件跑起来，
  * 验证 Config 校验、工具注册与 execute 调用链路。
  *
- * dsh 0.1.5-rc.2 起 session.append 按「无损 JSON」严格校验载荷：任何一个
- * 对象属性值是 undefined 都整条拒绝。这里在 ctx 上 provide 一个同样严格的
- * 伪 session 服务，验证插件的事件载荷（含缺省的 note / narration）能过得了
- * 这道关。
+ * 持久化模型（宿主 0.1.6-alpha.1 实证）：anim/* 事件绝不写宿主会话日志——
+ * 读回路径对未知事件类型 fail-closed（`SessionEvent.ignorable` 才放行），
+ * 而 `session.append` 不提供 ignorable 入口，写了整个会话拒读。事件落
+ * 插件自有的 sidecar JSONL（`<outputDir>/sessions/<sessionId>.jsonl`）。
+ * 这里验证：sidecar 落盘（含无损 JSON 严格校验）、宿主日志零污染、
+ * sidecar 优先恢复、宿主日志回退恢复（旧日志 + 修复脚本场景）。
  *
  * 前提：先 pnpm build。用法：node scripts/smoke-host.mjs
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 const { Context } = await import('@deepseek-ai/cordis')
 const { defineTool } = await import('@deepseek-ai/dsh-tools')
@@ -34,12 +39,26 @@ assert.ok(resolved.outputDir, 'Config 应为 outputDir 填默认值')
 assert.equal(typeof defineTool, 'function')
 assert.equal(typeof Schema.object, 'function')
 
-// ---- 伪 session 服务：模仿 dsh 0.1.5-rc.2 的无损 JSON 严格校验 ----
-// 真实现（@deepseek-ai/dsh-util-values 的 snapshotJsonValue）会在 append 现场
-// 抛错；这里复刻与插件相关的失败类别：undefined 属性值、函数、非有限数、稀疏数组。
+// ---- 伪会话 fixture：模仿 dsh Session 的形状；append 是禁止写入的金丝雀 ----
+// 一旦 sink 回退成写宿主会话日志（regression），append 抛错会让工具调用失败、
+// 冒烟当场红——比静默毒化真机日志好得多。
+function makeAgentSession(id, log = []) {
+  return {
+    id,
+    _log: log,
+    snapshotEvents() {
+      return this._log
+    },
+    append() {
+      throw new Error('金丝雀：anim/* 事件禁止写入宿主会话日志（会毒化读回）')
+    },
+  }
+}
+
+// 无损 JSON 校验（与 dsh 的 snapshotJsonValue 同一失败类别）：sidecar 行也走这套
 function assertLosslessJson(value, at = 'data') {
   if (value === null) return
-  if (value === undefined) throw new Error(`${at} 是 undefined：rc.2 的 session.append 会整条拒绝`)
+  if (value === undefined) throw new Error(`${at} 是 undefined：dsh 的无损 JSON 校验会整条拒绝`)
   if (typeof value === 'function' || typeof value === 'bigint' || typeof value === 'symbol') {
     throw new Error(`${at} 是 ${typeof value}，不可序列化`)
   }
@@ -52,39 +71,47 @@ function assertLosslessJson(value, at = 'data') {
     if (Object.getPrototypeOf(value) !== Array.prototype) throw new Error(`${at} 不是普通数组`)
     for (let i = 0; i < value.length; i++) {
       if (!Object.prototype.hasOwnProperty.call(value, i)) throw new Error(`${at}[${i}] 是空洞`)
-      assertLosslessJson(value[i], `${at}[${i}]`)
+      assertLosslessJson(value[i], `${at}[i]`)
     }
     return
   }
   if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
-    throw new Error(`${at} 不是普通对象（class 实例会被 rc.2 拒绝）`)
+    throw new Error(`${at} 不是普通对象（class 实例会被 dsh 拒绝）`)
   }
   for (const [k, v] of Object.entries(value)) assertLosslessJson(v, `${at}.${k}`)
 }
 
-const sessionLog = []
-const fakeSession = {
-  append(type, data) {
-    assertLosslessJson(data, `event ${type}.data`)
-    sessionLog.push({ type, data })
-    return { type, seq: sessionLog.length - 1, time: Date.now(), data }
-  },
+/** 读 sidecar 文件为事件数组，逐行做无损 JSON 校验。 */
+function readSidecar(sessionsDir, sessionId) {
+  const file = join(sessionsDir, `${sessionId}.jsonl`)
+  assert.ok(existsSync(file), `sidecar 应存在：${file}`)
+  return readFileSync(file, 'utf8')
+    .split('\n')
+    .filter(l => l.trim() !== '')
+    .map((line, i) => {
+      const ev = JSON.parse(line)
+      assertLosslessJson(ev.data, `sidecar[${i}] ${ev.type}.data`)
+      return ev
+    })
 }
 
-// ---- 伪 tools 服务：记录注册的定义，模仿 dsh 的 ToolRegistry 契约 ----
-const registered = []
-const fakeTools = {
+// ---- 挂载：outputDir 指向临时目录（apply 由此派生 sessionsDir）----
+const tmpRoot = mkdtempSync(join(tmpdir(), 'dsh-anim-smoke-'))
+const sessionsDir = resolve(tmpRoot, 'sessions')
+
+const fakeToolsFor = sink => ({
   register(definition) {
-    registered.push(definition)
+    sink.push(definition)
     return () => {}
   },
-}
+})
 
+const registered = []
 const ctx = new Context()
-ctx.provide('tools', fakeTools)
-ctx.provide('session', fakeSession)
+ctx.provide('tools', fakeToolsFor(registered))
+// 注意：不提供 ctx.session——真机形态
 try {
-  await ctx.plugin(plugin, {}) // Fiber & PromiseLike：await 即等待启动完成
+  await ctx.plugin(plugin, { outputDir: tmpRoot }) // Fiber & PromiseLike：await 即等待启动完成
 } catch (err) {
   console.error('插件挂载失败：', err)
   process.exit(1)
@@ -104,10 +131,11 @@ assert.deepEqual(names, [
 ])
 console.log(`  ✔ 插件挂载成功，${names.length} 个 anim_* 工具已注册`)
 
-// ---- 走一遍 create → plan → draft → patch → undo → get 的 execute 链路 ----
-// 事件全部落进严格校验的伪 session：载荷里若混进 undefined 属性值（rc.2 拒绝
-// 的形态），append 当场抛错、冒烟失败。
-const exec = { signal: new AbortController().signal }
+// ---- create → plan → draft → patch → undo → get：事件全部落 sidecar ----
+// 载荷里若混进 undefined 属性值（dsh 无损 JSON 校验拒绝的形态），逐行校验
+// 当场失败；若 sink 回退写宿主会话日志，金丝雀 append 当场炸。
+const agentSession = makeAgentSession('sess-main')
+const exec = { signal: new AbortController().signal, agent: { session: agentSession } }
 const byName = Object.fromEntries(registered.map(d => [d.name, d]))
 
 const created = await byName['anim_create_spec'].execute(
@@ -116,8 +144,8 @@ const created = await byName['anim_create_spec'].execute(
 )
 assert.equal(created.specId, 'smoke')
 
-// 大纲条目故意不带 narration：老代码会留下 narration: undefined 属性值，
-// 在 rc.2 的严格 append 下整条炸掉——这条断言就是防回归的
+// 大纲条目故意不带 narration：老代码会留下 narration: undefined 属性值——
+// 这条断言就是防回归的
 const planned = await byName['anim_plan'].execute(
   {
     specId: 'smoke',
@@ -158,51 +186,44 @@ const got = await byName['anim_get'].execute({ specId: 'smoke', path: '/scenes/0
 assert.equal(got.value, '你好')
 console.log('  ✔ create → plan → draft → patch → undo → get 执行链路通过')
 
-// 事件流的形状也要对：类型齐全、按序落盘
-assert.deepEqual(sessionLog.map(e => e.type), [
+// sidecar 的形状：类型齐全、按序落盘、宿主日志零污染
+const sidecar = readSidecar(sessionsDir, 'sess-main')
+assert.deepEqual(sidecar.map(e => e.type), [
   'anim/spec-created',
   'anim/outline-updated',
   'anim/spec-patched', // draft_scene
   'anim/spec-patched', // patch
   'anim/spec-patched', // undo
 ])
-assert.ok(!('narration' in sessionLog[1].data.outline[0]), '缺省 narration 不应留下 undefined 属性')
-assert.ok(!('note' in sessionLog[3].data), '省略的 note 不应留下 undefined 属性')
-console.log(`  ✔ ${sessionLog.length} 条 anim/* 事件通过 rc.2 无损 JSON 校验并落盘`)
+assert.ok(!('narration' in sidecar[1].data.outline[0]), '缺省 narration 不应留下 undefined 属性')
+assert.ok(!('note' in sidecar[3].data), '省略的 note 不应留下 undefined 属性')
+assert.equal(agentSession._log.length, 0, '宿主会话日志必须零 anim 事件（零污染）')
+console.log(`  ✔ ${sidecar.length} 条 anim/* 事件落 sidecar 并通过无损 JSON 校验，宿主日志零污染`)
 
-// anim_diagnose 会真正探测环境（浏览器/ffmpeg），只验证调用不抛
+// anim_diagnose 会真正探测环境（浏览器/ffmpeg），只验证调用不抛 + host 报告形状
 const diag = await byName['anim_diagnose'].execute({}, exec)
 assert.equal(typeof diag.ok, 'boolean')
-console.log(`  ✔ anim_diagnose 可调用（当前环境 ok=${diag.ok}）`)
+assert.equal(diag.host.sessionsDirConfigured, true, 'diagnose 应报告 sessionsDir 已配置')
+assert.equal(diag.host.agentSessionIdKnown, true, 'diagnose 应报告会话 id 已知')
+console.log(`  ✔ anim_diagnose 可调用（当前环境 ok=${diag.ok}），host 报告形状正确`)
 
-// ---- 会话恢复：新挂载从同一份日志 fold，旧 spec（连同撤销历史）应原样可用 ----
+// ---- 恢复（主路径）：新挂载 + 同一 sessionsDir，从 sidecar fold，旧 spec 原样可用 ----
 const registered2 = []
 const ctx2 = new Context()
-ctx2.provide('tools', {
-  register(definition) {
-    registered2.push(definition)
-    return () => {}
-  },
-})
-ctx2.provide('session', {
-  append(type, data) {
-    assertLosslessJson(data, `event ${type}.data`)
-    sessionLog.push({ type, data })
-  },
-  snapshotEvents: () => sessionLog,
-})
-await ctx2.plugin(plugin, {})
-
+ctx2.provide('tools', fakeToolsFor(registered2))
+await ctx2.plugin(plugin, { outputDir: tmpRoot })
 const byName2 = Object.fromEntries(registered2.map(d => [d.name, d]))
-const got2 = await byName2['anim_get'].execute({ specId: 'smoke', path: '/scenes/0/layers/0/props/text' }, exec)
-assert.equal(got2.value, '你好', '二次挂载应能读到重启前的 spec')
-// fold 重建的撤销历史也要可用
-const undone2 = await byName2['anim_undo'].execute({ specId: 'smoke' }, exec)
+// 只带 id 不带 snapshotEvents：逼出 sidecar 恢复路径
+const exec2 = { signal: new AbortController().signal, agent: { session: makeAgentSession('sess-main') } }
+const got2 = await byName2['anim_get'].execute({ specId: 'smoke', path: '/scenes/0/layers/0/props/text' }, exec2)
+assert.equal(got2.value, '你好', '二次挂载应能从 sidecar 读到重启前的 spec')
+// fold 重建的撤销历史也要可用；undo 事件继续落同一份 sidecar
+const undone2 = await byName2['anim_undo'].execute({ specId: 'smoke' }, exec2)
 assert.equal(undone2.applied, 1)
-assert.equal(sessionLog.at(-1).type, 'anim/spec-patched')
-console.log('  ✔ 会话恢复：二次挂载从事件流 fold 出 spec，撤销历史可用')
+assert.equal(readSidecar(sessionsDir, 'sess-main').at(-1).type, 'anim/spec-patched')
+console.log('  ✔ 会话恢复（sidecar）：二次挂载 fold 出 spec，撤销历史可用')
 
-// ---- 真机路径：宿主 ctx 没有 session 服务，落盘点是 exec.agent.session ----
+// ---- 恢复（回退路径）：宿主日志里的旧 anim/* 事件（修复脚本处理过的旧日志）----
 const legacySpec = {
   version: 1,
   meta: { id: 'legacy', title: '历史片', fps: 30, size: { width: 1280, height: 720 } },
@@ -213,56 +234,19 @@ const legacySpec = {
   assets: {},
   scenes: [],
 }
-const agentSession = {
-  id: 'session-agent-test',
-  _log: [{ type: 'anim/spec-created', data: { specId: 'legacy', spec: legacySpec } }],
-  snapshotEvents() {
-    return this._log
-  },
-  append(type, data) {
-    assertLosslessJson(data, `event ${type}.data`)
-    this._log.push({ type, data })
-    return { type, seq: this._log.length, time: Date.now(), data }
-  },
-}
-const execAgent = { signal: new AbortController().signal, agent: { session: agentSession } }
-
+const legacySession = makeAgentSession('sess-legacy', [
+  { type: 'anim/spec-created', data: { specId: 'legacy', spec: legacySpec } },
+])
 const registered3 = []
-const ctx3 = new Context() // 注意：不提供 session 服务——逼出 agent.session 正道
-ctx3.provide('tools', {
-  register(definition) {
-    registered3.push(definition)
-    return () => {}
-  },
-})
-await ctx3.plugin(plugin, {})
+const ctx3 = new Context()
+ctx3.provide('tools', fakeToolsFor(registered3))
+await ctx3.plugin(plugin, { outputDir: tmpRoot })
 const byName3 = Object.fromEntries(registered3.map(d => [d.name, d]))
-
-const created3 = await byName3['anim_create_spec'].execute({ specId: 'fresh', title: '新片' }, execAgent)
-assert.equal(created3.specId, 'fresh')
-assert.ok(
-  agentSession._log.some(e => e.type === 'anim/spec-created' && e.data.specId === 'fresh'),
-  '事件应落进 exec.agent.session（真机唯一落盘点）',
+const got3 = await byName3['anim_get'].execute(
+  { specId: 'legacy', path: '/meta/title' },
+  { signal: new AbortController().signal, agent: { session: legacySession } },
 )
-assert.ok(
-  !sessionLog.some(e => e.data?.specId === 'fresh'),
-  '无 agent 路径的日志不应混入新 spec 的事件',
-)
-console.log('  ✔ 真机落盘路径：exec.agent.session.append 收到 anim/* 事件')
-
-// 第四次挂载 + 同一个 agent.session：懒恢复应让旧 spec 直接可读
-const registered4 = []
-const ctx4 = new Context()
-ctx4.provide('tools', {
-  register(definition) {
-    registered4.push(definition)
-    return () => {}
-  },
-})
-await ctx4.plugin(plugin, {})
-const byName4 = Object.fromEntries(registered4.map(d => [d.name, d]))
-const got4 = await byName4['anim_get'].execute({ specId: 'legacy', path: '/meta/title' }, execAgent)
-assert.equal(got4.value, '历史片', '懒恢复应从 exec.agent.session 的历史里还原旧 spec')
-console.log('  ✔ 懒恢复：首次工具调用即从 agent 会话历史 fold 出旧 spec')
+assert.equal(got3.value, '历史片', 'sidecar 缺失时应回退到宿主日志里的 anim/* 事件')
+console.log('  ✔ 会话恢复（宿主日志回退）：sidecar 缺失时从 snapshotEvents fold 出旧 spec')
 
 console.log('\n宿主挂载冒烟通过')

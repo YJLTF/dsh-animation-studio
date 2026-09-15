@@ -5,6 +5,7 @@
  * 注册全部走 `ctx.effect`，插件卸载（含 HMR）时自动回滚。
  */
 
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import type { Context, Disposable } from '@deepseek-ai/cordis'
@@ -70,12 +71,12 @@ function probe(ctx: Context, key: string): unknown {
 }
 
 /**
- * 从会话事件流 fold 出工作台状态（spec 内容 + 撤销历史）。
+ * 挂载时从 ctx.session 的会话事件流 fold 出工作台状态（spec 内容 + 撤销历史）。
  *
- * dsh 是事件溯源的：`anim/*` 事件落在会话日志里，插件挂载（含宿主重启、会话
- * resume）时把历史读回来 fold 一遍，工具就能继续编辑重启前的 spec。读取走
- * `session.snapshotEvents()`（rc.2 的 Session 读 API），按结构探测——宿主侧
- * 类型不在本包的类型面上，拿不到就跳过（冒烟等无宿主环境照常工作）。
+ * 只对「ctx 上有 session 服务」的宿主形态 / 冒烟环境生效；真机的恢复走
+ * makeSessionHydrator 的按会话懒恢复（sidecar 优先，宿主日志里的旧
+ * anim/* 事件作回退）。读取走 `session.snapshotEvents()`，按结构探测——
+ * 宿主侧类型不在本包的类型面上，拿不到就跳过。
  */
 function restoreFromSession(ctx: Context, store: SpecStore): void {
   const session = probe(ctx, 'session') as { snapshotEvents?: () => unknown } | undefined
@@ -117,31 +118,54 @@ function restoreFromSession(ctx: Context, store: SpecStore): void {
 }
 
 /**
- * 按会话懒恢复：工具执行时从 `exec.agent.session` 把该会话日志里的 `anim/*`
- * 事件 fold 进 store（每会话只做一次）。
+ * 按会话懒恢复：工具执行时把该会话的 `anim/*` 事件 fold 进 store（每会话
+ * 只做一次）。事件来源两档：
+ * 1. **sidecar**（`<sessionsDir>/<sessionId>.jsonl`，主路径）——本插件写入
+ *    的事件文件，有则权威；
+ * 2. `exec.agent.session.snapshotEvents()`——宿主会话日志里的 `anim/*` 事件。
+ *    只对「插件曾以 session.append 落盘」的旧日志（修复脚本补过 ignorable
+ *    标记后可加载）生效；新写入不再产生这类事件。
  *
  * 为什么是懒恢复而不是挂载时恢复：宿主是「一个 profile 多个会话」的形态，
  * 插件挂载在根上下文、拿不到任何具体会话；而工具执行上下文天然带着当次
- * agent（`exec.agent.session`，真机正道）。第一次工具调用把该会话的历史
- * fold 进来，之后的变更经事件 sink 增量落盘，两边无缝衔接。
+ * agent（`exec.agent.session`）。第一次工具调用把该会话的历史 fold 进来，
+ * 之后的变更经事件 sink 增量落盘，两边无缝衔接。
  */
-export function makeSessionHydrator(store: SpecStore): (agent: unknown) => void {
+export function makeSessionHydrator(
+  store: SpecStore,
+  options: { sessionsDir?: string } = {},
+): (agent: unknown) => void {
   const hydrated = new Set<string>()
+  const fold = (events: Array<{ type: string; data: unknown }>): boolean => {
+    const animEvents = events.filter(e => typeof e.type === 'string' && e.type.startsWith('anim/'))
+    if (animEvents.length === 0) return false
+    store.adopt(foldEvents(animEvents))
+    return true
+  }
   return agent => {
     const session = (agent as { session?: { id?: unknown; snapshotEvents?: unknown } } | undefined)?.session
-    if (!session || typeof session.id !== 'string' || typeof session.snapshotEvents !== 'function') return
+    if (!session || typeof session.id !== 'string') return
     if (hydrated.has(session.id)) return
     hydrated.add(session.id)
     try {
-      const events = (session.snapshotEvents as () => unknown)() as unknown
-      if (!Array.isArray(events)) return
-      const animEvents = events
-        .filter((e): e is { type: string; data: unknown } => {
-          const t = (e as { type?: unknown } | null)?.type
-          return typeof t === 'string' && t.startsWith('anim/')
-        })
-        .map(e => ({ type: e.type, data: e.data }))
-      if (animEvents.length > 0) store.adopt(foldEvents(animEvents))
+      // 1. sidecar 优先：本插件的事件文件，行即事件
+      if (options.sessionsDir) {
+        const safeId = session.id.replace(/[^a-zA-Z0-9._-]/g, '_')
+        const file = resolve(options.sessionsDir, `${safeId}.jsonl`)
+        if (existsSync(file)) {
+          const events = readFileSync(file, 'utf8')
+            .split('\n')
+            .filter(line => line.trim() !== '')
+            .map(line => JSON.parse(line) as { type: string; data: unknown })
+          if (fold(events)) return
+          // sidecar 存在但为空/无 anim 事件：继续尝试会话日志（无损）
+        }
+      }
+      // 2. 宿主会话日志（旧日志回退路径）
+      if (typeof session.snapshotEvents === 'function') {
+        const events = (session.snapshotEvents as () => unknown)() as unknown
+        if (Array.isArray(events)) fold(events as Array<{ type: string; data: unknown }>)
+      }
     } catch {
       // 恢复失败不拖垮工具调用；store 以当前内存状态为准
     }
@@ -152,6 +176,10 @@ export function makeSessionHydrator(store: SpecStore): (agent: unknown) => void 
 
 export async function apply(ctx: Context, config: Partial<Config> = {}): Promise<void> {
   const outputDir = config.outputDir ?? DEFAULT_OUTPUT_DIR
+  // anim/* 事件的 sidecar 目录：本插件自有的事件溯源文件，按会话一文件。
+  // 放 outputDir 下不新增配置面；绝不写宿主会话日志（会毒化读回，见
+  // resolveEventSink 的注释）。
+  const sessionsDir = resolve(outputDir, 'sessions')
   const store = new SpecStore()
 
   // 恢复先于一切注册。真机上 ctx 没有 session 服务，这条探测不会命中——
@@ -161,12 +189,12 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
 
   const registry = new AnimRendererRegistry()
   const deps: AnimDeps = { store, renderers: registry, outputDir }
-  const hydrate = makeSessionHydrator(store)
+  const hydrate = makeSessionHydrator(store, { sessionsDir })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给
   // ctx.effect——那会被当成 effect body 立即调用，等于注册完马上注销。
-  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx), hydrate }))
+  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate }))
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
 }
 

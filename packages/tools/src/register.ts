@@ -11,6 +11,9 @@
  *    场合被调用，不能依赖任何运行时状态。
  */
 
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+
 import type { Context, Disposable } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
@@ -34,21 +37,20 @@ import {
 /**
  * 会话事件写入口。
  *
- * **真机事实（宿主 0.1.6-alpha.1 实证）**：ctx 上没有名为 `session` 的服务
- * （宿主各处都走 `ctx.sessions.get(id)` 注册表），挂载时探测 `ctx.session`
- * 必然失败——0.1.x 的实现因此在真机上从未落盘过一条事件。正道是工具执行
- * 上下文里的 `exec.agent.session`：agent 持有当次会话的活 Session，append
- * 进去的事件由持久化后端无条件写入日志（写入端按 `session/event` 全量收，
- * 不按词汇过滤）。
+ * **落盘主路径是插件自有的 sidecar JSONL**（`<sessionsDir>/<sessionId>.jsonl`，
+ * 按会话一文件、行即事件）。绝不写宿主会话日志（`session.append`）：dsh 的
+ * 读回路径对未知事件类型 fail-closed——除非记录带 `SessionEvent.ignorable: true`
+ * 信封，整个会话拒读（「likely written by a newer harness」）；而宿主
+ * 0.1.6-alpha.1 的 append API 不提供 ignorable 入口，写入 anim/* 事件等于
+ * 毒化该会话日志（真机事故：session-0ea61fc8 加载失败）。等宿主开放
+ * ignorable 写入后再评估切回。
  *
- * 因此 append 按**每次工具调用**动态解析落盘点，优先级：
- * 1. `exec.agent.session.append`——真机宿主，事件持久化、可恢复；
- * 2. ctx 上探测到的 `session.append`——冒烟环境 / 可能的旧式宿主；
- * 3. cordis 事件总线——仅进程内可见；
- * 4. 日志——最后的可见性兜底。
+ * 拿不到会话 id（冒烟环境）或 sidecar 写失败时按退路降级：
+ * 1. cordis 事件总线——仅进程内可见；
+ * 2. 日志——最后的可见性兜底。
  *
- * 载荷在边界上做深清理（跳过 undefined 属性值，无损 JSON 校验的拒绝形态），
- * 对四条退路统一生效。其余代码只认这个接口，不认具体实现。
+ * 载荷在边界上做深清理（跳过 undefined 属性值——无损 JSON 校验的拒绝形态），
+ * 对所有退路统一生效。其余代码只认这个接口，不认具体实现。
  *
  * 注意：cordis 的 Context 是代理，读取未 inject 的服务属性会直接抛错
  * （而不是返回 undefined），所以所有属性探测都必须裹进 try/catch。
@@ -94,28 +96,44 @@ function probeJobs(ctx: Context): AnimJobsService | undefined {
   return jobs && typeof jobs.start === 'function' ? (jobs as AnimJobsService) : undefined
 }
 
-export function resolveEventSink(ctx: Context): EventSink {
+/**
+ * 事件落盘选项：`sessionsDir` 是插件自有的事件 sidecar 目录
+ * （`<outputDir>/sessions/<sessionId>.jsonl`）。
+ */
+export interface EventSinkOptions {
+  sessionsDir?: string
+}
+
+export function resolveEventSink(ctx: Context, options: EventSinkOptions = {}): EventSink {
   // 工具调用是串行的（同一 agent 回合内），单个槽位即可让 append 拿到当次会话
   let currentAgent: unknown
+  let sessionsDirReady = false
   return {
     setAgent(agent) {
       currentAgent = agent
     },
     append(event) {
       const data = stripUndefined(event.data)
-      // 1. 当次会话的活 Session（真机持久化正道）
-      const agentSession = (currentAgent as { session?: { append?: unknown } } | undefined)?.session
-      if (typeof agentSession?.append === 'function') {
-        ;(agentSession.append as (type: string, data: unknown) => void).call(agentSession, event.type, data)
-        return
+      // 1. 插件自有 sidecar（真机持久化正道）。绝不写宿主会话日志：
+      //    dsh 读回路径对未知事件类型 fail-closed（`SessionEvent.ignorable`
+      //    才放行），而 `session.append` API 不提供 ignorable 入口——写了
+      //    anim/* 事件整个会话就拒读（真机事故：session-0ea61fc8）。
+      const sessionId = (currentAgent as { session?: { id?: unknown } } | undefined)?.session?.id
+      if (options.sessionsDir && typeof sessionId === 'string') {
+        try {
+          if (!sessionsDirReady) {
+            mkdirSync(options.sessionsDir, { recursive: true })
+            sessionsDirReady = true
+          }
+          const safeId = sessionId.replace(/[^a-zA-Z0-9._-]/g, '_')
+          const line = `${JSON.stringify({ type: event.type, time: Date.now(), data })}\n`
+          appendFileSync(join(options.sessionsDir, `${safeId}.jsonl`), line, 'utf8')
+          return
+        } catch {
+          /* sidecar 写失败退到总线/日志，工具调用不能被持久化拖垮 */
+        }
       }
-      // 2. ctx 上的 session 服务（冒烟环境）
-      const session = probe(ctx, 'session') as { append?(type: string, data: unknown): void } | undefined
-      if (typeof session?.append === 'function') {
-        session.append(event.type, data)
-        return
-      }
-      // 3/4. 事件总线 → 日志
+      // 2/3. 事件总线 → 日志（无 sessionsDir 或拿不到会话 id 时的降级）
       const emit = probe(ctx, 'emit') as ((name: string, payload?: unknown) => void) | undefined
       if (typeof emit === 'function') {
         emit.call(ctx, event.type, data)
@@ -186,7 +204,11 @@ function coerceJsonParam(value: unknown, label: string): unknown {
  * 宿主服务可见性报告：anim_diagnose 用它把「事件落盘 / 后台渲染在真机上
  * 到底走哪条路」变成可观测事实，而不是让我们对着回执猜。
  */
-function hostServiceReport(ctx: Context, exec: { agent?: unknown }): Record<string, unknown> {
+function hostServiceReport(
+  ctx: Context,
+  exec: { agent?: unknown },
+  sessionsDir: string | undefined,
+): Record<string, unknown> {
   const read = (obj: unknown, key: string): unknown => {
     try {
       return (obj as Record<string, unknown>)?.[key]
@@ -197,10 +219,11 @@ function hostServiceReport(ctx: Context, exec: { agent?: unknown }): Record<stri
   const jobs = read(ctx, 'jobs')
   const session = read(ctx, 'session')
   const sessions = read(ctx, 'sessions')
-  const agentSession = read(read(exec, 'agent'), 'session') as { append?: unknown; snapshotEvents?: unknown }
+  const agentSession = read(read(exec, 'agent'), 'session') as { id?: unknown }
   return {
-    // 落盘链路：真机应依赖 agent.session；sessionOnCtx 为 true 说明宿主提供了 ctx 级 session
-    agentSessionAppendable: typeof agentSession?.append === 'function' && typeof agentSession?.snapshotEvents === 'function',
+    // 落盘链路：sidecar 需要「目录已配置 + 当次会话 id 可读」两个条件
+    sessionsDirConfigured: typeof sessionsDir === 'string',
+    agentSessionIdKnown: typeof agentSession?.id === 'string',
     sessionOnCtx: typeof (session as { append?: unknown } | undefined)?.append === 'function',
     sessionsRegistryOnCtx: typeof (sessions as { get?: unknown } | undefined)?.get === 'function',
     // 后台渲染链路：jobsOnCtx 为 false 时渲染一律走同步回退
@@ -214,6 +237,11 @@ export interface RegisterOptions {
   deps: AnimDeps
   sink: EventSink
   /**
+   * 事件 sidecar 目录（`<outputDir>/sessions`）。配置后 anim/* 事件按会话
+   * 落 JSONL sidecar，绝不写宿主会话日志（见 resolveEventSink 内注释）。
+   */
+  sessionsDir?: string
+  /**
    * 每次工具调用前按当次 agent 做会话懒恢复（见 makeSessionHydrator）。
    * 省略则不做恢复（冒烟等无宿主环境）。
    */
@@ -222,7 +250,7 @@ export interface RegisterOptions {
 
 /** 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。 */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
-  const { deps, sink, hydrate } = options
+  const { deps, sink, sessionsDir, hydrate } = options
   const emit = (event: AnimEvent): void => sink.append(event)
   const disposers: Array<() => void> = []
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
@@ -256,7 +284,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       presentCall: () => ({ card: 'generic', title: '检查渲染环境', kind: 'read' }),
       async execute(args, exec) {
         const result = await opDiagnose(deps, args)
-        return { ...result, host: hostServiceReport(ctx, exec) } as never
+        return { ...result, host: hostServiceReport(ctx, exec, sessionsDir) } as never
       },
     }),
   )
