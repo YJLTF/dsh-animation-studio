@@ -166,6 +166,6 @@ node --import tsx scripts/debug-render.ts   # 输出帧数、帧目录与 debug-
 - 图层类型目前支持 `text / rect / circle / image`，`group` 预留未实现；不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
 - 会话事件的落盘桥（`resolveEventSink`）优先走 `session.append`，退到事件总线、再退到日志。dsh 0.1.5-rc.2 的 `session.append` 按「无损 JSON」严格校验载荷（任何 undefined 属性值整条拒绝），事件在边界上已做深清理并通过冒烟验证；但 `anim/*` 属于插件自有事件，不在 rc.2 的核心事件词汇表内，持久化信封上的 `ignorable` 标记由宿主侧负责——事件真正落盘仍需在真机 Web 会话里确认一次。
-- 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。
+- 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。渲染时会弹出一个**有头**浏览器窗口（headless 拿不到 WebGL），这是正常现象：窗口标题栏会实时显示渲染状态与进度（`视频渲染中 n/m 帧（p%）…`），渲染完成后自动关闭。
 - Windows 下离线 tgz 的存放路径不能包含空格（`dsh plugin add` 的转发限制），详见 offline-packager README。
 - `dsh plugin add` 在部分 Windows 环境会把 pnpm 转发给 cmd 执行；若 cmd 按 PATH 找不到 pnpm（本机实测出现过），直接在 profile 目录里 `pnpm add <插件路径>` 并把插件名写进 profile `package.json` 的 `dsh.profile.bundles` 即可。

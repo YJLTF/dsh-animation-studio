@@ -304,11 +304,33 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
             '--window-size=1600,900',
           ],
         })
-        const page = await browser.newPage()
+        // 复用启动时的首个空白页而不是 newPage()：窗口里只留一个标签页，
+        // 且标题在 vite 首次预打包的白屏阶段就能挂上去
+        const [page] = await browser.pages()
         await page.setViewport({ width: 1600, height: 900 })
         await page.bringToFront()
 
+        // 窗口标题就是给用户看的渲染状态条（有头窗口没法藏，索性说清楚
+        // 它在干什么）；标题更新失败绝不影响渲染本身
+        let lastTitleAt = 0
+        const setTitle = (text: string): void => {
+          // 包的 TS lib 无 DOM，document 经 globalThis 转型；函数体跑在浏览器里
+          void page.evaluate(t => {
+            (globalThis as unknown as { document: { title: string } }).document.title = t
+          }, text).catch(() => {})
+        }
+        const titleProgress = (done: number, total: number): void => {
+          onProgress?.(done, total)
+          const now = Date.now()
+          if (now - lastTitleAt < 500) return // 进度回调每帧都来，标题刷新限频
+          lastTitleAt = now
+          const pct = total > 0 ? Math.round((done / total) * 100) : 0
+          setTitle(`视频渲染中 ${done}/${total} 帧（${pct}%）…`)
+        }
+
+        setTitle('动画渲染启动中：正在加载 Motion Canvas 编辑器…')
         await page.goto(`http://localhost:${port}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
+        setTitle('编辑器加载中…')
         await page.waitForSelector('canvas', { timeout: 60_000 })
         await new Promise(r => setTimeout(r, 4000)) // 等编辑器完成场景加载
 
@@ -322,10 +344,12 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         })
         if (!clicked) throw new Error('找不到 Render 按钮——Motion Canvas 版本可能变了，请重新确认编辑器 UI')
 
+        setTitle('编辑器就绪，开始渲染…')
         // 注意顺序：先等帧、再定位帧目录。exporter 的输出子目录是在首帧落盘时
         // 才创建的，点完 Render 立刻找目录只会拿到空的 output 根目录——而等待
         // 用的 collectFrames 会递归扫一层子目录，帧再多也救不回早已定错的目录。
-        const count = await waitForFrames(rootDir, expectedFrames, timeoutMs, signal, onProgress)
+        const count = await waitForFrames(rootDir, expectedFrames, timeoutMs, signal, titleProgress)
+        setTitle(`帧渲染完成（${count} 帧），正在关闭浏览器…`)
         return { frameDir: findImageDir(rootDir), frameCount: count }
       } finally {
         await browser?.close()
