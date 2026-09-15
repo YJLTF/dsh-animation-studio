@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import type { Context, Disposable } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-import type { JsonValue, PatchOp } from '@dsh-anim/spec'
+import type { PatchOp } from '@dsh-anim/spec'
 
 import type { AnimEvent } from './events.ts'
 import type { AnimDeps, AnimJobsService } from './ops.ts'
@@ -156,6 +156,16 @@ function truncate(text: string): string {
 
 const text = (content: string) => [{ type: 'text', text: truncate(content) }] as never
 
+/** 容忍二次编码的 JSON 解析：不是字符串原样返回，解析失败返回 undefined。 */
+function jsonLike(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 把模型给的 ops 收敛成 PatchOp[]。
  * 不做盲转——bad op 早失败，比让 applyPatch 在第 7 条炸掉更容易让模型纠正。
@@ -246,22 +256,47 @@ export interface RegisterOptions {
    * 省略则不做恢复（冒烟等无宿主环境）。
    */
   hydrate?: (agent: unknown) => void
+  /** 渲染任务簿：渲染事件流过的同时记账，/dsh-anim/api/state 读它讲进度。 */
+  tracker?: { observe(event: AnimEvent): void }
+  /** 产物媒体索引：工具回执里出现过的文件路径才可被 /dsh-anim/media 服务。 */
+  media?: { add(path: string): void }
+}
+
+/**
+ * 回执媒体采集：结果对象里的 outputPath / frames[].path 全部进媒体索引。
+ * 放在工具包装层而不是 ops 层——新增一个返回产物的 op 时不用记得登记。
+ */
+function indexMediaFromResult(media: { add(path: string): void } | undefined, result: unknown): void {
+  if (!media || typeof result !== 'object' || result === null) return
+  const record = result as Record<string, unknown>
+  if (typeof record.outputPath === 'string') media.add(record.outputPath)
+  if (Array.isArray(record.frames)) {
+    for (const frame of record.frames) {
+      const path = (frame as { path?: unknown } | null)?.path
+      if (typeof path === 'string') media.add(path)
+    }
+  }
 }
 
 /** 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。 */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
   const { deps, sink, sessionsDir, hydrate } = options
-  const emit = (event: AnimEvent): void => sink.append(event)
+  const emit = (event: AnimEvent): void => {
+    sink.append(event)
+    options.tracker?.observe(event)
+  }
   const disposers: Array<() => void> = []
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
     // 单一收口：每个工具执行前注入当次 agent（事件 sink 与懒恢复都靠它定位会话）
     const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
     if (originalExecute) {
-      const wrapped = (args: never, exec: { agent?: unknown }): unknown => {
+      const wrapped = async (args: never, exec: { agent?: unknown }): Promise<unknown> => {
         const agent = (exec as { agent?: unknown } | undefined)?.agent
         sink.setAgent(agent)
         hydrate?.(agent)
-        return originalExecute(args, exec as never)
+        const result = await originalExecute(args, exec as never)
+        indexMediaFromResult(options.media, result)
+        return result
       }
       ;(definition as { execute: unknown }).execute = wrapped
     }
@@ -280,6 +315,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // 面板卡片读 meta：结构化、不受模型回执截断影响（presentCall 卡片）
+        presentationMeta: (_args, value) => value as never,
       },
       presentCall: () => ({ card: 'generic', title: '检查渲染环境', kind: 'read' }),
       async execute(args, exec) {
@@ -308,6 +345,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'generic', title: `新建动画：${args.title}`, kind: 'other' }),
       execute: args => Promise.resolve(opCreateSpec(deps, args, emit) as never),
@@ -342,6 +380,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // 大纲本体在参数里（回执只有体检结果），面板卡片要的是两者合体
+        presentationMeta: (args, value) => ({ ...(value as object), outline: args.outline }) as never,
       },
       presentCall: args => ({ card: 'generic', title: `规划分镜：${args.specId}`, kind: 'edit' }),
       execute: args => {
@@ -383,6 +423,14 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // inverse 可能包含整幕数据，卡片用不着，不进 meta
+        presentationMeta: (args, value) => {
+          const v = value as Record<string, unknown>
+          const scene = jsonLike(args.scene) as { name?: unknown } | null
+          const sceneName = typeof scene?.name === 'string' && scene.name !== '' ? scene.name : undefined
+          const { inverse: _inverse, ...rest } = v
+          return { ...rest, ...(sceneName ? { sceneName } : {}) } as never
+        },
       },
       presentCall: args => ({ card: 'generic', title: `写入场景 → ${args.specId}`, kind: 'edit' }),
       execute: args =>
@@ -413,6 +461,13 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // value 本体可能巨大，meta 只带定位信息；内容客户端按需拉 /api/spec
+        presentationMeta: (_args, value) =>
+          ({
+            specId: (value as { specId?: unknown }).specId,
+            path: (value as { path?: unknown }).path,
+            durationMs: (value as { durationMs?: unknown }).durationMs,
+          }) as never,
       },
       presentCall: args => ({ card: 'generic', title: `读取 ${args.specId}${args.path ?? ''}`, kind: 'read' }),
       execute: args => Promise.resolve(opGet(deps, args) as never),
@@ -439,6 +494,11 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // 修改历史卡片：版本、规模、说明。inverse 不进 meta（撤销走 anim_undo）
+        presentationMeta: (args, value) => {
+          const { inverse: _inverse, ...rest } = value as Record<string, unknown>
+          return { ...rest, note: args.note } as never
+        },
       },
       presentCall: args => ({ card: 'generic', title: `修改 ${args.specId}（${args.ops.length} 条）`, kind: 'edit' }),
       execute: args =>
@@ -457,6 +517,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        presentationMeta: (_args, value) => {
+          const { inverse: _inverse, ...rest } = value as Record<string, unknown>
+          return { ...rest, note: '撤销上一步' } as never
+        },
       },
       presentCall: args => ({ card: 'generic', title: `撤销 ${args.specId}`, kind: 'edit' }),
       async execute(args) {
@@ -482,7 +546,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
-        presentationMeta: (_args, value) => ((value as { frames?: unknown[] }).frames ?? []) as unknown as JsonValue,
+        // meta 用对象（客户端 readReceipt 对数组会回退到解析回执文本）
+        presentationMeta: (_args, value) => ({ frames: (value as { frames?: unknown }).frames ?? [] }) as never,
       },
       presentCall: args => ({ card: 'terminal', title: `anim preview ${args.specId}` }),
       async execute(args, exec) {

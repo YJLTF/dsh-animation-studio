@@ -16,6 +16,7 @@ import type { AnimDeps } from './ops.ts'
 import { registerAnimTools, resolveEventSink } from './register.ts'
 import type { AnimRenderer } from './render.ts'
 import { AnimRendererRegistry } from './render.ts'
+import { MediaIndex, mountAnimWebRoutes, RenderTracker } from './web.ts'
 
 export const name = 'dsh-anim-studio'
 
@@ -181,6 +182,10 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   // resolveEventSink 的注释）。
   const sessionsDir = resolve(outputDir, 'sessions')
   const store = new SpecStore()
+  // Web 面的内存态：渲染任务簿（/api/state 的进度来源）与产物媒体索引
+  // （outputDir 之外的回执产物按「工具出过这个路径」放行）
+  const tracker = new RenderTracker()
+  const media = new MediaIndex()
 
   // 恢复先于一切注册。真机上 ctx 没有 session 服务，这条探测不会命中——
   // 真正生效的是 makeSessionHydrator 的按会话懒恢复（工具执行时从
@@ -194,8 +199,12 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给
   // ctx.effect——那会被当成 effect body 立即调用，等于注册完马上注销。
-  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate }))
+  ctx.effect(() =>
+    registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media }),
+  )
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
+  // /dsh-anim 路由：宿主有 webServer（dsh web）才挂得上，headless 形态整段不存在
+  mountAnimWebRoutes(ctx, { store, tracker, media, outputDir })
 }
 
 /**
@@ -235,3 +244,5 @@ export type { AnimEvent, AnimEventDataMap } from './events.ts'
 export type { AnimRenderer, PreviewResult, RenderResult, RenderDiagnostics } from './render.ts'
 export { AnimRendererRegistry } from './render.ts'
 export { SpecStore, SpecStoreError } from '@dsh-anim/store'
+export { createAnimKernel, MediaIndex, RenderTracker } from './web.ts'
+export type { KernelRequest, KernelResponse, RenderStatusView } from './web.ts'

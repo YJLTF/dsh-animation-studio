@@ -107,8 +107,16 @@ const fakeToolsFor = sink => ({
 })
 
 const registered = []
+const webRoutes = []
 const ctx = new Context()
 ctx.provide('tools', fakeToolsFor(registered))
+// 伪 webServer：真机由 dsh web 组合提供；这里捕捉插件注册的 /dsh-anim 路由
+ctx.provide('webServer', {
+  register(route) {
+    webRoutes.push(route)
+    return () => {}
+  },
+})
 // 注意：不提供 ctx.session——真机形态
 try {
   await ctx.plugin(plugin, { outputDir: tmpRoot }) // Fiber & PromiseLike：await 即等待启动完成
@@ -248,5 +256,81 @@ const got3 = await byName3['anim_get'].execute(
 )
 assert.equal(got3.value, '历史片', 'sidecar 缺失时应回退到宿主日志里的 anim/* 事件')
 console.log('  ✔ 会话恢复（宿主日志回退）：sidecar 缺失时从 snapshotEvents fold 出旧 spec')
+
+// ---- Web 面：/dsh-anim 路由已注册，JSON 端点经适配层可达 ----
+const animRoute = webRoutes.find(r => r.kind === 'prefix' && r.path === '/dsh-anim')
+assert.ok(animRoute, '插件应向 webServer 注册 /dsh-anim 前缀路由')
+
+function makeRes() {
+  return {
+    status: 0,
+    headers: {},
+    body: undefined,
+    writableEnded: false,
+    writeHead(status, headers) {
+      this.status = status
+      this.headers = headers
+    },
+    end(body) {
+      this.ended = true
+      this.writableEnded = true
+      this.body = body
+    },
+    on() {},
+  }
+}
+
+const stateRes = makeRes()
+await animRoute.handler({ method: 'GET', url: '/dsh-anim/api/state', headers: {} }, stateRes)
+assert.equal(stateRes.status, 200)
+const state = JSON.parse(stateRes.body.toString('utf8'))
+assert.equal(state.specs[0]?.specId, 'smoke', '状态 API 应列出当前 spec（含恢复回来的）')
+assert.ok(Array.isArray(state.renders), '状态 API 应带渲染任务簿（空也要在）')
+console.log('  ✔ /dsh-anim/api/state 经 webServer 路由可达，spec 与渲染簿在列')
+
+// ---- client bundle：lazy-CJS 包装契约 + keyed 工具视图注册 ----
+const vm = await import('node:vm')
+const clientSource = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+let registration
+const sandbox = { window: { __ModuleLoader__: { load(reg) { registration = reg } } } }
+vm.runInNewContext(clientSource, sandbox, { filename: 'lib/client.js' })
+assert.ok(registration, 'bundle 执行必须向 window.__ModuleLoader__ 登记工厂')
+assert.equal(registration.id, 'dsh-animation-studio', 'entry id 必须等于包名')
+
+// 物化：factory(require) 只需要 react 系 stub（卡片渲染发生在浏览器）
+const jsxStub = { Fragment: 'Fragment', jsx: () => null, jsxs: () => null }
+const clientExports = registration.factory(spec =>
+  spec === 'react/jsx-runtime' ? jsxStub : spec === 'react' ? {} : undefined,
+)
+assert.equal(typeof clientExports.apply, 'function', '工厂应产出插件对象（apply）')
+assert.deepEqual([...clientExports.inject], ['slots'])
+
+const registeredViews = []
+const fakeClientCtx = {
+  slots: {
+    inject(slot, register) {
+      assert.equal(slot, 'tool.call.toolview')
+      register()
+    },
+    register(options, component) {
+      assert.equal(typeof component, 'function')
+      registeredViews.push(options.key)
+      return () => {}
+    },
+  },
+}
+clientExports.apply(fakeClientCtx)
+assert.deepEqual(registeredViews.sort(), [
+  'anim_create_spec',
+  'anim_diagnose',
+  'anim_draft_scene',
+  'anim_get',
+  'anim_patch',
+  'anim_plan',
+  'anim_preview',
+  'anim_render',
+  'anim_undo',
+])
+console.log(`  ✔ client bundle 包装契约成立，${registeredViews.length} 个 anim_* 卡片已注册进 tool.call.toolview`)
 
 console.log('\n宿主挂载冒烟通过')

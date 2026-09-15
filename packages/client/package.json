@@ -1,0 +1,20 @@
+{
+  "name": "@dsh-anim/client",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.31",
+    "react": "18.3.1",
+    "typescript": "^5.7.3"
+  }
+}

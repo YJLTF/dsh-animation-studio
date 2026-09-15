@@ -9,7 +9,9 @@
  * 用法：pnpm smoke
  */
 import assert from 'node:assert/strict'
-import { isAbsolute } from 'node:path'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join } from 'node:path'
 
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
@@ -29,6 +31,8 @@ import type { AnimEvent } from '../packages/tools/src/events.ts'
 import { opRender } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
+import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
+import type { KernelResponse } from '../packages/tools/src/web.ts'
 
 let passed = 0
 
@@ -433,6 +437,104 @@ await checkA('opRender: 相对 outputPath 解析成绝对路径——适配器�
   assert.ok(isAbsolute(result.outputPath), `回执应给绝对路径，收到 ${result.outputPath}`)
   const start = emitted.find(e => e.type === 'anim/render-start')
   assert.ok(isAbsolute((start!.data as { outputPath: string }).outputPath), 'render-start 事件的 outputPath 也是绝对路径')
+})
+
+/* ------------------------------------------------- /dsh-anim 请求内核 */
+
+/** 内核响应统一收流成 Buffer，断言才好写。 */
+async function drain(response: KernelResponse): Promise<Buffer> {
+  if (response.body) return Buffer.from(response.body)
+  const chunks: Buffer[] = []
+  for await (const chunk of response.stream!) chunks.push(chunk as Buffer)
+  return Buffer.concat(chunks)
+}
+
+await checkA('/dsh-anim 内核：渲染任务簿 + 状态 API + 媒体放行', async () => {
+  // 目录布局：tmpRoot（outputDir 之外的世界）/ output（outputDir 本体）
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'anim-web-'))
+  const outputDir = join(tmpRoot, 'output')
+  mkdirSync(outputDir)
+  const insideMp4 = join(outputDir, 'demo.mp4')
+  writeFileSync(insideMp4, '0123456789')
+  const insideText = join(outputDir, 'notes.txt')
+  writeFileSync(insideText, '秘密')
+  const outsideMp4 = join(tmpRoot, 'outside.mp4')
+  writeFileSync(outsideMp4, 'abcdefghij')
+
+  const store = new SpecStore()
+  store.create('webdemo', demoSpec())
+  const tracker = new RenderTracker()
+  const kernel = createAnimKernel({ store, tracker, media: new MediaIndex(), outputDir })
+
+  // 事件记账 → /api/state 讲得出任务状态
+  tracker.observe({ type: 'anim/render-start', data: { specId: 'webdemo', jobId: 'anim-render-1', outputPath: insideMp4 } })
+  tracker.observe({
+    type: 'anim/render-progress',
+    data: { specId: 'webdemo', jobId: 'anim-render-1', done: 50, total: 100, percent: 50 },
+  })
+  tracker.observe({
+    type: 'anim/render-finished',
+    data: { specId: 'webdemo', jobId: 'anim-render-1', outputPath: insideMp4, frameCount: 30, durationMs: 1000 },
+  })
+  const stateRes = await kernel({ method: 'GET', url: '/dsh-anim/api/state', headers: {} })
+  assert.equal(stateRes.status, 200)
+  const state = JSON.parse((await drain(stateRes)).toString('utf8')) as {
+    specs: Array<{ specId: string; renders: Array<{ jobId: string; status: string; percent: number }> }>
+    renders: Array<{ jobId: string }>
+  }
+  assert.equal(state.specs[0]?.specId, 'webdemo')
+  assert.equal(state.specs[0]?.renders[0]?.status, 'completed')
+  assert.equal(state.specs[0]?.renders[0]?.percent, 50)
+  assert.equal(state.renders.length, 1)
+
+  // /api/spec：整份 spec 可读；未知 id 404
+  const specRes = await kernel({ method: 'GET', url: '/dsh-anim/api/spec?id=webdemo', headers: {} })
+  assert.equal(specRes.status, 200)
+  // store 键（webdemo）与 spec.meta.id（demoSpec 自带 smoke）本就独立
+  assert.equal(((JSON.parse((await drain(specRes)).toString('utf8')) as { spec: AnimationSpec }).spec).meta.id, 'smoke')
+  assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/api/spec?id=nope', headers: {} })).status, 404)
+
+  // media：outputDir 内的 MP4 可服务（200 全量 / 206 区间 / 304 协商）
+  const media = (p: string, extra: Record<string, string> = {}): Promise<KernelResponse> =>
+    kernel({ method: 'GET', url: `/dsh-anim/media?p=${encodeURIComponent(p)}`, headers: extra })
+  const full = await media(insideMp4)
+  assert.equal(full.status, 200)
+  assert.equal(full.headers['content-type'], 'video/mp4')
+  assert.equal(full.headers['accept-ranges'], 'bytes')
+  assert.equal((await drain(full)).toString(), '0123456789')
+  const part = await media(insideMp4, { range: 'bytes=0-3' })
+  assert.equal(part.status, 206)
+  assert.equal(part.headers['content-range'], 'bytes 0-3/10')
+  assert.equal((await drain(part)).toString(), '0123')
+  const etag = full.headers.etag
+  assert.equal((await media(insideMp4, { 'if-none-match': etag })).status, 304)
+  assert.equal((await media(insideMp4, { range: 'bytes=99-' })).status, 416)
+
+  // 放行边界：目录穿越、outputDir 外未登记、非媒体扩展名一律 404
+  assert.equal((await media(join(tmpRoot, '..', 'outside-of-scope.mp4'))).status, 404)
+  assert.equal((await media(outsideMp4)).status, 404, 'outputDir 外、回执未出现过的文件不可服务')
+  assert.equal((await media(insideText)).status, 404, '非媒体扩展名不可服务')
+
+  // 回执索引：工具出过这条路径才放行 outputDir 外的产物
+  const indexedKernel = createAnimKernel({ store, tracker, media: new MediaIndex(), outputDir: outputDir })
+  assert.equal(
+    (await indexedKernel({ method: 'GET', url: `/dsh-anim/media?p=${encodeURIComponent(outsideMp4)}`, headers: {} })).status,
+    404,
+  )
+  const mediaIndex = new MediaIndex()
+  const indexedKernel2 = createAnimKernel({ store, tracker, media: mediaIndex, outputDir: outputDir })
+  mediaIndex.add(outsideMp4)
+  const indexed = await indexedKernel2({
+    method: 'GET',
+    url: `/dsh-anim/media?p=${encodeURIComponent(outsideMp4)}`,
+    headers: {},
+  })
+  assert.equal(indexed.status, 200)
+  assert.equal((await drain(indexed)).toString(), 'abcdefghij')
+
+  // 杂项：POST 405、未知路径 404
+  assert.equal((await kernel({ method: 'POST', url: '/dsh-anim/api/state', headers: {} })).status, 405)
+  assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/other', headers: {} })).status, 404)
 })
 
 console.log(`\n冒烟通过：${passed} 项`)
