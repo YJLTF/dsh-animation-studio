@@ -116,22 +116,57 @@ function restoreFromSession(ctx: Context, store: SpecStore): void {
   }
 }
 
+/**
+ * 按会话懒恢复：工具执行时从 `exec.agent.session` 把该会话日志里的 `anim/*`
+ * 事件 fold 进 store（每会话只做一次）。
+ *
+ * 为什么是懒恢复而不是挂载时恢复：宿主是「一个 profile 多个会话」的形态，
+ * 插件挂载在根上下文、拿不到任何具体会话；而工具执行上下文天然带着当次
+ * agent（`exec.agent.session`，真机正道）。第一次工具调用把该会话的历史
+ * fold 进来，之后的变更经事件 sink 增量落盘，两边无缝衔接。
+ */
+export function makeSessionHydrator(store: SpecStore): (agent: unknown) => void {
+  const hydrated = new Set<string>()
+  return agent => {
+    const session = (agent as { session?: { id?: unknown; snapshotEvents?: unknown } } | undefined)?.session
+    if (!session || typeof session.id !== 'string' || typeof session.snapshotEvents !== 'function') return
+    if (hydrated.has(session.id)) return
+    hydrated.add(session.id)
+    try {
+      const events = (session.snapshotEvents as () => unknown)() as unknown
+      if (!Array.isArray(events)) return
+      const animEvents = events
+        .filter((e): e is { type: string; data: unknown } => {
+          const t = (e as { type?: unknown } | null)?.type
+          return typeof t === 'string' && t.startsWith('anim/')
+        })
+        .map(e => ({ type: e.type, data: e.data }))
+      if (animEvents.length > 0) store.adopt(foldEvents(animEvents))
+    } catch {
+      // 恢复失败不拖垮工具调用；store 以当前内存状态为准
+    }
+  }
+}
+
 /* ------------------------------------------------------------------ 插件 */
 
 export async function apply(ctx: Context, config: Partial<Config> = {}): Promise<void> {
   const outputDir = config.outputDir ?? DEFAULT_OUTPUT_DIR
   const store = new SpecStore()
 
-  // 恢复先于一切注册：模型随后的 anim_get / anim_patch 才能看到重启前的状态
+  // 恢复先于一切注册。真机上 ctx 没有 session 服务，这条探测不会命中——
+  // 真正生效的是 makeSessionHydrator 的按会话懒恢复（工具执行时从
+  // exec.agent.session fold）；这条留给提供 ctx.session 的宿主形态与冒烟环境。
   restoreFromSession(ctx, store)
 
   const registry = new AnimRendererRegistry()
   const deps: AnimDeps = { store, renderers: registry, outputDir }
+  const hydrate = makeSessionHydrator(store)
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给
   // ctx.effect——那会被当成 effect body 立即调用，等于注册完马上注销。
-  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx) }))
+  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx), hydrate }))
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
 }
 

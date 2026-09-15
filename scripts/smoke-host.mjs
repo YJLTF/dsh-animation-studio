@@ -202,4 +202,67 @@ assert.equal(undone2.applied, 1)
 assert.equal(sessionLog.at(-1).type, 'anim/spec-patched')
 console.log('  ✔ 会话恢复：二次挂载从事件流 fold 出 spec，撤销历史可用')
 
+// ---- 真机路径：宿主 ctx 没有 session 服务，落盘点是 exec.agent.session ----
+const legacySpec = {
+  version: 1,
+  meta: { id: 'legacy', title: '历史片', fps: 30, size: { width: 1280, height: 720 } },
+  theme: {
+    colors: { background: '#101418', text: '#F2F5F7', muted: '#8B97A3', primary: '#4C9AFF', accent: '#FFB020' },
+    font: { family: 'Noto Sans CJK SC', size: 48 },
+  },
+  assets: {},
+  scenes: [],
+}
+const agentSession = {
+  id: 'session-agent-test',
+  _log: [{ type: 'anim/spec-created', data: { specId: 'legacy', spec: legacySpec } }],
+  snapshotEvents() {
+    return this._log
+  },
+  append(type, data) {
+    assertLosslessJson(data, `event ${type}.data`)
+    this._log.push({ type, data })
+    return { type, seq: this._log.length, time: Date.now(), data }
+  },
+}
+const execAgent = { signal: new AbortController().signal, agent: { session: agentSession } }
+
+const registered3 = []
+const ctx3 = new Context() // 注意：不提供 session 服务——逼出 agent.session 正道
+ctx3.provide('tools', {
+  register(definition) {
+    registered3.push(definition)
+    return () => {}
+  },
+})
+await ctx3.plugin(plugin, {})
+const byName3 = Object.fromEntries(registered3.map(d => [d.name, d]))
+
+const created3 = await byName3['anim_create_spec'].execute({ specId: 'fresh', title: '新片' }, execAgent)
+assert.equal(created3.specId, 'fresh')
+assert.ok(
+  agentSession._log.some(e => e.type === 'anim/spec-created' && e.data.specId === 'fresh'),
+  '事件应落进 exec.agent.session（真机唯一落盘点）',
+)
+assert.ok(
+  !sessionLog.some(e => e.data?.specId === 'fresh'),
+  '无 agent 路径的日志不应混入新 spec 的事件',
+)
+console.log('  ✔ 真机落盘路径：exec.agent.session.append 收到 anim/* 事件')
+
+// 第四次挂载 + 同一个 agent.session：懒恢复应让旧 spec 直接可读
+const registered4 = []
+const ctx4 = new Context()
+ctx4.provide('tools', {
+  register(definition) {
+    registered4.push(definition)
+    return () => {}
+  },
+})
+await ctx4.plugin(plugin, {})
+const byName4 = Object.fromEntries(registered4.map(d => [d.name, d]))
+const got4 = await byName4['anim_get'].execute({ specId: 'legacy', path: '/meta/title' }, execAgent)
+assert.equal(got4.value, '历史片', '懒恢复应从 exec.agent.session 的历史里还原旧 spec')
+console.log('  ✔ 懒恢复：首次工具调用即从 agent 会话历史 fold 出旧 spec')
+
 console.log('\n宿主挂载冒烟通过')

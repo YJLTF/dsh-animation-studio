@@ -27,13 +27,14 @@
 
 ## 特性
 
-- **9 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（按 JSON Pointer 精确读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_preview`（降分辨率抽帧）、`anim_render`（整片 MP4）。- **绝对毫秒时间线 IR**：所有时间都是场景内绝对毫秒，可动画属性统一收进轨道关键帧；内置 linear / easeIn/Out/InOut / cubicBezier / spring 缓动。
+- **9 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（按 JSON Pointer 精确读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_preview`（降分辨率抽帧）、`anim_render`（整片 MP4）。
+- **绝对毫秒时间线 IR**：所有时间都是场景内绝对毫秒，可动画属性统一收进轨道关键帧；内置 linear / easeIn/Out/InOut / cubicBezier / spring 缓动。
 - **写入走 JSON Patch（RFC 6902 子集）**：改完整份校验，不通过整批回滚；每次修改同时记录正向 ops 与反向 inverse，撤销不需要重新推理。补丁入参在边界上做收敛校验，坏 op 立刻以可读的报错返回。
 - **事件溯源**：spec 的每次变更都是一条自包含会话事件（`anim/spec-created` / `anim/spec-patched` / …），`foldEvents` 从事件流还原状态——刷新不丢、可回放、可 fork。事件载荷在边界上做了深清理，能通过 dsh 0.1.5-rc.2 的无损 JSON 严格校验。
 - **开箱即用的 Motion Canvas 渲染**：插件启动时自动挂载渲染 Provider。自动处理 Motion Canvas 3.17 没有官方 CLI、WebGL 上下文、帧落盘子目录、尾部静止提前停帧等一整串坑；渲染超时或中断会显式报错，绝不静默产出残片。渲染前 `anim_diagnose` 会把缺 ffmpeg / 缺浏览器 / 缺中文字体说成可操作的修复建议。
 - **渲染默认走后台任务**：宿主提供 `ctx.jobs` 时，`anim_render` 立即返回 jobId 并开始渲染，进度以事件可见，模型用 `job_output` / `job_kill`（dsh-tool-jobs）收集与终止；宿主没有 jobs 服务或任务发布失败时自动退回同步渲染。
 - **渲染过程可见**：渲染按序落 `anim/render-start` / `anim/render-progress`（5% 一档节流，不灌水）/ `anim/render-finished` 事件，工作台面板与回放都能重建进度；有头调试模式下浏览器窗口标题栏同时显示进度，渲染完成后自动关闭。
-- **会话恢复**：插件挂载时从会话日志 fold 回工作台状态（含撤销历史）——宿主重启、会话 resume 之后，旧 spec 照常 `anim_patch` / `anim_undo`，不丢不重。
+- **会话恢复**：工具执行时从当次会话日志**懒恢复**（fold）出工作台状态，含撤销历史——宿主重启、会话重开之后，旧 spec 照常 `anim_patch` / `anim_undo`，不丢不重。
 - **渲染器可替换**：渲染能力是一个标准 seam（注册表 + `provideRenderer`），想接 Remotion/Manim 就写一个 Provider 顶掉默认项，工具与事件零改动。
 - **离线分发友好**：`dsh.bundle` 声明 + esbuild 单文件构建，工作区内部包用 alias 内联、与包管理器无关，配合 offline-packager 一条命令打成自包含 tgz。
 
@@ -169,6 +170,6 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 
 - 图层类型目前支持 `text / rect / circle / image`，`group` 预留未实现；不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
-- 会话事件的落盘桥（`resolveEventSink`）优先走 `session.append`，退到事件总线、再退到日志。挂载时的会话恢复（fold）已实现并通过真实 cordis 环境冒烟；但 `anim/*` 属于插件自有事件，不在 rc.2 的核心事件词汇表内，持久化信封上的 `ignorable` 标记由宿主侧负责——事件真正落盘仍需在真机 Web 会话里确认一次。
+- 会话事件的落盘点是工具执行上下文里的 **`exec.agent.session.append`**。真机实证（宿主 0.1.6-alpha.1）：ctx 上没有 `session` 服务，0.1.x 靠探测 `ctx.session` 落盘的实现从未真正持久化过一条事件，0.2.0 已改为 agent 会话正道并以真机会话日志复核。`anim/*` 是插件自有事件，不在宿主核心词汇表内，按「log-only」语义进日志（宿主读回时跳过、不影响其会话重建）；跨宿主版本的兼容语义（`ignorable` 信封标记，append API 暂不开放）随平台演进继续观察。
 - 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。Edge 152 起新 headless 配合 SwiftShader 可完整出帧，渲染**默认 headless 无窗口**（`headless: false` 仅作调试后门，Linux 无显示时该模式需要 Xvfb）。后台渲染依赖宿主的 `ctx.jobs` 服务，无此服务时自动退回同步渲染。
 - `dsh plugin add` 在部分 Windows 环境会把 pnpm 转发给 cmd 执行；若 cmd 按 PATH 找不到 pnpm（本机实测出现过），直接在 profile 目录里 `pnpm add <插件路径>` 并把插件名写进 profile `package.json` 的 `dsh.profile.bundles` 即可。

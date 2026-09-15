@@ -34,22 +34,29 @@ import {
 /**
  * 会话事件写入口。
  *
- * dsh 0.1.5-rc.2 的会话 API 是 `session.append(type, data)`，且 append 处会
- * 严格校验 data 的「无损 JSON」合法性：任何一个对象属性值为 undefined
- * （更不用说函数、循环引用）都会让整条事件在 append 现场抛错。而可选字段
- * （如 anim_patch 的 note、大纲条目的 narration）在 TS 语义里天然可能带着
- * undefined 属性值，所以这里在边界上做一次深清理——构建新对象、跳过
- * undefined 属性——对三条退路（session / 事件总线 / 日志）统一生效。
+ * **真机事实（宿主 0.1.6-alpha.1 实证）**：ctx 上没有名为 `session` 的服务
+ * （宿主各处都走 `ctx.sessions.get(id)` 注册表），挂载时探测 `ctx.session`
+ * 必然失败——0.1.x 的实现因此在真机上从未落盘过一条事件。正道是工具执行
+ * 上下文里的 `exec.agent.session`：agent 持有当次会话的活 Session，append
+ * 进去的事件由持久化后端无条件写入日志（写入端按 `session/event` 全量收，
+ * 不按词汇过滤）。
  *
- * 除此之外没有更通用的落盘入口，所以这里仍是一个可替换的桥：优先走
- * session，其次退到 cordis 事件总线，最后退到日志。其余代码只认这个接口，
- * 不认具体实现。
+ * 因此 append 按**每次工具调用**动态解析落盘点，优先级：
+ * 1. `exec.agent.session.append`——真机宿主，事件持久化、可恢复；
+ * 2. ctx 上探测到的 `session.append`——冒烟环境 / 可能的旧式宿主；
+ * 3. cordis 事件总线——仅进程内可见；
+ * 4. 日志——最后的可见性兜底。
+ *
+ * 载荷在边界上做深清理（跳过 undefined 属性值，无损 JSON 校验的拒绝形态），
+ * 对四条退路统一生效。其余代码只认这个接口，不认具体实现。
  *
  * 注意：cordis 的 Context 是代理，读取未 inject 的服务属性会直接抛错
  * （而不是返回 undefined），所以所有属性探测都必须裹进 try/catch。
  */
 export interface EventSink {
   append(event: AnimEvent): void
+  /** 每次工具调用前由执行包装器注入当次 agent（见 registerAnimTools 的收口）。 */
+  setAgent(agent: unknown): void
 }
 
 /**
@@ -88,14 +95,27 @@ function probeJobs(ctx: Context): AnimJobsService | undefined {
 }
 
 export function resolveEventSink(ctx: Context): EventSink {
+  // 工具调用是串行的（同一 agent 回合内），单个槽位即可让 append 拿到当次会话
+  let currentAgent: unknown
   return {
+    setAgent(agent) {
+      currentAgent = agent
+    },
     append(event) {
       const data = stripUndefined(event.data)
+      // 1. 当次会话的活 Session（真机持久化正道）
+      const agentSession = (currentAgent as { session?: { append?: unknown } } | undefined)?.session
+      if (typeof agentSession?.append === 'function') {
+        ;(agentSession.append as (type: string, data: unknown) => void).call(agentSession, event.type, data)
+        return
+      }
+      // 2. ctx 上的 session 服务（冒烟环境）
       const session = probe(ctx, 'session') as { append?(type: string, data: unknown): void } | undefined
       if (typeof session?.append === 'function') {
         session.append(event.type, data)
         return
       }
+      // 3/4. 事件总线 → 日志
       const emit = probe(ctx, 'emit') as ((name: string, payload?: unknown) => void) | undefined
       if (typeof emit === 'function') {
         emit.call(ctx, event.type, data)
@@ -167,14 +187,30 @@ function coerceJsonParam(value: unknown, label: string): unknown {
 export interface RegisterOptions {
   deps: AnimDeps
   sink: EventSink
+  /**
+   * 每次工具调用前按当次 agent 做会话懒恢复（见 makeSessionHydrator）。
+   * 省略则不做恢复（冒烟等无宿主环境）。
+   */
+  hydrate?: (agent: unknown) => void
 }
 
 /** 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。 */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
-  const { deps, sink } = options
+  const { deps, sink, hydrate } = options
   const emit = (event: AnimEvent): void => sink.append(event)
   const disposers: Array<() => void> = []
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
+    // 单一收口：每个工具执行前注入当次 agent（事件 sink 与懒恢复都靠它定位会话）
+    const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
+    if (originalExecute) {
+      const wrapped = (args: never, exec: { agent?: unknown }): unknown => {
+        const agent = (exec as { agent?: unknown } | undefined)?.agent
+        sink.setAgent(agent)
+        hydrate?.(agent)
+        return originalExecute(args, exec as never)
+      }
+      ;(definition as { execute: unknown }).execute = wrapped
+    }
     disposers.push(ctx.tools.register(definition))
   }
 
