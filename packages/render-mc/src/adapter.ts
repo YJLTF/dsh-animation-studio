@@ -23,7 +23,7 @@ import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 import type { AnimationSpec } from '@dsh-anim/spec'
-import { sceneDurationMs, specDurationMs } from '@dsh-anim/spec'
+import { sceneDurationMs, specDurationMs, truncateSpecAtMs } from '@dsh-anim/spec'
 
 import type { AnimRenderer, PreviewRequest, PreviewResult, RenderDiagnostics, RenderRequest, RenderResult } from './contract.ts'
 import { generateProject, resolveResolutionScale } from './codegen.ts'
@@ -78,12 +78,15 @@ export class MotionCanvasRenderer implements AnimRenderer {
   }
 
   async preview(request: PreviewRequest, signal: AbortSignal): Promise<PreviewResult> {
-    // 预览 = 只渲染抽样帧。Motion Canvas 没有「只渲某几帧」的入口，
-    // 所以 MVP 的做法是整片低分辨率渲染后挑帧；`atMs` 只是告诉调用方
-    // 该看哪几帧，不改变渲染量。
+    // 预览 = 只渲染抽样帧。Motion Canvas 没有「只渲某几帧」的入口，所以
+    // 做法是：把时间线截短到最晚的抽帧点（其后的场景不渲），低分辨率出帧后
+    // 按帧下标挑帧——截断点之前的时间线逐毫秒等价，下标取帧不受影响。
     const resolutionScale = resolveResolutionScale(request.scale)
-    const result = await this.#renderFrames(request.spec, signal, resolutionScale)
     const at = request.atMs?.length ? request.atMs : autoSamplePoints(request.spec)
+    const cutMs = Math.max(...at)
+    const totalMs = specDurationMs(request.spec.scenes)
+    const spec = cutMs > 0 && cutMs < totalMs ? truncateSpecAtMs(request.spec, cutMs) : request.spec
+    const result = await this.#renderFrames(spec, signal, resolutionScale)
     const frames = at
       .map(atMs => {
         const index = Math.min(
@@ -103,8 +106,10 @@ export class MotionCanvasRenderer implements AnimRenderer {
   async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
     const resolutionScale = resolveResolutionScale(request.scale)
     const result = await this.#renderFrames(request.spec, signal, resolutionScale, request.onProgress)
-    const outputPath = request.outputPath || this.#defaultOutputPath
-    if (!outputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
+    const rawOutputPath = request.outputPath || this.#defaultOutputPath
+    if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
+    // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
+    const outputPath = resolve(rawOutputPath)
 
     const durationMs = specDurationMs(request.spec.scenes)
     await encodeFrames(result.frameDir, result.expected, request.spec.meta.fps, outputPath)

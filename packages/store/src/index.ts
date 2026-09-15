@@ -1,18 +1,16 @@
 /**
- * spec 存储：内存态 + 事件流 fold。
+ * @dsh-anim/store —— spec 状态容器：内存态 + 事件流 fold。
  *
- * 这里刻意不依赖 dsh 运行时——`foldEvents` 是纯函数，可以直接单测，
- * 也是 client 面板「从事件流还原状态」的同一份逻辑（两半共用才不会漂移）。
+ * 从 host 包（@dsh-anim/tools）下沉到共享层的理由：client 面板要从**同一条**
+ * 事件流还原出同一个状态，而官方硬规则是 client 绝不 import host 实现代码进
+ * 浏览器 bundle。本包只依赖 @dsh-anim/spec（纯数据层），host 与 client 共用，
+ * 两半的状态还原才不会漂移。
  *
- * 一个取舍：**不做快照**。每次都从事件 0 开始 fold，spec 大了会慢。
- * 但 MVP 阶段 spec 是几十个场景量级，fold 一次是微秒级；等真的慢了再加
- * 周期性快照，而快照本身就是一条事件，不影响这里的结构。
+ * 这里刻意不依赖 dsh 运行时——`foldEvents` 是纯函数，可以直接单测。
  */
 
 import type { AnimationSpec, JsonValue, PatchOp, Scene } from '@dsh-anim/spec'
 import { applyPatch, specDurationMs, validateSpec } from '@dsh-anim/spec'
-
-import type { AnimEvent } from './events.ts'
 
 export interface PatchRecord {
   ops: PatchOp[]
@@ -76,6 +74,17 @@ export class SpecStore {
   }
 
   /**
+   * 并入另一份 store 的全部记录（覆盖同名 specId）。
+   * 供会话恢复用：fold 出来的 store 连同撤销历史整体搬进活 store，
+   * 走 create() 逐份重建会把 history 丢掉，撤销就断了。
+   */
+  adopt(other: SpecStore): void {
+    for (const [specId, record] of other.#records) {
+      this.#records.set(specId, record)
+    }
+  }
+
+  /**
    * 应用一组补丁。改完**整份校验**，不通过就整批回滚——
    * 半改成功的 spec 比没改更糟：后续每一步都在一个非法文档上累积。
    */
@@ -129,27 +138,47 @@ export class SpecStore {
   }
 }
 
+/**
+ * 事件名 → 载荷的最小结构视图。
+ *
+ * 事件类型本体（含 `SessionEventMap` 合并声明）住在 host 包的 events.ts——
+ * 那是「会话事件」这条 dsh 平台关注点；本包只消费 type/data 两元组，
+ * 于是 client 与 host 能在不含 dsh 类型的情况下共享 fold。
+ */
+export interface AnimEventView {
+  type: string
+  data: unknown
+}
+
 /** 从事件流还原 store。回放、fork、刷新恢复走的是同一条路径。 */
-export function foldEvents(events: readonly AnimEvent[]): SpecStore {
+export function foldEvents(events: readonly AnimEventView[]): SpecStore {
   const store = new SpecStore()
   for (const ev of events) {
     switch (ev.type) {
-      case 'anim/spec-created':
+      case 'anim/spec-created': {
+        const data = ev.data as { specId?: unknown; spec?: AnimationSpec }
+        if (typeof data.specId !== 'string' || !data.spec) break
         // 重复创建（fork 后重放）按幂等处理：后来者覆盖
-        if (store.has(ev.data.specId)) store.drop(ev.data.specId)
-        store.create(ev.data.specId, ev.data.spec)
-        break
-      case 'anim/spec-patched':
+        if (store.has(data.specId)) store.drop(data.specId)
         try {
-          store.patch(ev.data.specId, ev.data.ops, ev.data.note)
+          store.create(data.specId, data.spec)
         } catch {
-          // 回放遇到坏事件不能整条流崩掉；记过就跳过，状态以能还原的部分为准
-          continue
+          // 回放遇到坏事件不能整条流崩掉；状态以能还原的部分为准
         }
         break
-      case 'anim/outline-updated':
-      case 'anim/render-finished':
-        // 不影响 spec 状态
+      }
+      case 'anim/spec-patched': {
+        const data = ev.data as { specId?: unknown; ops?: PatchOp[]; note?: string }
+        if (typeof data.specId !== 'string' || !Array.isArray(data.ops)) break
+        try {
+          store.patch(data.specId, data.ops, data.note)
+        } catch {
+          // 同上：坏事件跳过，不崩整条流
+        }
+        break
+      }
+      default:
+        // outline / render-* 不影响 spec 状态
         break
     }
   }

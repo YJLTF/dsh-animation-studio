@@ -25,6 +25,7 @@ await build({
   sourcemap: 'linked',
   alias: {
     '@dsh-anim/spec': resolve('packages/spec/src/index.ts'),
+    '@dsh-anim/store': resolve('packages/store/src/index.ts'),
     '@dsh-anim/render-mc': resolve('packages/render-mc/src/index.ts'),
   },
   external: [
@@ -33,5 +34,42 @@ await build({
     'puppeteer-core',
     '@motion-canvas/*',
   ],
+  logLevel: 'info',
+})
+
+/*
+ * 浏览器面：packages/client/src/index.ts → lib/client.js。
+ *
+ * 产物包装必须精确匹配 dsh 的 lazy-CJS 契约（与官方 client bundle 同构）：
+ * 脚本执行只调 window.__ModuleLoader__.load({ id, factory }) 登记工厂，
+ * factory(require) 返回 CJS exports（插件对象 { name, inject, apply }），
+ * entry id == 包名。react / react/jsx-runtime 是 web shell 的 seed 模块，
+ * 保持 external 由模块系统的同步 require 提供。
+ */
+await build({
+  entryPoints: ['packages/client/src/index.ts'],
+  outfile: 'lib/client.js',
+  bundle: true,
+  platform: 'browser',
+  format: 'cjs',
+  target: 'es2020',
+  jsx: 'automatic',
+  sourcemap: 'linked',
+  alias: {
+    '@dsh-anim/spec': resolve('packages/spec/src/index.ts'),
+  },
+  external: ['react', 'react/jsx-runtime'],
+  banner: {
+    js: [
+      'window.__ModuleLoader__.load({',
+      '\tid: "dsh-animation-studio",',
+      '\tfactory: (require) => {',
+      '\t\tvar module = { exports: {} };',
+      '\t\tvar exports = module.exports;',
+    ].join('\n'),
+  },
+  footer: {
+    js: '\n\t\treturn module.exports;\n\t}\n});',
+  },
   logLevel: 'info',
 })

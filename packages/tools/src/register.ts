@@ -11,13 +11,16 @@
  *    场合被调用，不能依赖任何运行时状态。
  */
 
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+
 import type { Context, Disposable } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-import type { JsonValue, PatchOp } from '@dsh-anim/spec'
+import type { PatchOp } from '@dsh-anim/spec'
 
 import type { AnimEvent } from './events.ts'
-import type { AnimDeps } from './ops.ts'
+import type { AnimDeps, AnimJobsService } from './ops.ts'
 import {
   opCreateSpec,
   opDiagnose,
@@ -34,22 +37,28 @@ import {
 /**
  * 会话事件写入口。
  *
- * dsh 0.1.5-rc.2 的会话 API 是 `session.append(type, data)`，且 append 处会
- * 严格校验 data 的「无损 JSON」合法性：任何一个对象属性值为 undefined
- * （更不用说函数、循环引用）都会让整条事件在 append 现场抛错。而可选字段
- * （如 anim_patch 的 note、大纲条目的 narration）在 TS 语义里天然可能带着
- * undefined 属性值，所以这里在边界上做一次深清理——构建新对象、跳过
- * undefined 属性——对三条退路（session / 事件总线 / 日志）统一生效。
+ * **落盘主路径是插件自有的 sidecar JSONL**（`<sessionsDir>/<sessionId>.jsonl`，
+ * 按会话一文件、行即事件）。绝不写宿主会话日志（`session.append`）：dsh 的
+ * 读回路径对未知事件类型 fail-closed——除非记录带 `SessionEvent.ignorable: true`
+ * 信封，整个会话拒读（「likely written by a newer harness」）；而宿主
+ * 0.1.6-alpha.1 的 append API 不提供 ignorable 入口，写入 anim/* 事件等于
+ * 毒化该会话日志（真机事故：session-0ea61fc8 加载失败）。等宿主开放
+ * ignorable 写入后再评估切回。
  *
- * 除此之外没有更通用的落盘入口，所以这里仍是一个可替换的桥：优先走
- * session，其次退到 cordis 事件总线，最后退到日志。其余代码只认这个接口，
- * 不认具体实现。
+ * 拿不到会话 id（冒烟环境）或 sidecar 写失败时按退路降级：
+ * 1. cordis 事件总线——仅进程内可见；
+ * 2. 日志——最后的可见性兜底。
+ *
+ * 载荷在边界上做深清理（跳过 undefined 属性值——无损 JSON 校验的拒绝形态），
+ * 对所有退路统一生效。其余代码只认这个接口，不认具体实现。
  *
  * 注意：cordis 的 Context 是代理，读取未 inject 的服务属性会直接抛错
  * （而不是返回 undefined），所以所有属性探测都必须裹进 try/catch。
  */
 export interface EventSink {
   append(event: AnimEvent): void
+  /** 每次工具调用前由执行包装器注入当次 agent（见 registerAnimTools 的收口）。 */
+  setAgent(agent: unknown): void
 }
 
 /**
@@ -78,15 +87,53 @@ function probe(ctx: Context, key: string): unknown {
   }
 }
 
-export function resolveEventSink(ctx: Context): EventSink {
+/**
+ * 探测宿主的 ctx.jobs 服务（结构探测：宿主侧类型不在本包的类型面上）。
+ * 没有该服务时渲染类工具自动走同步路径，行为与 0.1.x 一致。
+ */
+function probeJobs(ctx: Context): AnimJobsService | undefined {
+  const jobs = probe(ctx, 'jobs') as { start?: unknown } | undefined
+  return jobs && typeof jobs.start === 'function' ? (jobs as AnimJobsService) : undefined
+}
+
+/**
+ * 事件落盘选项：`sessionsDir` 是插件自有的事件 sidecar 目录
+ * （`<outputDir>/sessions/<sessionId>.jsonl`）。
+ */
+export interface EventSinkOptions {
+  sessionsDir?: string
+}
+
+export function resolveEventSink(ctx: Context, options: EventSinkOptions = {}): EventSink {
+  // 工具调用是串行的（同一 agent 回合内），单个槽位即可让 append 拿到当次会话
+  let currentAgent: unknown
+  let sessionsDirReady = false
   return {
+    setAgent(agent) {
+      currentAgent = agent
+    },
     append(event) {
       const data = stripUndefined(event.data)
-      const session = probe(ctx, 'session') as { append?(type: string, data: unknown): void } | undefined
-      if (typeof session?.append === 'function') {
-        session.append(event.type, data)
-        return
+      // 1. 插件自有 sidecar（真机持久化正道）。绝不写宿主会话日志：
+      //    dsh 读回路径对未知事件类型 fail-closed（`SessionEvent.ignorable`
+      //    才放行），而 `session.append` API 不提供 ignorable 入口——写了
+      //    anim/* 事件整个会话就拒读（真机事故：session-0ea61fc8）。
+      const sessionId = (currentAgent as { session?: { id?: unknown } } | undefined)?.session?.id
+      if (options.sessionsDir && typeof sessionId === 'string') {
+        try {
+          if (!sessionsDirReady) {
+            mkdirSync(options.sessionsDir, { recursive: true })
+            sessionsDirReady = true
+          }
+          const safeId = sessionId.replace(/[^a-zA-Z0-9._-]/g, '_')
+          const line = `${JSON.stringify({ type: event.type, time: Date.now(), data })}\n`
+          appendFileSync(join(options.sessionsDir, `${safeId}.jsonl`), line, 'utf8')
+          return
+        } catch {
+          /* sidecar 写失败退到总线/日志，工具调用不能被持久化拖垮 */
+        }
       }
+      // 2/3. 事件总线 → 日志（无 sessionsDir 或拿不到会话 id 时的降级）
       const emit = probe(ctx, 'emit') as ((name: string, payload?: unknown) => void) | undefined
       if (typeof emit === 'function') {
         emit.call(ctx, event.type, data)
@@ -108,6 +155,16 @@ function truncate(text: string): string {
 }
 
 const text = (content: string) => [{ type: 'text', text: truncate(content) }] as never
+
+/** 容忍二次编码的 JSON 解析：不是字符串原样返回，解析失败返回 undefined。 */
+function jsonLike(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  try {
+    return JSON.parse(value) as unknown
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * 把模型给的 ops 收敛成 PatchOp[]。
@@ -153,19 +210,96 @@ function coerceJsonParam(value: unknown, label: string): unknown {
   return parsed
 }
 
+/**
+ * 宿主服务可见性报告：anim_diagnose 用它把「事件落盘 / 后台渲染在真机上
+ * 到底走哪条路」变成可观测事实，而不是让我们对着回执猜。
+ */
+function hostServiceReport(
+  ctx: Context,
+  exec: { agent?: unknown },
+  sessionsDir: string | undefined,
+): Record<string, unknown> {
+  const read = (obj: unknown, key: string): unknown => {
+    try {
+      return (obj as Record<string, unknown>)?.[key]
+    } catch {
+      return undefined
+    }
+  }
+  const jobs = read(ctx, 'jobs')
+  const session = read(ctx, 'session')
+  const sessions = read(ctx, 'sessions')
+  const agentSession = read(read(exec, 'agent'), 'session') as { id?: unknown }
+  return {
+    // 落盘链路：sidecar 需要「目录已配置 + 当次会话 id 可读」两个条件
+    sessionsDirConfigured: typeof sessionsDir === 'string',
+    agentSessionIdKnown: typeof agentSession?.id === 'string',
+    sessionOnCtx: typeof (session as { append?: unknown } | undefined)?.append === 'function',
+    sessionsRegistryOnCtx: typeof (sessions as { get?: unknown } | undefined)?.get === 'function',
+    // 后台渲染链路：jobsOnCtx 为 false 时渲染一律走同步回退
+    jobsOnCtx: typeof (jobs as { start?: unknown } | undefined)?.start === 'function',
+  }
+}
+
 /* ------------------------------------------------------------------ 注册 */
 
 export interface RegisterOptions {
   deps: AnimDeps
   sink: EventSink
+  /**
+   * 事件 sidecar 目录（`<outputDir>/sessions`）。配置后 anim/* 事件按会话
+   * 落 JSONL sidecar，绝不写宿主会话日志（见 resolveEventSink 内注释）。
+   */
+  sessionsDir?: string
+  /**
+   * 每次工具调用前按当次 agent 做会话懒恢复（见 makeSessionHydrator）。
+   * 省略则不做恢复（冒烟等无宿主环境）。
+   */
+  hydrate?: (agent: unknown) => void
+  /** 渲染任务簿：渲染事件流过的同时记账，/dsh-anim/api/state 读它讲进度。 */
+  tracker?: { observe(event: AnimEvent): void }
+  /** 产物媒体索引：工具回执里出现过的文件路径才可被 /dsh-anim/media 服务。 */
+  media?: { add(path: string): void }
+}
+
+/**
+ * 回执媒体采集：结果对象里的 outputPath / frames[].path 全部进媒体索引。
+ * 放在工具包装层而不是 ops 层——新增一个返回产物的 op 时不用记得登记。
+ */
+function indexMediaFromResult(media: { add(path: string): void } | undefined, result: unknown): void {
+  if (!media || typeof result !== 'object' || result === null) return
+  const record = result as Record<string, unknown>
+  if (typeof record.outputPath === 'string') media.add(record.outputPath)
+  if (Array.isArray(record.frames)) {
+    for (const frame of record.frames) {
+      const path = (frame as { path?: unknown } | null)?.path
+      if (typeof path === 'string') media.add(path)
+    }
+  }
 }
 
 /** 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。 */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
-  const { deps, sink } = options
-  const emit = (event: AnimEvent): void => sink.append(event)
+  const { deps, sink, sessionsDir, hydrate } = options
+  const emit = (event: AnimEvent): void => {
+    sink.append(event)
+    options.tracker?.observe(event)
+  }
   const disposers: Array<() => void> = []
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
+    // 单一收口：每个工具执行前注入当次 agent（事件 sink 与懒恢复都靠它定位会话）
+    const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
+    if (originalExecute) {
+      const wrapped = async (args: never, exec: { agent?: unknown }): Promise<unknown> => {
+        const agent = (exec as { agent?: unknown } | undefined)?.agent
+        sink.setAgent(agent)
+        hydrate?.(agent)
+        const result = await originalExecute(args, exec as never)
+        indexMediaFromResult(options.media, result)
+        return result
+      }
+      ;(definition as { execute: unknown }).execute = wrapped
+    }
     disposers.push(ctx.tools.register(definition))
   }
 
@@ -181,10 +315,13 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // 面板卡片读 meta：结构化、不受模型回执截断影响（presentCall 卡片）
+        presentationMeta: (_args, value) => value as never,
       },
       presentCall: () => ({ card: 'generic', title: '检查渲染环境', kind: 'read' }),
-      async execute(args) {
-        return await opDiagnose(deps, args) as never
+      async execute(args, exec) {
+        const result = await opDiagnose(deps, args)
+        return { ...result, host: hostServiceReport(ctx, exec, sessionsDir) } as never
       },
     }),
   )
@@ -208,6 +345,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'generic', title: `新建动画：${args.title}`, kind: 'other' }),
       execute: args => Promise.resolve(opCreateSpec(deps, args, emit) as never),
@@ -242,6 +380,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // 大纲本体在参数里（回执只有体检结果），面板卡片要的是两者合体
+        presentationMeta: (args, value) => ({ ...(value as object), outline: args.outline }) as never,
       },
       presentCall: args => ({ card: 'generic', title: `规划分镜：${args.specId}`, kind: 'edit' }),
       execute: args => {
@@ -283,6 +423,14 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // inverse 可能包含整幕数据，卡片用不着，不进 meta
+        presentationMeta: (args, value) => {
+          const v = value as Record<string, unknown>
+          const scene = jsonLike(args.scene) as { name?: unknown } | null
+          const sceneName = typeof scene?.name === 'string' && scene.name !== '' ? scene.name : undefined
+          const { inverse: _inverse, ...rest } = v
+          return { ...rest, ...(sceneName ? { sceneName } : {}) } as never
+        },
       },
       presentCall: args => ({ card: 'generic', title: `写入场景 → ${args.specId}`, kind: 'edit' }),
       execute: args =>
@@ -313,6 +461,13 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // value 本体可能巨大，meta 只带定位信息；内容客户端按需拉 /api/spec
+        presentationMeta: (_args, value) =>
+          ({
+            specId: (value as { specId?: unknown }).specId,
+            path: (value as { path?: unknown }).path,
+            durationMs: (value as { durationMs?: unknown }).durationMs,
+          }) as never,
       },
       presentCall: args => ({ card: 'generic', title: `读取 ${args.specId}${args.path ?? ''}`, kind: 'read' }),
       execute: args => Promise.resolve(opGet(deps, args) as never),
@@ -339,6 +494,11 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        // 修改历史卡片：版本、规模、说明。inverse 不进 meta（撤销走 anim_undo）
+        presentationMeta: (args, value) => {
+          const { inverse: _inverse, ...rest } = value as Record<string, unknown>
+          return { ...rest, note: args.note } as never
+        },
       },
       presentCall: args => ({ card: 'generic', title: `修改 ${args.specId}（${args.ops.length} 条）`, kind: 'edit' }),
       execute: args =>
@@ -357,6 +517,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        presentationMeta: (_args, value) => {
+          const { inverse: _inverse, ...rest } = value as Record<string, unknown>
+          return { ...rest, note: '撤销上一步' } as never
+        },
       },
       presentCall: args => ({ card: 'generic', title: `撤销 ${args.specId}`, kind: 'edit' }),
       async execute(args) {
@@ -382,7 +546,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
-        presentationMeta: (_args, value) => ((value as { frames?: unknown[] }).frames ?? []) as unknown as JsonValue,
+        // meta 用对象（客户端 readReceipt 对数组会回退到解析回执文本）
+        presentationMeta: (_args, value) => ({ frames: (value as { frames?: unknown }).frames ?? [] }) as never,
       },
       presentCall: args => ({ card: 'terminal', title: `anim preview ${args.specId}` }),
       async execute(args, exec) {
@@ -396,7 +561,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_render',
       description:
-        '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景做抽查。',
+        '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景抽查。'
+        + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
+        + '否则同步等待到出片为止。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         outputPath: { type: 'string', description: '输出 MP4 路径，省略则用默认目录' },
@@ -411,13 +578,21 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'terminal', title: `anim render ${args.specId}` }),
-      presentResult: (_args, result) => ({
-        card: 'generic',
-        title: '渲染完成',
-        content: result.content,
-      }),
+      presentResult: (_args, result) => {
+        // 纯函数：从已渲染内容里区分「已转后台」与「同步出片」两种回执
+        let title = '渲染完成'
+        try {
+          const first = result.content[0] as { text?: string } | undefined
+          const parsed = typeof first?.text === 'string' ? (JSON.parse(first.text) as { kind?: string }) : undefined
+          if (parsed?.kind === 'background') title = '渲染已转后台任务'
+        } catch {
+          /* 解析不出就维持默认标题 */
+        }
+        return { card: 'generic', title, content: result.content }
+      },
       async execute(args, exec) {
-        return (await opRender(deps, args, exec.signal, emit)) as never
+        const owner = (exec as { agent?: unknown }).agent
+        return (await opRender(deps, args, exec.signal, emit, probeJobs(ctx), owner)) as never
       },
     }),
   )

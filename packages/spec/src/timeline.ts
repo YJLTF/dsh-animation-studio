@@ -6,7 +6,7 @@
  * 因为后者强迫每个后端各自重写一遍时序推导。
  */
 
-import type { EaseSpec, KeyframeValue, Scene, Track } from './types.ts'
+import type { AnimationSpec, EaseSpec, KeyframeValue, Scene, Track } from './types.ts'
 
 /** 一个补间段：渲染后端的通用语言。 */
 export interface Tween {
@@ -45,6 +45,51 @@ export function sceneDurationMs(scene: Scene): number {
 /** 一部片子的总时长（毫秒）。 */
 export function specDurationMs(scenes: readonly Scene[]): number {
   return scenes.reduce((sum, s) => sum + sceneDurationMs(s), 0)
+}
+
+/**
+ * 把整份 spec 截短到前 `cutMs` 毫秒（不含），原 spec 不被修改。
+ *
+ * 预览加速用：`anim_preview` 只抽查若干时间点时，没必要渲染其后的内容。
+ * 截断点所在场景保留到截断处——超出截断点的关键帧被过滤掉（轨道因此为空
+ * 则整条丢弃，图层以静态 props 出现在截断点前，与原片该时段的画面一致），
+ * 声明时长同步收紧；完全落在截断点之后的场景整幕丢弃。截断点之前的
+ * 时间线逐毫秒等价，抽帧按下标取帧不受影响。
+ */
+export function truncateSpecAtMs(spec: AnimationSpec, cutMs: number): AnimationSpec {
+  if (!Number.isFinite(cutMs) || cutMs <= 0) {
+    throw new Error(`cutMs 必须是正的有限毫秒数，收到 ${cutMs}`)
+  }
+  // 截断点在片尾之外：无活儿可干，原样返回（保持引用相等，调用方可据此免拷贝）
+  if (cutMs >= specDurationMs(spec.scenes)) return spec
+  const scenes: Scene[] = []
+  let cursor = 0
+  for (const scene of spec.scenes) {
+    const duration = sceneDurationMs(scene)
+    if (cursor >= cutMs) break
+    if (cursor + duration <= cutMs) {
+      scenes.push(scene)
+      cursor += duration
+      continue
+    }
+    scenes.push(truncateSceneAtMs(scene, cutMs - cursor))
+    break
+  }
+  return { ...spec, scenes }
+}
+
+function truncateSceneAtMs(scene: Scene, keepMs: number): Scene {
+  const layers = scene.layers.map(layer => ({
+    ...layer,
+    tracks: layer.tracks
+      .map(track => {
+        // 关键帧只保证时间不重复、不保证升序，所以用过滤而不是截到第一个越界帧
+        const keys = track.keys.filter(k => k.atMs < keepMs)
+        return keys.length > 0 ? { ...track, keys } : undefined
+      })
+      .filter((t): t is Track => t !== undefined),
+  }))
+  return { ...scene, durationMs: Math.min(scene.durationMs, keepMs), layers }
 }
 
 /** 展开一条轨道为补间段序列。关键帧不足两个时返回空数组（无动画）。 */
