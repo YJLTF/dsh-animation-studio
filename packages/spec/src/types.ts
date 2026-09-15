@@ -57,7 +57,7 @@ export interface Track {
 
 /* ------------------------------------------------------------------ 图层 */
 
-export type LayerType = 'text' | 'rect' | 'circle' | 'image' | 'group'
+export type LayerType = 'text' | 'rect' | 'circle' | 'image' | 'group' | 'line' | 'arrow' | 'ellipse'
 
 /**
  * 图层静态属性。列出的是**已知**字段（有类型提示），
@@ -97,7 +97,18 @@ export interface LayerProps {
   lineHeight?: number
   // 图片
   src?: string
+  // 线条 / 箭头（line / arrow）
+  /** 折线顶点，如 [[-200,0],[200,0]]。坐标以图层自身原点为准（中心原点契约）。 */
+  points?: Array<[number, number]>
+  /** 画线进度 0~1：只显示从起点到该比例的一段（配合轨道动画做「画线」效果）。 */
+  start?: number
+  end?: number
+  startArrow?: boolean
+  endArrow?: boolean
+  /** 箭头大小（像素），默认 24。 */
+  arrowSize?: number
   // 分组
+  /** group 图层的成员图层 id 列表（同一场景内）。变换属性作用于整组。 */
   children?: LayerId[]
   [key: string]: JsonValue | undefined
 }

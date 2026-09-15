@@ -187,7 +187,7 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 
 ## 已知限制与说明
 
-- 图层类型目前支持 `text / rect / circle / image`，`group` 预留未实现；不支持的属性会以警告形式降级而不是失败。
+- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / group`（0.3.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；group 用 `children` 引用成员图层，变换作用于整组（MVP 单层分组）。不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
 - **工作台面板是只读的**（0.2.0 M2 范围）：卡片只展示状态与产物，"撤销这步 / 预览第 N 幕"按钮驱动的最简交互（P2）未做；面板功能依赖 `dsh web`（webServer 路由 + 浏览器插槽），headless CLI 会话只有工具回执、没有卡片。
 - `/dsh-anim/media` 的放行规则是「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg`）；把产物导出到 outputDir 之外的任意位置再用面板播放，前提是该路径出现在某次工具回执里。

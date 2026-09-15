@@ -24,7 +24,7 @@ import {
   tweensOf,
   validateSpec,
 } from '../packages/spec/src/index.ts'
-import type { AnimationSpec } from '../packages/spec/src/index.ts'
+import type { AnimationSpec, LayerType } from '../packages/spec/src/index.ts'
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
@@ -152,6 +152,92 @@ check('codegen: 图层 id 的连字符换成合法标识符；project.meta 带�
   const meta = JSON.parse(generateProjectMeta(spec))
   assert.equal(meta.rendering.fps, 30)
   assert.deepEqual(meta.shared.size, { x: 1280, y: 720 })
+})
+
+/* ------------------------------------- 0.3.0：圆形修复 + 新元素类型 */
+
+check('codegen: 圆形四形态回归——radius 换算、width/height 透传、缺省兜底、无色兜底', () => {
+  const sceneFor = (props: Record<string, unknown>): { content: string; warnings: string[] } => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [{ id: 'ball', name: '球', type: 'circle', props, tracks: [] }]
+    const r = generateProject(spec)
+    return { content: r.files.find(f => f.path === 'scenes/s0-intro.tsx')!.content, warnings: r.warnings }
+  }
+  // radius → size×2（模型按「圆半径」写是高频形态，0.3.0 之前直接静默丢属性 → 0×0 不可见）
+  const r1 = sceneFor({ radius: 40, fill: '#FFB020' })
+  assert.match(r1.content, /size=\{80\}/)
+  assert.ok(r1.warnings.some(w => w.includes('radius=40')), JSON.stringify(r1.warnings))
+  // width/height 原生透传（MC Circle 官方用法，width≠height 即椭圆）
+  const r2 = sceneFor({ width: 120, height: 60, fill: '#FFB020' })
+  assert.match(r2.content, /width=\{120\} height=\{60\}/)
+  // 缺尺寸 → size=100 兜底，杜绝 0×0
+  const r3 = sceneFor({ fill: '#FFB020' })
+  assert.match(r3.content, /size=\{100\}/)
+  assert.ok(r3.warnings.some(w => w.includes('size=100')), JSON.stringify(r3.warnings))
+  // 既无 fill 也无 stroke → 主题文字色兜底
+  const r4 = sceneFor({ size: 60 })
+  assert.match(r4.content, /fill=\{"#F2F5F7"\}/)
+})
+
+check('validate: circle 缺尺寸 / line 缺 points 或 stroke 有软警告，不阻断', () => {
+  const mk = (layer: unknown) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [layer as never]
+    return validateSpec(spec)
+  }
+  const circle = mk({ id: 'c', name: '圆', type: 'circle', props: { fill: '#fff' }, tracks: [] })
+  assert.ok(circle.ok)
+  if (circle.ok) assert.ok(circle.warnings.some(w => w.includes('circle')), JSON.stringify(circle.warnings))
+  const line = mk({ id: 'l', name: '线', type: 'line', props: { stroke: '#fff' }, tracks: [] })
+  assert.ok(line.ok)
+  if (line.ok) assert.ok(line.warnings.some(w => w.includes('points')), JSON.stringify(line.warnings))
+})
+
+check('codegen: 新元素类型——group 组合、line/arrow 折线箭头、ellipse', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    { id: 'axis', name: '轴', type: 'line', props: { points: [[-240, 0], [240, 0]], stroke: '#4C9AFF', lineWidth: 4 }, tracks: [{ id: 'draw', target: 'props.end', keys: [{ atMs: 0, value: 0 }, { atMs: 600, value: 1 }] }] },
+    { id: 'arr', name: '箭头', type: 'arrow', props: { points: [[0, -60], [0, -160]], stroke: '#FFB020', lineWidth: 4 }, tracks: [] },
+    { id: 'ell', name: '椭圆', type: 'ellipse', props: { width: 200, height: 100, fill: '#4C9AFF' }, tracks: [] },
+    { id: 'g', name: '组', type: 'group', props: { x: 100, children: ['axis', 'arr'] }, tracks: [{ id: 'fade', target: 'props.opacity', keys: [{ atMs: 0, value: 0 }, { atMs: 500, value: 1 }] }] },
+  ]
+  const { files, warnings } = generateProject(spec)
+  const s = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // group：Node 容器 + 成员挂到组节点而不是 view；组轨道作用于 Node
+  assert.match(s, /import \{makeScene2D, Circle, Line, Node\} from '@motion-canvas\/2d'/)
+  assert.match(s, /const n3_g = createRef<Node>\(\);/)
+  assert.match(s, /view\.add\(<Node ref=\{n3_g\}/)
+  assert.match(s, /n3_g\(\)\.add\(<Line ref=\{n0_axis\} /)
+  assert.match(s, /n3_g\(\)\.opacity\(0\);/)
+  // line：points 数组进 JSX；end 轨道驱动画线
+  assert.match(s, /points=\{\[\[-240,0\],\[240,0\]\]\}/)
+  assert.match(s, /n0_axis\(\)\.end\(1, 0\.6\)/)
+  // arrow：自动 endArrow
+  assert.match(s, /endArrow=\{true\}/)
+  // ellipse：Circle + width/height
+  assert.match(s, /const n2_ell = createRef<Circle>\(\);/)
+  assert.match(s, /width=\{200\} height=\{100\}/)
+  assert.deepEqual(warnings, [], JSON.stringify(warnings))
+})
+
+check('validate+codegen: 8 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
+  const types: Array<{ type: LayerType; props: Record<string, unknown> }> = [
+    { type: 'text', props: { text: 'x' } },
+    { type: 'rect', props: { width: 100, height: 50, fill: '#fff' } },
+    { type: 'circle', props: { size: 80, fill: '#fff' } },
+    { type: 'image', props: { src: 'x.png' } },
+    { type: 'group', props: { children: [] } },
+    { type: 'line', props: { points: [[0, 0], [10, 10]], stroke: '#fff' } },
+    { type: 'arrow', props: { points: [[0, 0], [10, 10]], stroke: '#fff' } },
+    { type: 'ellipse', props: { width: 100, height: 60, fill: '#fff' } },
+  ]
+  for (const t of types) {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [{ id: 'l0', name: 'x', type: t.type, props: t.props, tracks: [] }]
+    assert.equal(validateSpec(spec).ok, true, `${t.type} 应通过校验`)
+    const { files } = generateProject(spec)
+    assert.ok(files.some(f => f.path === 'scenes/s0-intro.tsx'), `${t.type} 应产出场景文件`)
+  }
 })
 
 /* ------------------------------------------------------------------ host */

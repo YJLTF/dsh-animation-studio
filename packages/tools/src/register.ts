@@ -414,9 +414,13 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
           type: 'json',
           required: true,
           description:
-            '场景对象：{ id, name, durationMs, layers: [{ id, name, type: text|rect|circle|image, props: {...}, tracks: [{ id, target: "props.x", keys: [{ atMs, value, ease }] }] }], transition?: { kind, durationMs } }。'
+            '场景对象：{ id, name, durationMs, layers: [{ id, name, type, props: {...}, tracks: [{ id, target: "props.x", keys: [{ atMs, value, ease }] }] }], transition?: { kind, durationMs } }。'
+            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | group。'
+            + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size；不要写 width/height 之外的尺寸。'
+            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边；arrow 自动带末端箭头（endArrow），画线进度用 start/end（0~1）轨道。'
+            + 'group 用 children: [成员图层id...] 组合，变换属性（x/y/scale/rotation/opacity）作用于整组，成员自己的动画不受影响。'
             + '所有时间都是场景内绝对毫秒。坐标系：props.x/y 的原点在画布中心（x 右正、y 下正），画布左上角是 (-宽/2, -高/2)——不是 web 的左上角原点，居中就是 x=0,y=0；'
-            + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」），改完再写下一幕。',
+            + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」与缺尺寸/缺描边兜底），改完再写下一幕。',
         },
         index: { type: 'number', description: '插入位置，省略则追加到末尾' },
       },

@@ -21,7 +21,7 @@ export type ValidateResult =
   | { ok: true; spec: AnimationSpec; warnings: string[] }
   | { ok: false; errors: SpecError[]; warnings: string[] }
 
-const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'image', 'group'])
+const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'image', 'group', 'line', 'arrow', 'ellipse'])
 const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -143,6 +143,27 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
   if (!isRecord(l.props)) c.fail(`${p}/props`, 'props 应为对象')
   if (!Array.isArray(l.tracks)) c.fail(`${p}/tracks`, 'tracks 应为数组')
   else l.tracks.forEach((t, i) => validateTrack(c, `${p}/tracks`, t, i))
+
+  // 类型相关的软性体检：不阻断校验，但把「注定画不出来」的形态说清楚。
+  // 真机教训：circle 缺尺寸 = MC 默认 0×0 不可见；line/arrow 缺 points 或
+  // 描边 = 不可见。渲染端还有一层兜底（见 codegen），这里的警告进工具回执。
+  const props = isRecord(l.props) ? l.props : undefined
+  if (l.type === 'circle' && props) {
+    const hasSize = props.size !== undefined || props.width !== undefined || props.height !== undefined || props.radius !== undefined
+    if (!hasSize) c.warn(`图层 ${String(l.id)}（circle）未指定尺寸（size/width/height/radius），渲染时按默认处理，可能过小或不可见`)
+    if (props.fill === undefined && props.stroke === undefined) {
+      c.warn(`图层 ${String(l.id)}（circle）既无 fill 也无 stroke，渲染端将按主题文字色兜底填充，否则不可见`)
+    }
+  }
+  if ((l.type === 'line' || l.type === 'arrow') && props) {
+    const pts = props.points
+    if (!Array.isArray(pts) || pts.length < 2 || !pts.every(p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite))) {
+      c.warn(`图层 ${String(l.id)}（${l.type}）的 points 需要至少两个 [x, y] 点，否则线条不可见`)
+    }
+    if (props.stroke === undefined) {
+      c.warn(`图层 ${String(l.id)}（${l.type}）未指定 stroke，渲染端将按主题文字色兜底，否则线条不可见`)
+    }
+  }
 }
 
 function validateAsset(c: Collector, path: string, a: unknown): void {

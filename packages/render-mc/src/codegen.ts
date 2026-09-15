@@ -13,7 +13,7 @@
  *    直接把 makeScene2D 内联进 scenes 数组，渲染器会在 reloadScenes 里崩掉。
  */
 
-import type { AnimationSpec, EaseSpec, KeyframeValue, Layer, LayerType, Scene } from '@dsh-anim/spec'
+import type { AnimationSpec, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
 import { sceneDurationMs, tweensOf } from '@dsh-anim/spec'
 
 export interface GeneratedFile {
@@ -32,33 +32,124 @@ export interface GenerateResult {
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
+/**
+ * 所有 Layout 系节点（Rect/Circle/Txt/Img/Line…）都有的尺寸/变换信号。
+ * 单独列出来，是为了让「size/width/height 对所有图层可动画」成立——
+ * MC 的 Layout 基类就有这三个 signal，不写进各类型的静态表也能动。
+ */
+const LAYOUT_PROPS = ['x', 'y', 'scale', 'rotation', 'opacity', 'size', 'width', 'height'] as const
+
 /** 各图层类型可接受的静态属性（值 = MC 组件上的属性名）。 */
 const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight' },
   rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius' },
-  circle: { size: 'size', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
+  // 由 normalizeLayerProps 换算成 size；见 0.3.0 规划 §1.4（圆形画不出来的修复）。
+  circle: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
   image: { src: 'src', width: 'width', height: 'height' },
+  // 成员经 children 引用，由 genSceneFile 组合成 Node 容器；静态属性只有变换。
   group: {},
+  // Line 的 start/end（0~1 画线进度）与 endArrow/arrowSize 都是 Curve 内建 signal
+  line: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
+  arrow: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
+  // MC 没有独立的 Ellipse 节点：椭圆 = Circle + width/height（官方用法）
+  ellipse: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
 }
 
-/** 可作为动画目标的属性（MC 上必须存在同名 signal）。 */
-const ANIMATABLE = new Set<string>([
-  ...COMMON_PROPS, 'fill', 'stroke', 'lineWidth', 'radius', 'width', 'height', 'size', 'fontSize', 'text',
-])
+/**
+ * 各类型可动画的目标集合：LAYOUT 信号 + 该类型静态属性表里的键。
+ *
+ * 不能再用全局大集合——rect 有 fill、image 没有，全局集合会把「对 Img 补间
+ * fill」这种运行时才会崩的代码放出去。按类型派生，不支持的动画目标走警告降级。
+ */
+const ANIMATABLE_BY_TYPE: Record<LayerType, Set<string>> = Object.fromEntries(
+  (Object.keys(STATIC_PROPS) as LayerType[]).map(type => [
+    type,
+    new Set<string>([...LAYOUT_PROPS, ...Object.keys(STATIC_PROPS[type])]),
+  ]),
+) as Record<LayerType, Set<string>>
 
 const COMPONENT: Record<LayerType, string | null> = {
   text: 'Txt',
   rect: 'Rect',
   circle: 'Circle',
   image: 'Img',
-  group: null, // MVP 未实现分组
+  group: 'Node', // 容器：成员用 .add() 挂进来，变换属性作用于整组
+  line: 'Line',
+  arrow: 'Line', // Line + endArrow（Curve 内建箭头，arrowSize 默认 24）
+  ellipse: 'Circle',
 }
 
 /* -------------------------------------------------------------- 工具函数 */
 
 function lit(value: KeyframeValue): string {
   if (typeof value === 'number' && Number.isFinite(value)) return num(value)
+  if (typeof value === 'boolean') return String(value)
   return JSON.stringify(String(value))
+}
+
+/** 属性值字面量：数组（points）走 JSON，原样进 JSX。 */
+function litProp(value: JsonValue): string {
+  if (Array.isArray(value)) return JSON.stringify(value)
+  if (value === null) return 'null'
+  return lit(value as KeyframeValue)
+}
+
+/**
+ * 按类型把 props 归一化成最终要写进 JSX 的属性表，并产出警告。
+ * 处理三类「模型常写错、静默画不出来」的形态：
+ * - circle 的 radius/r → size×2（MC Circle 没有 radius 信号）；
+ * - circle 缺尺寸 → 默认 size=100（MC 默认 0×0 不可见）；
+ * - 封闭形状（rect/circle/ellipse）既无 fill 也无 stroke → 主题文字色兜底；
+ * - line/arrow 缺 stroke → 主题文字色兜底；arrow 默认开 endArrow。
+ */
+function normalizeLayerProps(
+  type: LayerType,
+  props: LayerProps,
+  defaultTextFill: string,
+  warnings: string[],
+): Record<string, JsonValue> {
+  const out: Record<string, JsonValue> = {}
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined) continue
+    out[k] = v as JsonValue
+  }
+  if (type === 'group') {
+    // children 是组合引用，由 genSceneFile 消费，不是节点属性
+    delete out.children
+    return out
+  }
+  if ((type === 'rect' || type === 'circle' || type === 'ellipse') && out.fill === undefined && out.stroke === undefined) {
+    out.fill = defaultTextFill
+    warnings.push(`图层（${type}）既无 fill 也无 stroke，已按主题文字色填充兜底`)
+  }
+  if (type === 'circle') {
+    const r = out.radius ?? out.r
+    if (typeof r === 'number' && Number.isFinite(r) && r > 0) {
+      delete out.radius
+      delete out.r
+      if (out.size === undefined && out.width === undefined && out.height === undefined) {
+        out.size = r * 2
+        warnings.push(`circle 图层写了 radius=${r}，已换算为 size=${r * 2}`)
+      } else {
+        warnings.push(`circle 图层写了 radius=${r}，但已指定尺寸，radius 被忽略`)
+      }
+    }
+    if (out.size === undefined && out.width === undefined && out.height === undefined) {
+      out.size = 100
+      warnings.push('circle 图层未指定尺寸（size/width/height/radius），已按 size=100 兜底')
+    }
+  }
+  if (type === 'line' || type === 'arrow') {
+    if (out.stroke === undefined) {
+      out.stroke = defaultTextFill
+      warnings.push(`${type} 图层未指定 stroke，已按主题文字色描边兜底`)
+    }
+    if (type === 'arrow' && out.endArrow === undefined && out.startArrow === undefined) {
+      out.endArrow = true
+    }
+  }
+  return out
 }
 
 function num(v: number): string {
@@ -164,20 +255,57 @@ function genSceneFile(scene: Scene, index: number, background: string, defaultTe
   const initial: string[] = []
   const tasks: string[] = []
 
-  for (const [i, layer] of scene.layers.entries()) {
+  // Pass 1：分组关系。group 的 children 引用同一场景内的图层 id；
+  // MVP 单层分组（组内不套组），冲突引用以警告降级而不是失败。
+  const parentOf = new Map<string, string>() // 成员 id → 组 id
+  const membersOf = new Map<string, string[]>() // 组 id → 成员 id 列表
+  for (const layer of scene.layers) {
+    if (layer.type !== 'group') continue
+    const kids = Array.isArray(layer.props.children) ? layer.props.children : []
+    for (const childId of kids) {
+      if (childId === layer.id) {
+        warnings.push(`group ${layer.id} 不能包含自己，已忽略`)
+        continue
+      }
+      const child = scene.layers.find(l => l.id === childId)
+      if (!child) {
+        warnings.push(`group ${layer.id} 引用了不存在的图层 ${childId}，已忽略`)
+        continue
+      }
+      if (child.type === 'group') {
+        warnings.push(`group ${layer.id} 包含另一个 group（${childId}），MVP 不支持组内套组，已忽略`)
+        continue
+      }
+      if (parentOf.has(childId)) {
+        warnings.push(`图层 ${childId} 被多个 group 引用，只归入第一个（${parentOf.get(childId)}）`)
+        continue
+      }
+      parentOf.set(childId, layer.id)
+      membersOf.set(layer.id, [...(membersOf.get(layer.id) ?? []), childId])
+    }
+  }
+
+  // 变量名 = 图层在数组里的位置 + 净化后的 id（与文件内唯一性解耦）
+  const varName = (layer: Layer): string => `n${scene.layers.indexOf(layer)}_${sanitize(layer.id)}`
+
+  /**
+   * 生成单个图层的节点创建：createRef + 挂到 parentExpr（view 或组节点）。
+   * 返回该图层的变量名，轨道生成要用它。
+   */
+  const emitNode = (layer: Layer, parentExpr: string): string => {
     const component = COMPONENT[layer.type]
     if (component === null) {
       warnings.push(`图层 ${layer.id}（${layer.name}）类型 ${layer.type} 暂未实现，已跳过`)
-      continue
+      return ''
     }
     components.add(component)
-    const varName = `n${i}_${sanitize(layer.id)}`
+    const name = varName(layer)
 
-    const attrs = [`ref={${varName}}`]
+    const attrs = [`ref={${name}}`]
     const allowed: Record<string, string> = { ...STATIC_PROPS[layer.type] }
     for (const key of COMMON_PROPS) allowed[key] = key
-    for (const [rawProp, value] of Object.entries(layer.props)) {
-      if (value === undefined) continue
+    const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings)
+    for (const [rawProp, value] of Object.entries(normalized)) {
       let prop = rawProp
       // 模型几乎必然写过 color：语义就是填充色，按 fill 处理而不是丢弃
       if (prop === 'color' && !allowed.color && allowed.fill) {
@@ -188,40 +316,63 @@ function genSceneFile(scene: Scene, index: number, background: string, defaultTe
         warnings.push(`图层 ${layer.id} 的属性 ${rawProp} 不被 ${layer.type} 支持，已忽略`)
         continue
       }
-      attrs.push(`${mapped}={${lit(value as KeyframeValue)}}`)
+      attrs.push(`${mapped}={${litProp(value)}}`)
     }
     // text 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
-    if (layer.type === 'text' && layer.props.fill === undefined && layer.props.color === undefined) {
+    if (layer.type === 'text' && normalized.fill === undefined && normalized.color === undefined) {
       attrs.push(`fill={${JSON.stringify(defaultTextFill)}}`)
     }
-    setup.push(`const ${varName} = createRef<${component}>();`)
-    setup.push(`view.add(<${component} ${attrs.join(' ')} />);`)
+    setup.push(`const ${name} = createRef<${component}>();`)
+    setup.push(`${parentExpr}.add(<${component} ${attrs.join(' ')} />);`)
     coreImports.add('createRef')
+    return name
+  }
 
+  /** 生成一个图层的轨道：初值 + 补间。 */
+  const emitTracks = (layer: Layer): void => {
+    const name = varName(layer)
     // 轨道：先落初值，再产出补间
     const initials = new Map<string, string>()
+    const animatable = ANIMATABLE_BY_TYPE[layer.type]
     for (const track of layer.tracks) {
       const prop = track.target.replace(/^props\./, '')
-      if (!ANIMATABLE.has(prop)) {
+      if (!animatable.has(prop)) {
         warnings.push(`图层 ${layer.id} 的轨道目标 ${track.target} 不可动画，已忽略`)
         continue
       }
       const keys = [...track.keys].sort((a, b) => a.atMs - b.atMs)
       if (keys.length === 0) continue
-      initials.set(prop, `${varName}().${prop}(${lit(keys[0].value)});`)
+      initials.set(prop, `${name}().${prop}(${lit(keys[0].value)});`)
 
       for (const t of tweensOf(track)) {
         const ease = easeExpr(t.ease, imports)
         const easeArg = ease ? `, ${ease}` : ''
         if (t.durationMs <= 0) {
           // 离散跳变：delay 也接受普通 callback
-          tasks.push(`delay(${sec(t.startMs)}, () => ${varName}().${prop}(${lit(t.to)})),`)
+          tasks.push(`delay(${sec(t.startMs)}, () => ${name}().${prop}(${lit(t.to)})),`)
         } else {
-          tasks.push(`delay(${sec(t.startMs)}, ${varName}().${prop}(${lit(t.to)}, ${sec(t.durationMs)}${easeArg})),`)
+          tasks.push(`delay(${sec(t.startMs)}, ${name}().${prop}(${lit(t.to)}, ${sec(t.durationMs)}${easeArg})),`)
         }
       }
     }
     initial.push(...initials.values())
+  }
+
+  // 主循环：group 的成员随所属组一起生成（保证父节点先于子节点存在）
+  for (const layer of scene.layers) {
+    if (parentOf.has(layer.id)) continue // 成员由所属 group 内联生成
+    if (layer.type === 'group') {
+      const name = emitNode(layer, 'view')
+      for (const memberId of membersOf.get(layer.id) ?? []) {
+        const member = scene.layers.find(l => l.id === memberId)!
+        emitNode(member, `${name}()`)
+        emitTracks(member)
+      }
+      emitTracks(layer)
+      continue
+    }
+    emitNode(layer, 'view')
+    emitTracks(layer)
   }
 
   // 进入转场

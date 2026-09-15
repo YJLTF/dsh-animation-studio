@@ -90,15 +90,15 @@ export const spec: AnimationSpec = {
         {
           id: 'axis',
           name: '横轴',
-          type: 'rect',
-          props: { width: 620, height: 4, fill: '#4C9AFF', radius: 2, x: 0, y: 170 },
+          type: 'line',
+          props: { points: [[-310, 170], [310, 170]], stroke: '#4C9AFF', lineWidth: 4 },
           tracks: [
             {
               id: 'axis-grow',
-              target: 'props.width',
+              target: 'props.end',
               keys: [
                 { atMs: 0, value: 0 },
-                { atMs: 600, value: 620, ease: { kind: 'easeOut' } },
+                { atMs: 600, value: 1, ease: { kind: 'easeOut' } },
               ],
             },
             {
@@ -112,10 +112,35 @@ export const spec: AnimationSpec = {
           ],
         },
         {
+          id: 'dir-arrow',
+          name: '下降方向箭头',
+          type: 'arrow',
+          props: { points: [[0, -60], [0, -150]], stroke: '#FFB020', lineWidth: 4 },
+          tracks: [
+            {
+              id: 'arrow-draw',
+              target: 'props.end',
+              keys: [
+                { atMs: 700, value: 0 },
+                { atMs: 1300, value: 1, ease: { kind: 'easeOut' } },
+              ],
+            },
+            {
+              id: 'arrow-fade',
+              target: 'props.opacity',
+              keys: [
+                { atMs: 700, value: 0 },
+                { atMs: 1100, value: 1 },
+              ],
+            },
+          ],
+        },
+        {
           id: 'ball',
           name: '小球',
           type: 'circle',
-          props: { size: 64, fill: '#FFB020', x: -240, y: -150 },
+          // 0.3.0 修复的形态：radius 会被换算成 size（radius×2），此前直接丢属性 → 0×0 不可见
+          props: { radius: 32, fill: '#FFB020', x: -240, y: -150 },
           tracks: [
             {
               id: 'ball-x',
