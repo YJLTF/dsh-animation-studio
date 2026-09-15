@@ -21,7 +21,7 @@ export type ValidateResult =
   | { ok: true; spec: AnimationSpec; warnings: string[] }
   | { ok: false; errors: SpecError[]; warnings: string[] }
 
-const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'ellipse', 'image', 'line', 'arrow', 'polygon', 'star', 'svg', 'group'])
+const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'ellipse', 'image', 'line', 'arrow', 'polygon', 'star', 'svg', 'code', 'math', 'group'])
 const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -175,6 +175,19 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
   if (l.type === 'svg' && props) {
     if (typeof props.svg !== 'string' || props.svg.trim() === '') {
       c.warn(`图层 ${String(l.id)}（svg）未提供 svg 内容（props.svg 内嵌 SVG 字符串），渲染为空`)
+    }
+  }
+  if (l.type === 'code' && props) {
+    if (typeof props.code !== 'string' || props.code.trim() === '') {
+      c.warn(`图层 ${String(l.id)}（code）未提供代码内容（props.code），渲染为空`)
+    }
+    if (props.language !== undefined && typeof props.language !== 'string') {
+      c.fail(`${p}/props/language`, 'code 图层的 language 应为字符串（如 typescript / python / json）')
+    }
+  }
+  if (l.type === 'math' && props) {
+    if (typeof props.tex !== 'string' || props.tex.trim() === '') {
+      c.warn(`图层 ${String(l.id)}（math）未提供 LaTeX 公式（props.tex），渲染为空`)
     }
   }
 }

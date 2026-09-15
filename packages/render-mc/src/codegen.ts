@@ -61,6 +61,11 @@ const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   star: { data: 'data', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
   // MC SVG 组件只接受内嵌 svg 字符串（不是文件路径）；文件资产走 image 图层
   svg: { svg: 'svg', width: 'width', height: 'height' },
+  // Code 组件：code 是 CodeSignal（字符串可补间，{{片段}} 可着色）；
+  // language 不进静态表，由 emitNode 转成 highlighter 引用（见 code-highlight 模块）
+  code: { code: 'code', fontSize: 'fontSize', fontFamily: 'fontFamily', fill: 'fill' },
+  // Latex 组件（SVGNode）：tex 是 SVG 源，fill/fontSize 由 MC 的 Shape 信号提供
+  math: { tex: 'tex', fontSize: 'fontSize', fill: 'fill' },
 }
 
 /**
@@ -88,7 +93,57 @@ const COMPONENT: Record<LayerType, string | null> = {
   polygon: 'Polygon',
   star: 'Path', // codegen 内置星形 path（MC 3.17 没有 Star 组件）
   svg: 'SVG',
+  code: 'Code',
+  math: 'Latex',
 }
+
+/**
+ * code 图层的 language → code-highlight.ts 里导出的高亮器名。
+ * @lezer/javascript 只导出单一 parser，TS/JSX 用 dialect 配置派生；
+ * 未知语言返回 undefined（纯文本渲染，不染色）。
+ */
+const LANGUAGE_HIGHLIGHTER: Record<string, string> = {
+  typescript: 'tsHighlighter',
+  ts: 'tsHighlighter',
+  tsx: 'tsxHighlighter',
+  javascript: 'jsHighlighter',
+  js: 'jsHighlighter',
+  jsx: 'jsxHighlighter',
+  python: 'pythonHighlighter',
+  py: 'pythonHighlighter',
+  json: 'jsonHighlighter',
+  html: 'htmlHighlighter',
+  css: 'cssHighlighter',
+}
+
+/**
+ * code-highlight.ts 的完整源码：每个语言一个 LezerHighlighter 单例。
+ * 只在 spec 里出现带 language 的 code 图层时才生成（见 generateProject）。
+ */
+const CODE_HIGHLIGHT_FILE = `/**
+ * code 图层的语法高亮器。由 @dsh-anim/render-mc 生成，请勿手工编辑。
+ *
+ * @lezer/javascript 只导出单一 parser，TypeScript/JSX 通过 dialect 派生；
+ * 其余语言各用独立解析器。LezerHighlighter 与 Code 组件同为实验性 API，
+ * 但就是 3.17 的官方路径，渲染不受影响。
+ */
+
+import {LezerHighlighter} from '@motion-canvas/2d/lib/code';
+import {parser as jsParser} from '@lezer/javascript';
+import {parser as pythonParser} from '@lezer/python';
+import {parser as jsonParser} from '@lezer/json';
+import {parser as htmlParser} from '@lezer/html';
+import {parser as cssParser} from '@lezer/css';
+
+export const jsHighlighter = new LezerHighlighter(jsParser);
+export const tsHighlighter = new LezerHighlighter(jsParser.configure({dialect: 'ts'}));
+export const jsxHighlighter = new LezerHighlighter(jsParser.configure({dialect: 'jsx'}));
+export const tsxHighlighter = new LezerHighlighter(jsParser.configure({dialect: 'ts + jsx'}));
+export const pythonHighlighter = new LezerHighlighter(pythonParser);
+export const jsonHighlighter = new LezerHighlighter(jsonParser);
+export const htmlHighlighter = new LezerHighlighter(htmlParser);
+export const cssHighlighter = new LezerHighlighter(cssParser);
+`
 
 /* -------------------------------------------------------------- 工具函数 */
 
@@ -153,6 +208,10 @@ function normalizeLayerProps(
     // children 是组合引用，由 genSceneFile 消费，不是节点属性
     delete out.children
     return out
+  }
+  if (type === 'code') {
+    // language 不写进 JSX（Code 组件没有该 prop），由 emitNode 转成 highlighter 引用
+    delete out.language
   }
   if ((type === 'rect' || type === 'circle' || type === 'ellipse' || type === 'polygon' || type === 'star') && out.fill === undefined && out.stroke === undefined) {
     out.fill = defaultTextFill
@@ -321,6 +380,7 @@ function genSceneFile(
   defaultTextFill: string,
   assets: Record<string, Asset>,
   warnings: string[],
+  usedHighlighters: Set<string>,
 ): GeneratedFile {
   const components = new Set<string>()
   const coreImports = new Set<string>()
@@ -393,9 +453,20 @@ function genSceneFile(
       }
       attrs.push(`${mapped}={${litProp(value)}}`)
     }
-    // text 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
-    if (layer.type === 'text' && normalized.fill === undefined && normalized.color === undefined) {
+    // text/math 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
+    if ((layer.type === 'text' || layer.type === 'math') && normalized.fill === undefined && normalized.color === undefined) {
       attrs.push(`fill={${JSON.stringify(defaultTextFill)}}`)
+    }
+    // code 图层写了 language：挂上对应高亮器（带语言的 code 图层才触发 code-highlight 模块生成）
+    if (layer.type === 'code') {
+      const lang = typeof layer.props.language === 'string' ? layer.props.language.toLowerCase() : undefined
+      const highlighter = lang ? LANGUAGE_HIGHLIGHTER[lang] : undefined
+      if (lang && !highlighter) {
+        warnings.push(`code 图层 ${layer.id} 的语言 ${layer.props.language} 暂不支持高亮，按纯文本渲染`)
+      } else if (highlighter) {
+        usedHighlighters.add(highlighter)
+        attrs.push(`highlighter={${highlighter}}`)
+      }
     }
     setup.push(`const ${name} = createRef<${component}>();`)
     setup.push(`${parentExpr}.add(<${component} ${attrs.join(' ')} />);`)
@@ -495,6 +566,9 @@ function genSceneFile(
   if (easingImports.size > 0) {
     L.push(`import {${[...easingImports].sort().join(', ')}} from '../anim-easing';`)
   }
+  if (usedHighlighters.size > 0) {
+    L.push(`import {${[...usedHighlighters].sort().join(', ')}} from '../code-highlight';`)
+  }
   L.push('')
   L.push('export default makeScene2D(function* (view) {')
   L.push(`  view.fill('${background}');`)
@@ -580,9 +654,15 @@ export function generateProject(
 
   const files: GeneratedFile[] = [{ path: 'anim-easing.ts', content: EASING_FILE }]
 
+  // code 图层用了 language 才生成高亮模块：没有任何 code 图层时，
+  // 生成物不依赖 @lezer/* 语言包，项目保持最小。
+  const usedHighlighters = new Set<string>()
   spec.scenes.forEach((scene, i) => {
-    files.push(genSceneFile(scene, i, background, defaultTextFill, spec.assets, warnings))
+    files.push(genSceneFile(scene, i, background, defaultTextFill, spec.assets, warnings, usedHighlighters))
   })
+  if (usedHighlighters.size > 0) {
+    files.push({ path: 'code-highlight.ts', content: CODE_HIGHLIGHT_FILE })
+  }
 
   const imports = spec.scenes.map((s, i) => `import s${i} from './scenes/s${i}-${sanitize(s.id)}?scene';`)
   const L: string[] = []

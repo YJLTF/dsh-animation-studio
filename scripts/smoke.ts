@@ -258,7 +258,49 @@ check('codegen: image 引用未登记资产 → 警告且 src 保持原样', () 
   assert.ok(warnings.some(w => w.includes('未登记') && w.includes('ghost')), JSON.stringify(warnings))
 })
 
-check('validate+codegen: 11 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
+check('codegen: M3 元素——code 高亮器与 math 公式', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    { id: 'c', name: '代码', type: 'code', props: { code: 'const x: number = 1;', language: 'typescript', fontSize: 28, fill: '#fff' }, tracks: [] },
+    { id: 'c2', name: '代码2', type: 'code', props: { code: 'print("hi")', language: 'PyThOn' }, tracks: [] },
+    { id: 'c3', name: '代码3', type: 'code', props: { code: 'plain text' }, tracks: [] },
+    { id: 'm', name: '公式', type: 'math', props: { tex: 'E = mc^2' }, tracks: [] },
+  ]
+  const { files, warnings } = generateProject(spec)
+  const s = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // Code/Latex 组件映射
+  assert.match(s, /import \{makeScene2D, Code, Latex\} from '@motion-canvas\/2d'/)
+  assert.match(s, /const n0_c = createRef<Code>\(\);/)
+  assert.match(s, /const n3_m = createRef<Latex>\(\);/)
+  // language → highlighter 引用（大小写不敏感），场景 import 相应高亮器
+  assert.match(s, /highlighter=\{tsHighlighter\}/)
+  assert.match(s, /highlighter=\{pythonHighlighter\}/)
+  assert.match(s, /import \{pythonHighlighter, tsHighlighter\} from '\.\.\/code-highlight'/)
+  assert.ok(files.some(f => f.path === 'code-highlight.ts'), '带语言的 code 图层应生成 code-highlight.ts')
+  // 无 language 的 code 图层不染色、不告警
+  assert.doesNotMatch(s, /n2_c3\(\)[\s\S]*highlighter/, '无 language 的 code 图层不应挂 highlighter')
+  // math：tex 透传 + fill 兜底主题文字色
+  assert.match(s, /tex=\{"E = mc\^2"\}/)
+  assert.match(s, /fill=\{"#F2F5F7"\}/)
+  assert.ok(!warnings.some(w => w.includes('不支持高亮')), JSON.stringify(warnings))
+})
+
+check('validate: code 缺 code 内容 / math 缺 tex 有软警告，language 非字符串是硬错误', () => {
+  const mk = (layer: unknown) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [layer as never]
+    return validateSpec(spec)
+  }
+  const code = mk({ id: 'c', name: '代码', type: 'code', props: {}, tracks: [] })
+  assert.ok(code.ok)
+  if (code.ok) assert.ok(code.warnings.some(w => w.includes('props.code')), JSON.stringify(code.warnings))
+  const math = mk({ id: 'm', name: '公式', type: 'math', props: { tex: '' }, tracks: [] })
+  assert.ok(math.ok)
+  if (math.ok) assert.ok(math.warnings.some(w => w.includes('props.tex')), JSON.stringify(math.warnings))
+  assert.equal(mk({ id: 'c2', name: '代码2', type: 'code', props: { code: 'x', language: 42 }, tracks: [] }).ok, false)
+})
+
+check('validate+codegen: 13 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
   const types: Array<{ type: LayerType; props: Record<string, unknown> }> = [
     { type: 'text', props: { text: 'x' } },
     { type: 'rect', props: { width: 100, height: 50, fill: '#fff' } },
@@ -271,6 +313,8 @@ check('validate+codegen: 11 种图层类型三处一致（validate 放行、code
     { type: 'polygon', props: { size: 80, fill: '#fff' } },
     { type: 'star', props: { size: 80, fill: '#fff' } },
     { type: 'svg', props: { svg: '<svg/>' } },
+    { type: 'code', props: { code: 'x', language: 'python' } },
+    { type: 'math', props: { tex: 'x^2' } },
   ]
   for (const t of types) {
     const spec = demoSpec()

@@ -89,7 +89,7 @@ dsh plugin --profile web add F:\path\to\dsh-animation-studio
 请将 F:/path/to/dsh-animation-studio 打包为离线安装包
 ```
 
-打包器会：复制源码到暂存目录（跳过 node_modules / .git）→ `npm install` 生产依赖（`@deepseek-ai/*` 是 peer，由 dsh 宿主提供，不打入）→ 通过 `bundleDependencies` 把 vite、puppeteer-core、Motion Canvas 等全部运行时依赖闭包塞进 tarball → 出自包含的 `dsh-animation-studio-0.2.0.tgz`。`package.json` 的 `files` 白名单保证包内只有 `lib/` 与 `cordis.patch.yml`，干净且小。
+打包器会：复制源码到暂存目录（跳过 node_modules / .git）→ `npm install` 生产依赖（`@deepseek-ai/*` 是 peer，由 dsh 宿主提供，不打入）→ 通过 `bundleDependencies` 把 vite、puppeteer-core、Motion Canvas、`@lezer/*` 语言包等全部运行时依赖闭包塞进 tarball → 出自包含的 `dsh-animation-studio-0.3.0.tgz`。`package.json` 的 `files` 白名单保证包内只有 `lib/` 与 `cordis.patch.yml`，干净且小。
 
 构建环节是免维护的：`build.mjs` 用 esbuild alias 解析工作区内部包，暂存目录里没有 pnpm 软链也能构建——源码目录里**已经跑过 `pnpm build`** 就直接用现成的 `lib/`，没跑过打包器也会自动构建，两种情况都不需要手工干预。
 
@@ -203,7 +203,7 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 
 ## 已知限制与说明
 
-- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / group`（0.3.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；polygon 是正多边形（`sides`+`size`）、star 自动生成星形（`size`+`sides`）；svg 用内嵌 SVG 字符串；image 的 `src` 可写 `asset:<assetId>` 引用素材；group 用 `children` 引用成员图层，变换作用于整组（MVP 单层分组）。不支持的属性会以警告形式降级而不是失败。
+- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / code / math / group`（0.3.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；polygon 是正多边形（`sides`+`size`）、star 自动生成星形（`size`+`sides`）；svg 用内嵌 SVG 字符串；image 的 `src` 可写 `asset:<assetId>` 引用素材；code 用 `code`+`language`（typescript/ts/tsx/javascript/js/jsx/python/py/json/html/css，自动语法高亮，`{{片段}}` 可给片段着色）渲染到 Motion Canvas 的 `Code` 节点；math 用 `tex` 写 LaTeX 公式渲染到 `Latex` 节点；group 用 `children` 引用成员图层，变换作用于整组（MVP 单层分组）。不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
 - **工作台面板是只读的**（0.2.0 M2 范围）：卡片只展示状态与产物，"撤销这步 / 预览第 N 幕"按钮驱动的最简交互（P2）未做；面板功能依赖 `dsh web`（webServer 路由 + 浏览器插槽），headless CLI 会话只有工具回执、没有卡片。
 - `/dsh-anim/media` 的放行规则是「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg`）；把产物导出到 outputDir 之外的任意位置再用面板播放，前提是该路径出现在某次工具回执里。

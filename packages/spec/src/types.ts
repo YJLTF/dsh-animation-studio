@@ -62,6 +62,7 @@ export type LayerType =
   | 'line' | 'arrow'
   | 'polygon' | 'star'
   | 'svg'
+  | 'code' | 'math'
   | 'group'
 
 /**
@@ -118,6 +119,18 @@ export interface LayerProps {
   // 内嵌 SVG（svg 图层）
   /** 内嵌 SVG 字符串（svg 图层用，如 '<svg viewBox="0 0 100 100">…</svg>'）。 */
   svg?: string
+  // 代码（code 图层）
+  /** 代码内容（code 图层）。字符串里用 `{{片段}}` 可给片段着色（Code 组件原生语法）。 */
+  code?: string
+  /**
+   * 代码语言（code 图层，用于语法高亮）。
+   * 支持：typescript/ts、tsx、javascript/js、jsx、python/py、json、html、css。
+   * 缺省或未知语言不染色（纯文本，仍可正常渲染）。
+   */
+  language?: string
+  // 数学公式（math 图层）
+  /** LaTeX 公式源码（math 图层），如 'E = mc^2'、'x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}'。 */
+  tex?: string
   // 分组
   /** group 图层的成员图层 id 列表（同一场景内）。变换属性作用于整组。 */
   children?: LayerId[]
