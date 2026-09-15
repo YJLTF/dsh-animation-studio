@@ -1,0 +1,24 @@
+{
+  "name": "@dsh-anim/example-hello-gradient",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node --import tsx scripts/generate.ts",
+    "build": "vite build",
+    "render": "node --import tsx scripts/render.ts",
+    "serve": "vite"
+  },
+  "dependencies": {
+    "@dsh-anim/render-mc": "workspace:*",
+    "@dsh-anim/spec": "workspace:*",
+    "@motion-canvas/2d": "3.17.2",
+    "@motion-canvas/core": "3.17.2"
+  },
+  "devDependencies": {
+    "@motion-canvas/ui": "3.17.2",
+    "@motion-canvas/vite-plugin": "3.17.2",
+    "typescript": "^5.7.3",
+    "vite": "^5.4.11"
+  }
+}

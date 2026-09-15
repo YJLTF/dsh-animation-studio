@@ -1,0 +1,224 @@
+/**
+ * render-mc 作为 dsh 渲染接缝的 **Provider** 一半。
+ *
+ * 它把 AnimationSpec 编译成 Motion Canvas 项目源码，再驱动 headless 浏览器出帧、
+ * 交给 ffmpeg 合成 MP4。三条踩过的坑固化成代码里的显式处理：
+ *
+ * 1. **WebGL**：纯 headless Chromium 拿不到 GL 上下文，渲染器会直接崩。
+ *    必须 Xvfb 虚拟显示 + 有头模式 + SwiftShader。所以本模块不自作主张地
+ *    改浏览器参数，而是 `diagnose()` 把它查出来、让上层决定怎么办。
+ * 2. **`?scene` 导入**：见 codegen.ts 头注释，场景只能以 `?scene` 形式进入 makeProject。
+ * 3. **帧落盘子目录**：image-sequence exporter 把帧写进 `output/<project>/`，
+ *    收集时必须递归，别只扫顶层。
+ *
+ * 依赖注入的边界：`AnimRenderer` 接口只认 spec 和信号，不认 vite / puppeteer。
+ * 渲染实现通过 `MotionCanvasRuntime` 注入，这样插件跑在 dsh 里时可以用
+ * `ctx.subprocess` 提供的进程能力，离线脚本里用直接 `spawn`。
+ */
+
+import { execFile } from 'node:child_process'
+import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { promisify } from 'node:util'
+
+import type { AnimationSpec } from '@dsh-anim/spec'
+import { sceneDurationMs, specDurationMs } from '@dsh-anim/spec'
+
+import type { AnimRenderer, PreviewRequest, PreviewResult, RenderDiagnostics, RenderRequest, RenderResult } from './contract.ts'
+import { generateProject, resolveResolutionScale } from './codegen.ts'
+
+const exec = promisify(execFile)
+
+/** 生成物要落到磁盘上，这一步由调用方提供目录。 */
+export interface MotionCanvasRuntime {
+  /**
+   * 把生成的项目文件写进工作目录，返回项目入口（vite 的 project 路径）。
+   * 返回相对路径，便于日志可读。
+   */
+  materialize(files: Array<{ path: string; content: string }>, workDir: string): Promise<void>
+  /**
+   * 打开编辑器并驱动一次渲染，帧落到 workDir/output 下。
+   * 实现里要处理 Xvfb / 浏览器参数 / 点击 Render / 等帧写满。
+   */
+  renderProject(options: {
+    workDir: string
+    fps: number
+    expectedFrames: number
+    signal: AbortSignal
+    onProgress?: (done: number, total: number) => void
+  }): Promise<{ frameDir: string; frameCount: number }>
+  /** 环境自检：浏览器、WebGL、ffmpeg、中文字体。 */
+  probe(): Promise<RenderDiagnostics>
+}
+
+export interface MotionCanvasRendererOptions {
+  runtime: MotionCanvasRuntime
+  /** 生成源码与帧的中间目录。 */
+  workDir: string
+  /** 默认输出路径（未在请求里指定时使用）。 */
+  defaultOutputPath?: string
+}
+
+export class MotionCanvasRenderer implements AnimRenderer {
+  readonly name = 'motion-canvas'
+
+  #runtime: MotionCanvasRuntime
+  #workDir: string
+  #defaultOutputPath: string | undefined
+
+  constructor(options: MotionCanvasRendererOptions) {
+    this.#runtime = options.runtime
+    this.#workDir = options.workDir
+    this.#defaultOutputPath = options.defaultOutputPath
+  }
+
+  async diagnose(): Promise<RenderDiagnostics> {
+    return this.#runtime.probe()
+  }
+
+  async preview(request: PreviewRequest, signal: AbortSignal): Promise<PreviewResult> {
+    // 预览 = 只渲染抽样帧。Motion Canvas 没有「只渲某几帧」的入口，
+    // 所以 MVP 的做法是整片低分辨率渲染后挑帧；`atMs` 只是告诉调用方
+    // 该看哪几帧，不改变渲染量。
+    const resolutionScale = resolveResolutionScale(request.scale)
+    const result = await this.#renderFrames(request.spec, signal, resolutionScale)
+    const at = request.atMs?.length ? request.atMs : autoSamplePoints(request.spec)
+    const frames = at
+      .map(atMs => {
+        const index = Math.min(
+          result.frameCount - 1,
+          Math.max(0, Math.round((atMs / 1000) * request.spec.meta.fps)),
+        )
+        return {
+          atMs,
+          path: join(result.frameDir, `${String(index).padStart(6, '0')}.png`),
+          width: Math.round(request.spec.meta.size.width * resolutionScale),
+          height: Math.round(request.spec.meta.size.height * resolutionScale),
+        }
+      })
+    return { frames, renderer: this.name }
+  }
+
+  async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
+    const resolutionScale = resolveResolutionScale(request.scale)
+    const result = await this.#renderFrames(request.spec, signal, resolutionScale, request.onProgress)
+    const outputPath = request.outputPath || this.#defaultOutputPath
+    if (!outputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
+
+    const durationMs = specDurationMs(request.spec.scenes)
+    await this.#encode(result.frameDir, result.expected, outputPath, request.spec)
+    return {
+      outputPath,
+      frameCount: result.frameCount,
+      durationMs,
+      // 报告实际输出尺寸：resolutionScale ≠ 1 时帧是缩过的，别谎报原始分辨率
+      width: Math.round(request.spec.meta.size.width * resolutionScale),
+      height: Math.round(request.spec.meta.size.height * resolutionScale),
+      renderer: this.name,
+    }
+  }
+
+  /* ---------------------------------------------------------------- 内部 */
+
+  async #renderFrames(
+    spec: AnimationSpec,
+    signal: AbortSignal,
+    resolutionScale: number,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ frameDir: string; frameCount: number; expected: number }> {
+    if (signal.aborted) throw new Error('渲染已取消')
+
+    const { files, warnings } = generateProject(spec, { resolutionScale })
+    if (warnings.length > 0) {
+      // 生成期降级必须可见：静默丢属性比渲染失败更难查
+      for (const w of warnings) console.warn(`[render-mc] ${w}`)
+    }
+
+    mkdirSync(this.#workDir, { recursive: true })
+    await this.#runtime.materialize(files, this.#workDir)
+
+    const totalMs = specDurationMs(spec.scenes)
+    const expected = Math.round((totalMs / 1000) * spec.meta.fps)
+    const result = await this.#runtime.renderProject({
+      workDir: this.#workDir,
+      fps: spec.meta.fps,
+      expectedFrames: expected,
+      signal,
+      onProgress,
+    })
+    return { ...result, expected }
+  }
+
+  async #encode(frameDir: string, expected: number, outputPath: string, spec: AnimationSpec): Promise<void> {
+    await encodeFrames(frameDir, expected, spec.meta.fps, outputPath)
+  }
+}
+
+/**
+ * 把帧序列合成 MP4。
+ *
+ * - 有 libx264 用 CRF 质量；没有则退到 libopenh264（部分发行版的 ffmpeg）；
+ * - `-frames:v` 严格按 spec 时长截断，避免 exporter 多输出的黑色缓冲帧混进成片。
+ */
+export async function encodeFrames(
+  frameDir: string,
+  expected: number,
+  fps: number,
+  outputPath: string,
+): Promise<void> {
+  const pattern = join(frameDir, '%06d.png')
+  mkdirSync(dirname(resolve(outputPath)), { recursive: true })
+  const codec = await hasEncoder('libx264') ? 'libx264' : 'libopenh264'
+  const codecOpts = codec === 'libopenh264' ? ['-b:v', '6M'] : ['-crf', '20']
+  await exec('ffmpeg', [
+    '-y', '-framerate', String(fps), '-i', pattern,
+    '-frames:v', String(expected),
+    '-fps_mode', 'cfr', '-r', String(fps), '-pix_fmt', 'yuv420p',
+    '-c:v', codec, ...codecOpts,
+    '-movflags', '+faststart',
+    outputPath,
+  ])
+}
+
+async function hasEncoder(name: string): Promise<boolean> {
+  try {
+    const { stdout } = await exec('ffmpeg', ['-hide_banner', '-encoders'])
+    return String(stdout ?? '').includes(name)
+  } catch {
+    return false
+  }
+}
+
+/** 递归一层收集帧文件。不要只扫顶层——exporter 会建子目录。 */
+export function collectFrames(dir: string): string[] {
+  const out: string[] = []
+  for (const top of readdirSync(dir)) {
+    const full = join(dir, top)
+    if (statSync(full).isDirectory()) {
+      for (const f of readdirSync(full)) {
+        if (f.endsWith('.png') || f.endsWith('.jpg')) out.push(join(full, f))
+      }
+    } else if (top.endsWith('.png') || top.endsWith('.jpg')) {
+      out.push(full)
+    }
+  }
+  return out.sort((a, b) => a.localeCompare(b, 'en', { numeric: true }))
+}
+
+/** 清空输出目录：旧帧混进新片是最难发现的一类错误。 */
+export function resetDir(dir: string): void {
+  rmSync(dir, { recursive: true, force: true })
+  mkdirSync(dir, { recursive: true })
+}
+
+/** 没有指定抽帧点时的默认采样：每幕的起点 + 每幕的中点（内容最丰富的时刻）。 */
+export function autoSamplePoints(spec: AnimationSpec): number[] {
+  const points: number[] = []
+  let cursor = 0
+  for (const scene of spec.scenes) {
+    const d = sceneDurationMs(scene)
+    points.push(cursor, cursor + Math.round(d / 2))
+    cursor += d
+  }
+  return points
+}

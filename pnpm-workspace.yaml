@@ -1,0 +1,10 @@
+packages:
+  - "packages/*"
+  - "examples/*"
+
+# dsh 生态以 alpha 版本快速迭代，pnpm 10 的 24h 供应链延迟（minimumReleaseAge）
+# 会频繁误拦刚发布的依赖。此设置与 dsh profile 侧的离线安装要求一致，见 README。
+minimumReleaseAge: 0
+
+allowBuilds:
+  esbuild: true

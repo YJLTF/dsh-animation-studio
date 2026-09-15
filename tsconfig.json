@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/spec" },
+    { "path": "packages/render-mc" },
+    { "path": "packages/tools" }
+  ]
+}

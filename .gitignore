@@ -1,0 +1,23 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+lib/
+*.tsbuildinfo
+
+# 渲染产物：帧图与合成视频都是可重现的，不进版本库
+output/
+*.mp4
+
+# 插件运行时的工作目录（生成项目、帧缓存）
+.dsh/
+
+# 探针与临时文件
+*.log
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
