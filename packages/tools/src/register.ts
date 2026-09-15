@@ -34,15 +34,39 @@ import {
 /**
  * 会话事件写入口。
  *
- * dsh 0.1.5-alpha.2 的会话 API 是 `session.append(type, data)`；除此之外没有
- * 更通用的落盘入口，所以这里做成一个可替换的桥：优先走 session，其次退到
- * cordis 事件总线，最后退到日志。其余代码只认这个接口，不认具体实现。
+ * dsh 0.1.5-rc.2 的会话 API 是 `session.append(type, data)`，且 append 处会
+ * 严格校验 data 的「无损 JSON」合法性：任何一个对象属性值为 undefined
+ * （更不用说函数、循环引用）都会让整条事件在 append 现场抛错。而可选字段
+ * （如 anim_patch 的 note、大纲条目的 narration）在 TS 语义里天然可能带着
+ * undefined 属性值，所以这里在边界上做一次深清理——构建新对象、跳过
+ * undefined 属性——对三条退路（session / 事件总线 / 日志）统一生效。
+ *
+ * 除此之外没有更通用的落盘入口，所以这里仍是一个可替换的桥：优先走
+ * session，其次退到 cordis 事件总线，最后退到日志。其余代码只认这个接口，
+ * 不认具体实现。
  *
  * 注意：cordis 的 Context 是代理，读取未 inject 的服务属性会直接抛错
  * （而不是返回 undefined），所以所有属性探测都必须裹进 try/catch。
  */
 export interface EventSink {
   append(event: AnimEvent): void
+}
+
+/**
+ * 深清理事件载荷：返回一个不含 undefined 属性值的等价 JSON 值。
+ * 只重建普通对象与数组；遇到 undefined 属性即跳过（正是 dsh rc.2 的
+ * 无损 JSON 校验所拒绝的形态），其余原样保留。
+ */
+function stripUndefined<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(stripUndefined) as unknown as T
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value)) {
+      if (v !== undefined) out[k] = stripUndefined(v)
+    }
+    return out as unknown as T
+  }
+  return value
 }
 
 /** 读取 ctx 上的属性；cordis 代理对未注入服务的访问会抛错，这里统一吞掉。 */
@@ -57,18 +81,19 @@ function probe(ctx: Context, key: string): unknown {
 export function resolveEventSink(ctx: Context): EventSink {
   return {
     append(event) {
+      const data = stripUndefined(event.data)
       const session = probe(ctx, 'session') as { append?(type: string, data: unknown): void } | undefined
       if (typeof session?.append === 'function') {
-        session.append(event.type, event.data)
+        session.append(event.type, data)
         return
       }
       const emit = probe(ctx, 'emit') as ((name: string, payload?: unknown) => void) | undefined
       if (typeof emit === 'function') {
-        emit.call(ctx, event.type, event.data)
+        emit.call(ctx, event.type, data)
         return
       }
       const logger = probe(ctx, 'logger') as { info?(message: string): void } | undefined
-      logger?.info?.(`[anim] ${event.type} ${JSON.stringify(event.data).slice(0, 200)}`)
+      logger?.info?.(`[anim] ${event.type} ${JSON.stringify(data).slice(0, 200)}`)
     },
   }
 }
@@ -223,7 +248,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             id: String(o.id ?? ''),
             name: String(o.name ?? ''),
             intent: String(o.intent ?? ''),
-            narration: o.narration === undefined ? undefined : String(o.narration),
+            // 缺省就别留 undefined 属性值：rc.2 的 session.append 会按无损
+            // JSON 校验整条拒绝（EventSink 里还有一层兜底深清理）
+            ...(o.narration === undefined ? {} : { narration: String(o.narration) }),
             durationMs: Number(o.durationMs ?? 0),
           }
         })

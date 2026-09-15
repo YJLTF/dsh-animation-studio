@@ -5,9 +5,10 @@
  * 事件与类型就都对上了（`'anim/spec-created'` 的载荷会被推导成
  * `AnimSpecCreatedData`，写错字段编译期就炸）。
  *
- * 这个文件在仓库里是「待生效」的——`@deepseek-ai/dsh-session` 未发布到 npm，
- * 装不上，所以这里是 ambient 声明。把本包装进真 dsh 仓库后，它与官方的
- * `SessionEventMap` 自动合并；合并前它也不会引起编译错误。
+ * 自 dsh 0.1.5-rc.2 起 `@deepseek-ai/dsh-session` 已发布真实类型，这里的
+ * `declare module` 是对官方 `SessionEventMap` 的标准模块扩充（interface 自动
+ * 合并），合并后的 `anim/*` 键会进入 `SessionEventType`——官方类型里注明该
+ * 接口就是为插件合并设计的（merge-extensible）。
  */
 declare module '@deepseek-ai/dsh-session' {
   interface SessionEventMap {

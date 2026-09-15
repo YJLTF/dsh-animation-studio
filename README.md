@@ -2,7 +2,7 @@
 
 给 [DeepSeek Harness（DSH）](https://deepseek-harness.github.io/deepseek-harness/) 做的**教学动画制作工作台**插件：一套内置在教学会话里的"教学视频 agent"。你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 9 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程，中途可以随时抽查画面、改一个关键帧、或者撤销上一步。
 
-基于 **dsh 0.1.5-alpha.2**（cordis 4.0.2 / dsh-tools 0.1.5-alpha.2）的类型开发与校验，可直接用 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
+基于 **dsh 0.1.5-rc.2**（cordis 4.0.2 / dsh-tools 0.1.5-rc.2）的类型开发与校验，可直接用 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
 
 ---
 
@@ -47,7 +47,7 @@
 
 ## 环境要求
 
-- Node.js ≥ 22，已安装 DSH ≥ 0.1.5-alpha.2（`dsh` CLI 可用）
+- Node.js ≥ 22，已安装 DSH ≥ 0.1.5-rc.2（`dsh` CLI 可用）
 - **包管理器必须用 pnpm**（在 pnpm 12 上验证）：工作区包互相依赖用的是 `workspace:*` 协议，npm 不支持该协议（装不上），且根脚本直接调用 `pnpm -r` / `pnpm --filter`
 - 渲染需要（不渲染只做脚本可以不装）：
   - **ffmpeg**（帧合成 MP4）
@@ -148,9 +148,9 @@ node --import tsx scripts/render.ts     # 源码 → output/output.mp4（需要�
 
 ```bash
 pnpm install
-pnpm typecheck   # 三个包全量类型检查（对真实 @deepseek-ai/dsh-tools@0.1.5-alpha.2 类型）
+pnpm typecheck   # 三个包全量类型检查（对真实 @deepseek-ai/dsh-tools@0.1.5-rc.2 类型）
 pnpm build       # esbuild 打包插件 → lib/index.js
-pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟（无需浏览器）
+pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟（含 rc.2 无损 JSON 事件校验，无需浏览器）
 ```
 
 ### 渲染层单独诊断
@@ -165,7 +165,7 @@ node --import tsx scripts/debug-render.ts   # 输出帧数、帧目录与 debug-
 
 - 图层类型目前支持 `text / rect / circle / image`，`group` 预留未实现；不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
-- 会话事件的落盘桥（`resolveEventSink`）优先走 `session.append`，退到事件总线、再退到日志；接入真实 dsh 会话持久化还需在真机确认一次 API（headless profile 的会话文件不落工具条目，事件持久化尚未在 Web 会话里验证）。
+- 会话事件的落盘桥（`resolveEventSink`）优先走 `session.append`，退到事件总线、再退到日志。dsh 0.1.5-rc.2 的 `session.append` 按「无损 JSON」严格校验载荷（任何 undefined 属性值整条拒绝），事件在边界上已做深清理并通过冒烟验证；但 `anim/*` 属于插件自有事件，不在 rc.2 的核心事件词汇表内，持久化信封上的 `ignorable` 标记由宿主侧负责——事件真正落盘仍需在真机 Web 会话里确认一次。
 - 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。
 - Windows 下离线 tgz 的存放路径不能包含空格（`dsh plugin add` 的转发限制），详见 offline-packager README。
 - `dsh plugin add` 在部分 Windows 环境会把 pnpm 转发给 cmd 执行；若 cmd 按 PATH 找不到 pnpm（本机实测出现过），直接在 profile 目录里 `pnpm add <插件路径>` 并把插件名写进 profile `package.json` 的 `dsh.profile.bundles` 即可。
