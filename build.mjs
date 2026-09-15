@@ -6,8 +6,14 @@
  * - @deepseek-ai/*：dsh 宿主在 profile 里提供，打进包反而会实例化两份；
  * - vite / puppeteer-core / @motion-canvas/*：体量大且含动态加载，作为
  *   dependencies 随离线包携带，由 node_modules 解析。
+ *
+ * 工作区包靠 alias 解析而不是 node_modules 软链：本仓库是 pnpm workspace，
+ * 而 dsh-plugin-offline-packager 在暂存目录里用 npm 安装依赖（npm 不认
+ * pnpm-workspace.yaml，不会建工作区软链）——alias 让「拷走源码就能构建」
+ * 与包管理器无关，打包器的自动构建路径因此可用。
  */
 import { build } from 'esbuild'
+import { resolve } from 'node:path'
 
 await build({
   entryPoints: ['packages/tools/src/index.ts'],
@@ -17,6 +23,10 @@ await build({
   format: 'esm',
   target: 'node22',
   sourcemap: 'linked',
+  alias: {
+    '@dsh-anim/spec': resolve('packages/spec/src/index.ts'),
+    '@dsh-anim/render-mc': resolve('packages/render-mc/src/index.ts'),
+  },
   external: [
     '@deepseek-ai/*',
     'vite',
