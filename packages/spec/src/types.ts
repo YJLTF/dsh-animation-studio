@@ -62,13 +62,23 @@ export type LayerType = 'text' | 'rect' | 'circle' | 'image' | 'group'
 /**
  * 图层静态属性。列出的是**已知**字段（有类型提示），
  * 其余字段通过索引签名放开放置，便于后端适配器扩展。
+ *
+ * 坐标系契约：`x`/`y` 的**原点在画布中心**——x 向右为正、y 向下为正，
+ * 单位 px，画布左上角是 `(-width/2, -height/2)`、右下角是 `(width/2, height/2)`。
+ * 这与渲染后端（Motion Canvas）一致，但与 web/CSS 的左上角原点直觉相反；
+ * validateSpec 会对疑似按左上角书写的坐标给出警告。
  */
 export interface LayerProps {
   // 变换
+  /** 水平位置：原点在画布中心，向右为正；画布左缘是 -meta.size.width/2。 */
   x?: number
+  /** 垂直位置：原点在画布中心，向下为正；画布上缘是 -meta.size.height/2。 */
   y?: number
+  /** 等比缩放系数，1 = 原始大小。 */
   scale?: number
+  /** 旋转角度（度），正值为顺时针。 */
   rotation?: number
+  /** 不透明度，0（透明）~ 1（不透明）。 */
   opacity?: number
   // 尺寸
   width?: number

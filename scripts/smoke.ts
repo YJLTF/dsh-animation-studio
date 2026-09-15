@@ -73,6 +73,22 @@ check('validate: 合法 spec 通过，缺 props. 前缀的 target 被拒', () =>
   assert.equal(validateSpec(bad).ok, false)
 })
 
+check('validate: 左上角原点坐标触发警告，出现负坐标则视为知情不告警', () => {
+  const topLeft = demoSpec()
+  topLeft.scenes[0].layers[0].props.x = 640 // 1280 宽的画布：中心原点下这是右缘
+  topLeft.scenes[0].layers[0].props.y = 360
+  const r = validateSpec(topLeft)
+  assert.ok(r.ok, '坐标警告不应阻断校验')
+  if (r.ok) assert.ok(r.warnings.some(w => w.includes('左上角')), JSON.stringify(r.warnings))
+
+  const entrance = demoSpec()
+  entrance.scenes[0].layers[0].props.x = 640
+  entrance.scenes[0].layers[0].props.y = -200 // 有负值 = 作者知道画布中心之外还有空间
+  const r2 = validateSpec(entrance)
+  assert.ok(r2.ok)
+  if (r2.ok) assert.deepEqual(r2.warnings, [])
+})
+
 check('patch: replace 生效且 inverse 完整还原、入参不被修改', () => {
   const original = demoSpec()
   const r = applyPatch(original, [{ op: 'replace', path: '/meta/title', value: '新标题' }])

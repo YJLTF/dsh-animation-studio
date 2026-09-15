@@ -192,7 +192,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_create_spec',
       description:
-        '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。',
+        '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。'
+        + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec 标识，建议用短横线命名，如 gradient-descent' },
         title: { type: 'string', required: true, description: '片名' },
@@ -271,7 +272,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
           type: 'json',
           required: true,
           description:
-            '场景对象：{ id, name, durationMs, layers: [{ id, name, type: text|rect|circle|image, props: {...}, tracks: [{ id, target: "props.x", keys: [{ atMs, value, ease }] }] }], transition?: { kind, durationMs } }。所有时间都是绝对毫秒。',
+            '场景对象：{ id, name, durationMs, layers: [{ id, name, type: text|rect|circle|image, props: {...}, tracks: [{ id, target: "props.x", keys: [{ atMs, value, ease }] }] }], transition?: { kind, durationMs } }。'
+            + '所有时间都是场景内绝对毫秒。坐标系：props.x/y 的原点在画布中心（x 右正、y 下正），画布左上角是 (-宽/2, -高/2)——不是 web 的左上角原点，居中就是 x=0,y=0；'
+            + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」），改完再写下一幕。',
         },
         index: { type: 'number', description: '插入位置，省略则追加到末尾' },
       },

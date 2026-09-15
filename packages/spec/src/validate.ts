@@ -272,6 +272,61 @@ export function validateSpec(input: unknown, options: { allowEmptyScenes?: boole
     }
   }
 
+  // 坐标系启发式：IR 的原点在画布中心（x 右正、y 下正），而调用方的默认直觉
+  // 是 web/CSS 的左上角原点。按左上角写出来的布局在中心原点下整体塌进右下
+  // 象限——渲染不报错、只在看片时才发现，必须在生成阶段就提醒。
+  //
+  // 判据（按幕）：本幕所有 x/y 值都不为负——左上角思维意识不到画布左/上还有
+  // 空间，永远写不出负坐标，出现任何一个负值就说明作者知道中心原点——且存在
+  // 图层静止位置超出画布半径。中途的极端关键帧不参与判定，那多半是滑入入场的
+  // 离屏起点；静止位置（静态 props 与每条轨道按 atMs 最大的关键帧）才是布局
+  // 意图。确按中心原点的满幅布局理论上会误报，文案里写明可忽略。
+  if (c.errors.length === 0 && Array.isArray(input.scenes)) {
+    const size = isRecord(input.meta) && isRecord(input.meta.size) ? input.meta.size : undefined
+    const halfW = size && isFiniteNumber(size.width) ? size.width / 2 : undefined
+    const halfH = size && isFiniteNumber(size.height) ? size.height / 2 : undefined
+    if (halfW !== undefined && halfH !== undefined) {
+      for (const [i, s] of input.scenes.entries()) {
+        if (!isRecord(s) || !Array.isArray(s.layers)) continue
+        const offenders: string[] = []
+        const values: number[] = []
+        for (const l of s.layers) {
+          if (!isRecord(l) || !isRecord(l.props)) continue
+          const label = typeof l.id === 'string' && l.id !== '' ? l.id : typeof l.name === 'string' ? l.name : '图层'
+          let restX = isFiniteNumber(l.props.x) ? l.props.x : undefined
+          let restY = isFiniteNumber(l.props.y) ? l.props.y : undefined
+          for (const v of [restX, restY]) if (v !== undefined) values.push(v)
+          if (Array.isArray(l.tracks)) {
+            for (const t of l.tracks) {
+              if (!isRecord(t) || typeof t.target !== 'string' || !Array.isArray(t.keys)) continue
+              const axis = t.target === 'props.x' ? 'x' : t.target === 'props.y' ? 'y' : null
+              if (!axis) continue
+              let bestAt = -Infinity
+              for (const k of t.keys) {
+                if (!isRecord(k)) continue
+                if (isFiniteNumber(k.value)) values.push(k.value)
+                if (isFiniteNumber(k.value) && isFiniteNumber(k.atMs) && k.atMs >= bestAt) {
+                  bestAt = k.atMs
+                  if (axis === 'x') restX = k.value
+                  else restY = k.value
+                }
+              }
+            }
+          }
+          if (restX !== undefined && restX >= halfW) offenders.push(`${label} 的 x=${restX}`)
+          else if (restY !== undefined && restY >= halfH) offenders.push(`${label} 的 y=${restY}`)
+        }
+        if (offenders.length > 0 && (values.length === 0 || Math.min(...values) >= 0)) {
+          c.warn(
+            `场景 ${i}（${String(s.name)}）疑似按「左上角原点」书写坐标：${offenders.join('、')} 超出了画布半径。`
+            + `IR 的原点在画布中心（x 右正、y 下正），${halfW * 2}×${halfH * 2} 的画布左上角是 (-${halfW}, -${halfH})，`
+            + '请把 x/y 整体平移 (-画布宽/2, -画布高/2)；若确按中心原点布局可忽略本提示。',
+          )
+        }
+      }
+    }
+  }
+
   if (c.errors.length > 0) return { ok: false, errors: c.errors, warnings: c.warnings }
   return { ok: true, spec: input as unknown as AnimationSpec, warnings: c.warnings }
 }

@@ -226,6 +226,8 @@ export type DraftSceneResult = {
   sceneCount: number
   durationMs: number
   inverse: PatchOp[]
+  /** 校验软警告（时长超声明、疑似左上角坐标系等）。模型必须读到并自行处理。 */
+  warnings: string[]
 }
 
 export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): DraftSceneResult {
@@ -249,7 +251,15 @@ export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): 
     type: 'anim/spec-patched',
     data: { specId: args.specId, ops, inverse, note: `写入场景「${args.scene.name}」`, durationMs },
   })
-  return { specId: args.specId, sceneId: args.scene.id, index, sceneCount: spec.scenes.length, durationMs, inverse }
+  return {
+    specId: args.specId,
+    sceneId: args.scene.id,
+    index,
+    sceneCount: spec.scenes.length,
+    durationMs,
+    inverse,
+    warnings: checked.warnings,
+  }
 }
 
 /* ------------------------------------------------------------------ 渲染 */
