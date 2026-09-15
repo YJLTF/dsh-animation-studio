@@ -300,8 +300,11 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
             '--disable-backgrounding-occluded-windows',
             '--disable-renderer-backgrounding',
             '--disable-background-timer-throttling',
-            '--window-position=40,40',
-            '--window-size=1600,900',
+            // 不要传 --window-position / --window-size：Edge 152 起对这两个开关
+            // 有离谱缺陷——窗口按指定几何创建了却永不显示（Win32 visible=False，
+            // 任务栏也没有），渲染照常出帧、标题状态条却永远看不见；CDP
+            // setWindowBounds 也救不回来。默认窗口尺寸对编辑器足够，出帧分辨率
+            // 由 project.meta × resolutionScale 决定，与窗口大小无关。
           ],
         })
         // 复用启动时的首个空白页而不是 newPage()：窗口里只留一个标签页，
