@@ -1,8 +1,10 @@
 # dsh Animation Studio
 
-给 [DeepSeek Harness（DSH）](https://deepseek-harness.github.io/deepseek-harness/) 做的**教学动画制作工作台**插件：一套内置在教学会话里的"教学视频 agent"。你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 9 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程，中途可以随时抽查画面、改一个关键帧、或者撤销上一步。
+给 [DeepSeek Harness（DSH）](https://deepseek-harness.github.io/deepseek-harness/) 做的**教学动画制作工作台**插件：一套内置在教学会话里的"教学视频 agent"。
 
-基于 **dsh 0.1.5-rc.2**（cordis 4.0.2 / dsh-tools 0.1.5-rc.2）的类型开发与校验，可直接用 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
+你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 9 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程——中途可以随时抽查画面、把某个关键帧挪几百毫秒、或者撤销上一步。模型全程不写动画代码，只读写一份数据文档。
+
+基于 **dsh 0.1.5-rc.2**（cordis 4.0.2 / dsh-tools 0.1.5-rc.2）的类型开发与验证，peer 依赖声明为 `>=0.1.5-rc.2`，可无缝配合 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
 
 ---
 
@@ -27,11 +29,12 @@
 
 - **9 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（按 JSON Pointer 精确读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_preview`（降分辨率抽帧）、`anim_render`（整片 MP4）。
 - **绝对毫秒时间线 IR**：所有时间都是场景内绝对毫秒，可动画属性统一收进轨道关键帧；内置 linear / easeIn/Out/InOut / cubicBezier / spring 缓动。
-- **写入走 JSON Patch（RFC 6902 子集）**：改完整份校验，不通过整批回滚；每次修改同时记录正向 ops 与反向 inverse，撤销不需要重新推理。
-- **事件溯源**：spec 的每次变更都是一条自包含会话事件（`anim/spec-created` / `anim/spec-patched` / …），`foldEvents` 从事件流还原状态——刷新不丢、可回放、可 fork。
-- **开箱即用的 Motion Canvas 渲染**：插件启动时自动挂载渲染 Provider。自动处理 Motion Canvas 3.17 没有官方 CLI、headless 拿不到 WebGL、帧落盘子目录等坑；渲染前 `diagnose()` 会把缺 ffmpeg / 缺浏览器 / 缺中文字体说成可操作的修复建议。
+- **写入走 JSON Patch（RFC 6902 子集）**：改完整份校验，不通过整批回滚；每次修改同时记录正向 ops 与反向 inverse，撤销不需要重新推理。补丁入参在边界上做收敛校验，坏 op 立刻以可读的报错返回。
+- **事件溯源**：spec 的每次变更都是一条自包含会话事件（`anim/spec-created` / `anim/spec-patched` / …），`foldEvents` 从事件流还原状态——刷新不丢、可回放、可 fork。事件载荷在边界上做了深清理，能通过 dsh 0.1.5-rc.2 的无损 JSON 严格校验。
+- **开箱即用的 Motion Canvas 渲染**：插件启动时自动挂载渲染 Provider。自动处理 Motion Canvas 3.17 没有官方 CLI、headless 拿不到 WebGL、帧落盘子目录、尾部静止提前停帧等一整串坑；渲染超时或中断会显式报错，绝不静默产出残片。渲染前 `anim_diagnose` 会把缺 ffmpeg / 缺浏览器 / 缺中文字体说成可操作的修复建议。
+- **渲染过程可见**：渲染时弹出的有头浏览器窗口，标题栏实时显示状态与进度（`视频渲染中 n/m 帧（p%）…`），完成后自动关闭。
 - **渲染器可替换**：渲染能力是一个标准 seam（注册表 + `provideRenderer`），想接 Remotion/Manim 就写一个 Provider 顶掉默认项，工具与事件零改动。
-- **离线分发友好**：`dsh.bundle` 声明 + esbuild 单文件构建，配合 offline-packager 一条命令打成自包含 tgz。
+- **离线分发友好**：`dsh.bundle` 声明 + esbuild 单文件构建，工作区内部包用 alias 内联、与包管理器无关，配合 offline-packager 一条命令打成自包含 tgz。
 
 ## 包结构
 
@@ -42,7 +45,6 @@
 | `packages/tools` | dsh 宿主插件：`anim_*` 工具、spec store、会话事件、渲染 seam |
 | `examples/hello-gradient` | 端到端样例：一份中文教学动画 spec → MP4 |
 | `scripts/smoke.ts` / `scripts/smoke-host.mjs` | 冒烟测试：纯逻辑冒烟 + 真实 cordis 环境挂载冒烟 |
-| `scripts/debug-render.ts` | 渲染链路单独诊断（见下文「渲染层单独诊断」） |
 | `docs/设计草案.md` | 设计与选型记录：dsh 平台事实、AnimationSpec IR 设计、事件模型、实施路线与踩坑 |
 
 ## 环境要求
@@ -72,19 +74,25 @@ dsh plugin --profile web add F:\path\to\dsh-animation-studio
 
 ### 方式二：打包成离线安装包（无网络环境）
 
-在**联网机器**上用 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager)，在 DSH Web UI 里直接说：
+在**联网机器**上用 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打包，推荐直接在 DSH Web UI 里说：
 
 ```
 请将 F:/path/to/dsh-animation-studio 打包为离线安装包
 ```
 
-生成自包含的 `dsh-animation-studio-0.1.0.tgz`（已捆绑 vite、puppeteer-core、Motion Canvas 等全部运行时依赖；`@deepseek-ai/*` 由 dsh 宿主提供，不重复打入）。拷到离线机器后：
+打包器会：复制源码到暂存目录（跳过 node_modules / .git）→ `npm install` 生产依赖（`@deepseek-ai/*` 是 peer，由 dsh 宿主提供，不打入）→ 通过 `bundleDependencies` 把 vite、puppeteer-core、Motion Canvas 等全部运行时依赖闭包塞进 tarball → 出自包含的 `dsh-animation-studio-0.1.0.tgz`。`package.json` 的 `files` 白名单保证包内只有 `lib/` 与 `cordis.patch.yml`，干净且小。
+
+构建环节是免维护的：`build.mjs` 用 esbuild alias 解析工作区内部包，暂存目录里没有 pnpm 软链也能构建——源码目录里**已经跑过 `pnpm build`** 就直接用现成的 `lib/`，没跑过打包器也会自动构建，两种情况都不需要手工干预。
+
+拷到离线机器后：
 
 ```bash
 dsh plugin --profile web add ./dsh-animation-studio-0.1.0.tgz
 ```
 
-> pnpm ≥ 11 的离线环境需要先在 profile 的 `pnpm-workspace.yaml` 里设置 `minimumReleaseAge: 0`，否则 `pnpm add` 会联网校验发布时间元数据而失败——详见 offline-packager 的 README。
+> 两个已知的坑（都来自 offline-packager 的 README，装不上时先查这里）：
+> - pnpm ≥ 11 的离线环境需要先在 profile 的 `pnpm-workspace.yaml` 里设置 `minimumReleaseAge: 0`，否则 `pnpm add` 会联网校验发布时间元数据而失败；
+> - Windows 下离线 tgz 的存放路径不能包含空格（`dsh plugin add` 的转发限制）。
 
 ### 配置
 
@@ -144,7 +152,7 @@ node --import tsx scripts/generate.ts   # spec → Motion Canvas 源码（src/ �
 node --import tsx scripts/render.ts     # 源码 → output/output.mp4（需要渲染环境）
 ```
 
-### 开发
+## 开发
 
 ```bash
 pnpm install
@@ -153,19 +161,12 @@ pnpm build       # esbuild 打包插件 → lib/index.js
 pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟（含 rc.2 无损 JSON 事件校验，无需浏览器）
 ```
 
-### 渲染层单独诊断
-
-冒烟测试不覆盖浏览器渲染。怀疑渲染链路（vite / puppeteer / 帧落盘 / ffmpeg）有问题时，可以单跑诊断脚本，它走与 `anim_render` 完全相同的运行时路径：
-
-```bash
-node --import tsx scripts/debug-render.ts   # 输出帧数、帧目录与 debug-output.mp4
-```
+冒烟测试覆盖 spec 校验 / patch 可逆 / 时间线展开 / codegen 结构 / store 回滚撤销 / 事件流 fold / 渲染注册表，以及构建产物在真实 cordis 环境里的挂载与执行链路。浏览器渲染链路（vite / puppeteer / ffmpeg）不在冒烟范围内，由 `examples/hello-gradient` 的 `scripts/render.ts` 走与 `anim_render` 完全相同的运行时路径，可当渲染链路的手动诊断入口用。
 
 ## 已知限制与说明
 
 - 图层类型目前支持 `text / rect / circle / image`，`group` 预留未实现；不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
 - 会话事件的落盘桥（`resolveEventSink`）优先走 `session.append`，退到事件总线、再退到日志。dsh 0.1.5-rc.2 的 `session.append` 按「无损 JSON」严格校验载荷（任何 undefined 属性值整条拒绝），事件在边界上已做深清理并通过冒烟验证；但 `anim/*` 属于插件自有事件，不在 rc.2 的核心事件词汇表内，持久化信封上的 `ignorable` 标记由宿主侧负责——事件真正落盘仍需在真机 Web 会话里确认一次。
-- 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。渲染时会弹出一个**有头**浏览器窗口（headless 拿不到 WebGL），这是正常现象：窗口标题栏会实时显示渲染状态与进度（`视频渲染中 n/m 帧（p%）…`），渲染完成后自动关闭。
-- Windows 下离线 tgz 的存放路径不能包含空格（`dsh plugin add` 的转发限制），详见 offline-packager README。
+- 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。渲染时会弹出一个**有头**浏览器窗口（headless 拿不到 WebGL），这是正常现象：窗口标题栏会实时显示渲染状态与进度，渲染完成后自动关闭。
 - `dsh plugin add` 在部分 Windows 环境会把 pnpm 转发给 cmd 执行；若 cmd 按 PATH 找不到 pnpm（本机实测出现过），直接在 profile 目录里 `pnpm add <插件路径>` 并把插件名写进 profile `package.json` 的 `dsh.profile.bundles` 即可。
