@@ -52,6 +52,7 @@
 | `packages/tools` | dsh 宿主插件：`anim_*` 工具、spec store、会话事件、渲染 seam、`/dsh-anim` 媒体与状态路由 |
 | `packages/client` | 浏览器面（`lib/client.js`）：anim_* 工具的会话卡片（React），经 keyed `tool.call.toolview` 插槽认领渲染权 |
 | `examples/hello-gradient` | 端到端样例：一份中文教学动画 spec → MP4 |
+| `config/agent-presets/anim-studio` | 会话级 agent preset：导演 persona + 分镜方法论提示词（拷到 `~/.dsh/.agent-presets/` 启用） |
 | `scripts/smoke.ts` / `scripts/smoke-host.mjs` | 冒烟测试：纯逻辑冒烟 + 真实 cordis 环境挂载冒烟 |
 | `docs/设计草案.md` | 设计与选型记录：dsh 平台事实、AnimationSpec IR 设计、事件模型、实施路线与踩坑 |
 
@@ -134,6 +135,20 @@ AI：anim_diagnose   → 环境自检
 ```
 
 你会拿到的每个工具回执都带"下一步该做什么"的引导；`anim_patch` 返回的 `inverse` 可以直接喂回给 `anim_patch` 撤销，`anim_undo` 则是它的快捷方式。
+
+### 用 anim-studio 预设（推荐）
+
+仓库自带一个会话级 **agent preset**：`config/agent-presets/anim-studio/`，给会话配上「教学动画导演」身份 + 分镜方法论系统提示词（自检 → 分镜 → 逐幕细化 → 预览 → 微调 → 出片），让模型一句话主题就能按正确姿势出片。安装：
+
+```bash
+# 把预设目录拷到你的 DSH_HOME（默认 ~/.dsh）下的 .agent-presets/
+cp -r config/agent-presets/anim-studio ~/.dsh/.agent-presets/anim-studio
+```
+
+然后在 `dsh web` **新开**一个会话，预设选择器里选「动画制作工作台」（preset 是会话级快照，已开的会话不生效）。说明：
+
+- `anim_*` 工具由插件在**宿主层**注册、对所有会话可见，preset 不再重复挂载插件（重复挂载会再起一份 store / 路由）；
+- preset 的增量是 persona 方法论提示词；不选它、直接在普通会话里说需求也能出片，只是没有这套导演式引导。
 
 ### 工作台面板（dsh Web）
 

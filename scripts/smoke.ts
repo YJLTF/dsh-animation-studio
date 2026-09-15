@@ -9,7 +9,7 @@
  * 用法：pnpm smoke
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
@@ -306,6 +306,25 @@ await checkA('opAssetImport: 本地文件复制进资产目录并 patch 进 spec
   assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'x', kind: 'image', src: txt }, () => {}), /不支持扩展名/)
   assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'icon', kind: 'image', src }, () => {}), /已存在/)
   assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'bad id!', kind: 'image', src }, () => {}), /assetId/)
+})
+
+/* ---------------------------------------------- 0.3.0 M2：anim-studio preset */
+
+check('preset: anim-studio 预设文件齐全且含 persona 方法论锚点', () => {
+  const dir = join(process.cwd(), 'config/agent-presets/anim-studio')
+  const meta = readFileSync(join(dir, 'preset.yml'), 'utf8')
+  const agent = readFileSync(join(dir, 'agent.cordis.yml'), 'utf8')
+  assert.match(meta, /^name: .+/m, 'preset.yml 应有显示名')
+  assert.match(meta, /^description: .+/m, 'preset.yml 应有描述')
+  // agent.cordis.yml 是会话层插件行列表：persona 挂官方 dsh-persona
+  assert.match(agent, /^- id: persona$/m)
+  assert.match(agent, /name: '@deepseek-ai\/dsh-persona'/)
+  // persona 文本覆盖完整工作流的关键锚点：自检→建文档→大纲→逐幕→预览→微调→出片
+  for (const anchor of ['anim_diagnose', 'anim_create_spec', 'anim_plan', 'anim_draft_scene', 'anim_preview', 'anim_patch', 'anim_render']) {
+    assert.ok(agent.includes(anchor), `persona 方法论应提到 ${anchor}`)
+  }
+  assert.ok(agent.includes('中心原点'), 'persona 应钉死中心原点坐标系契约')
+  assert.ok(agent.includes('props.end'), 'persona 应提到画线轨道 props.end')
 })
 
 /* ------------------------------------------------------------------ host */
