@@ -106,7 +106,7 @@ export class MotionCanvasRenderer implements AnimRenderer {
     if (!outputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
 
     const durationMs = specDurationMs(request.spec.scenes)
-    await this.#encode(result.frameDir, result.expected, outputPath, request.spec)
+    await encodeFrames(result.frameDir, result.expected, request.spec.meta.fps, outputPath)
     return {
       outputPath,
       frameCount: result.frameCount,
@@ -147,10 +147,6 @@ export class MotionCanvasRenderer implements AnimRenderer {
       onProgress,
     })
     return { ...result, expected }
-  }
-
-  async #encode(frameDir: string, expected: number, outputPath: string, spec: AnimationSpec): Promise<void> {
-    await encodeFrames(frameDir, expected, spec.meta.fps, outputPath)
   }
 }
 

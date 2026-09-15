@@ -200,11 +200,9 @@ export function opPatch(deps: AnimDeps, args: PatchArgs, emit: Emit): PatchResul
   } catch (err) {
     throw new AnimOpError(err instanceof Error ? err.message : String(err))
   }
+  // patch 后的软警告（时长超声明、疑似左上角坐标系）随回执带给模型
+  const { warnings } = validateSpec(deps.store.get(args.specId))
   const durationMs = deps.store.durationMs(args.specId)
-
-  const warnings: string[] = []
-  const checked = validateSpec(deps.store.get(args.specId))
-  for (const w of checked.warnings) warnings.push(w)
 
   emit({ type: 'anim/spec-patched', data: { specId: args.specId, ops: applied, inverse, note: args.note, durationMs } })
   return { specId: args.specId, version, applied: applied.length, durationMs, inverse, warnings }
@@ -312,5 +310,5 @@ export async function opDiagnose(
 ): Promise<{ renderer: string; ok: boolean; issues: string[] }> {
   const renderer = deps.renderers.get(args.renderer)
   const d = await renderer.diagnose()
-  return { renderer: d.renderer ?? renderer.name, ok: d.ok, issues: d.issues }
+  return { renderer: d.renderer, ok: d.ok, issues: d.issues }
 }

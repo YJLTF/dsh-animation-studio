@@ -56,7 +56,7 @@ const COMPONENT: Record<LayerType, string | null> = {
 
 /* -------------------------------------------------------------- 工具函数 */
 
-function lit(value: KeyframeValue | string | number | boolean): string {
+function lit(value: KeyframeValue): string {
   if (typeof value === 'number' && Number.isFinite(value)) return num(value)
   return JSON.stringify(String(value))
 }
@@ -83,8 +83,8 @@ function sanitize(id: string): string {
 
 /**
  * MC 没有导出 `cubicBezier`；原生 `spring` 的时长由物理决定、无法与 IR 的
- * durationMs 对齐（预览与成片会不一致）。所以两者都内联实现，公式与
- * spec 层的 applyEase 保持一致。
+ * durationMs 对齐（预览与成片会不一致）。所以两者都内联实现到生成的
+ * anim-easing.ts 里，随项目一起编译。
  */
 const EASING_FILE = `/**
  * IR 缓动的内联实现。由 @dsh-anim/render-mc 生成，请勿手工编辑。

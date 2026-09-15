@@ -71,7 +71,6 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   const deps: AnimDeps = { store, renderers: animRenderers(ctx), outputDir }
 
   ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx) }))
-  ctx.effect(() => provideState(ctx, store))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给
   // ctx.effect——那会被当成 effect body 立即调用，等于注册完马上注销。
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
@@ -106,24 +105,6 @@ async function mountMotionCanvas(ctx: Context, outputDir: string): Promise<Dispo
     }
     return () => {}
   }
-}
-
-/** 把 store 挂到 ctx 上，方便命令、面板、测试取用。 */
-const STORE = Symbol.for('dsh-anim.store')
-
-function provideState(ctx: Context, store: SpecStore): () => void {
-  const holder = ctx as unknown as Record<symbol, SpecStore | undefined>
-  holder[STORE] = store
-  return () => {
-    holder[STORE] = undefined
-  }
-}
-
-export function animStore(ctx: Context): SpecStore {
-  const holder = ctx as unknown as Record<symbol, SpecStore | undefined>
-  const store = holder[STORE]
-  if (!store) throw new Error('dsh-anim-studio 尚未启动，或 store 已被卸载')
-  return store
 }
 
 export { foldEvents }

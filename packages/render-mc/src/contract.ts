@@ -28,7 +28,6 @@ export interface PreviewRequest {
   spec: AnimationSpec
   atMs?: number[]
   scale?: number
-  fps?: number
 }
 
 export interface PreviewResult {

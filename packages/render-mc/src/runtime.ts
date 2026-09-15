@@ -226,8 +226,6 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
     },
 
     async materialize(files, workDir) {
-      const { mkdirSync, writeFileSync } = await import('node:fs')
-      const { dirname } = await import('node:path')
       ensureWorkDirModules(workDir)
       for (const file of files) {
         const target = join(workDir, file.path)
@@ -366,7 +364,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
 /**
  * 等帧写满。
  *
- * 停滞有三种结局，不能一概而论：
+ * 停滞有四种结局，不能一概而论：
  * - 写满 expected 后稳定 → 正常完成（多出的缓冲帧由 ffmpeg -frames:v 截掉）；
  * - **尾部静止**：最后一幕动画结束、只剩 waitFor 静止收尾时，MC 编辑器会提前
  *   约 0.5 秒停止出帧（实测每次渲染必现：462 帧的片子稳定差 10~17 帧）。
@@ -374,7 +372,8 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
  *   就复制最后一帧补齐——即便偶尔误判，代价也只是片尾多定格 ≤1 秒，
  *   远好于让每次带静止收尾的渲染都失败；
  * - 其余停滞 = 真中断：渲染出的是一条短了几秒的残片，报错让上层重试，
- *   比静默交片更负责任。
+ *   比静默交片更负责任；
+ * - 墙钟超时 = 同样报错，绝不静默返回残片。
  */
 export async function waitForFrames(
   dir: string,
@@ -417,7 +416,15 @@ export async function waitForFrames(
     }
     await new Promise(r => setTimeout(r, 800))
   }
-  return safeCount(dir)
+  const final = safeCount(dir)
+  // 循环条件耗尽 = 墙钟超时：不带这个检查，超时会静默返回一条缺了几十秒的残片
+  if (final < expected) {
+    throw new Error(
+      `渲染超时：${Math.round(timeoutMs / 60_000)} 分钟只产出 ${final}/${expected} 帧。`
+      + '请重试；若反复出现，降低分辨率或缩短时长。',
+    )
+  }
+  return final
 }
 
 /**

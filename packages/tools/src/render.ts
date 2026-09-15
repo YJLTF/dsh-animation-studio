@@ -33,7 +33,6 @@ export interface PreviewRequest {
   atMs?: number[]
   /** 预览降分辨率：默认 2 表示长宽各一半，快 4 倍。 */
   scale?: number
-  fps?: number
 }
 
 export interface PreviewResult {

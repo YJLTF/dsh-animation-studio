@@ -48,20 +48,20 @@ class Collector {
     this.warnings.push(message)
   }
 
-  str(path: string, obj: Record<string, unknown>, key: string, opts: { required?: boolean } = {}): void {
+  str(path: string, obj: Record<string, unknown>, key: string): void {
     const v = obj[key]
     if (v === undefined || v === null) {
-      if (opts.required !== false) this.fail(`${path}/${key}`, '缺少必填字段')
+      this.fail(`${path}/${key}`, '缺少必填字段')
       return
     }
     if (typeof v !== 'string') this.fail(`${path}/${key}`, `应为字符串，实际为 ${typeof v}`)
-    else if (opts.required !== false && v.trim() === '') this.fail(`${path}/${key}`, '不能为空字符串')
+    else if (v.trim() === '') this.fail(`${path}/${key}`, '不能为空字符串')
   }
 
-  num(path: string, obj: Record<string, unknown>, key: string, opts: { min?: number; required?: boolean } = {}): void {
+  num(path: string, obj: Record<string, unknown>, key: string, opts: { min?: number } = {}): void {
     const v = obj[key]
     if (v === undefined || v === null) {
-      if (opts.required !== false) this.fail(`${path}/${key}`, '缺少必填字段')
+      this.fail(`${path}/${key}`, '缺少必填字段')
       return
     }
     if (!isFiniteNumber(v)) {

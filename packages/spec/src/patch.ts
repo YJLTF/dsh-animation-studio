@@ -7,7 +7,7 @@
  * 3. 可撤销——`inverse` 让「撤回上一步」不需要重新推理一遍。
  */
 
-import type { AnimationSpec, JsonValue, Scene } from './types.ts'
+import type { AnimationSpec, JsonValue } from './types.ts'
 
 export type PatchOp =
   | { op: 'add'; path: string; value: JsonValue }
@@ -56,7 +56,11 @@ function parentOf(root: unknown, path: string, label: 'path' | 'from'): { parent
   return { parent: cur, key: last }
 }
 
-function getAt(root: unknown, path: string): unknown {
+/**
+ * 按路径读取一个值。`anim_get` 与客户端面板共用；路径不存在时抛 PatchError，
+ * 而不是静默返回 undefined——「查了个不存在的东西」必须能被模型看见。
+ */
+export function readAt(root: unknown, path: string): unknown {
   const { parent, key } = parentOf(root, path, 'path')
   if (Array.isArray(parent)) {
     if (key === '-') throw new PatchError(`读取路径不能使用 "-"：${path}`)
@@ -114,14 +118,6 @@ function removeAt(root: unknown, path: string): JsonValue {
   throw new PatchError(`无法从非容器移除：${path}`)
 }
 
-/**
- * 按路径读取一个值。`anim_get` 与客户端面板共用；路径不存在时抛 PatchError，
- * 而不是静默返回 undefined——「查了个不存在的东西」必须能被模型看见。
- */
-export function readAt(root: unknown, path: string): unknown {
-  return getAt(root, path)
-}
-
 export interface PatchResult {
   value: AnimationSpec
   /** 反向操作序列，按顺序应用即可撤销本次修改。 */
@@ -152,14 +148,14 @@ export function applyPatch(spec: AnimationSpec, ops: readonly PatchOp[]): PatchR
         inverse.push({ op: 'add', path: op.path, value: removeAt(root, op.path) })
         break
       case 'replace': {
-        // replace 要求目标已存在，getAt 会在缺失时抛错
-        const old = getAt(root, op.path)
+        // replace 要求目标已存在，readAt 会在缺失时抛错
+        const old = readAt(root, op.path)
         addAt(root, op.path, op.value)
         inverse.push({ op: 'replace', path: op.path, value: old as JsonValue })
         break
       }
       case 'move': {
-        const value = getAt(root, op.from)
+        const value = readAt(root, op.from)
         removeAt(root, op.from)
         addAt(root, op.path, value as JsonValue)
         inverse.push({ op: 'move', from: op.path, path: op.from })
@@ -174,39 +170,4 @@ export function applyPatch(spec: AnimationSpec, ops: readonly PatchOp[]): PatchR
 
   inverse.reverse()
   return { value: root as AnimationSpec, inverse }
-}
-
-/* ------------------------------------------------------------- 便捷构造 */
-
-/** 生成一条「设置某图层静态属性」的 patch。 */
-export function setLayerProp(
-  scenes: readonly Scene[],
-  sceneId: string,
-  layerId: string,
-  prop: string,
-  value: JsonValue,
-): PatchOp {
-  const si = scenes.findIndex(s => s.id === sceneId)
-  if (si < 0) throw new PatchError(`场景不存在：${sceneId}`)
-  const li = scenes[si].layers.findIndex(l => l.id === layerId)
-  if (li < 0) throw new PatchError(`图层不存在：${layerId}（场景 ${sceneId}）`)
-  return { op: 'replace', path: `/scenes/${si}/layers/${li}/props/${prop}`, value }
-}
-
-/** 生成一条「移动某个关键帧到新时刻」的 patch。 */
-export function moveKeyframe(
-  scenes: readonly Scene[],
-  sceneId: string,
-  layerId: string,
-  trackId: string,
-  keyIndex: number,
-  atMs: number,
-): PatchOp {
-  const si = scenes.findIndex(s => s.id === sceneId)
-  if (si < 0) throw new PatchError(`场景不存在：${sceneId}`)
-  const li = scenes[si].layers.findIndex(l => l.id === layerId)
-  if (li < 0) throw new PatchError(`图层不存在：${layerId}（场景 ${sceneId}）`)
-  const ti = scenes[si].layers[li].tracks.findIndex(t => t.id === trackId)
-  if (ti < 0) throw new PatchError(`轨道不存在：${trackId}（图层 ${layerId}）`)
-  return { op: 'replace', path: `/scenes/${si}/layers/${li}/tracks/${ti}/keys/${keyIndex}/atMs`, value: atMs }
 }

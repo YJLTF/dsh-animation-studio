@@ -123,8 +123,12 @@ function coerceOps(input: unknown): PatchOp[] {
     }
     if (op.op === 'move') {
       if (typeof op.from !== 'string') throw new Error(`ops[${i}].from 必须是字符串路径`)
+      if (typeof op.path !== 'string') throw new Error(`ops[${i}].path 必须是字符串路径`)
     } else {
       if (typeof op.path !== 'string') throw new Error(`ops[${i}].path 必须是字符串路径`)
+      if (op.op !== 'remove' && !('value' in op)) {
+        throw new Error(`ops[${i}] 是 ${op.op}，必须带 value`)
+      }
     }
     return op as unknown as PatchOp
   })
@@ -154,8 +158,6 @@ function coerceJsonParam(value: unknown, label: string): unknown {
 export interface RegisterOptions {
   deps: AnimDeps
   sink: EventSink
-  /** 渲染类工具走后台任务时的开关；MVP 同步执行，留作后续阶段的接缝。 */
-  background?: boolean
 }
 
 /** 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。 */
@@ -357,10 +359,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
       },
       presentCall: args => ({ card: 'generic', title: `撤销 ${args.specId}`, kind: 'edit' }),
-      execute: args => {
+      async execute(args) {
         const inverse = deps.store.undo(args.specId)
-        if (!inverse) return Promise.reject(new Error(`spec ${args.specId} 没有可撤销的修改`))
-        return Promise.resolve(opPatch(deps, { specId: args.specId, ops: inverse, note: '撤销上一步' }, emit) as never)
+        if (!inverse) throw new Error(`spec ${args.specId} 没有可撤销的修改`)
+        return await opPatch(deps, { specId: args.specId, ops: inverse, note: '撤销上一步' }, emit) as never
       },
     }),
   )
