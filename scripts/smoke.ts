@@ -9,6 +9,7 @@
  * 用法：pnpm smoke
  */
 import assert from 'node:assert/strict'
+import { isAbsolute } from 'node:path'
 
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
@@ -403,6 +404,35 @@ await checkA('opRender: 无 jobs 或 start 抛错都退回同步路径，行为�
     assert.equal((finished.data as { status?: string }).status, 'failed')
     assert.match((finished.data as { error?: string }).error ?? '', /ffmpeg/)
   }
+})
+
+await checkA('opRender: 进度 done 超过预估 total 时 percent 钳在 100（真机实测 92/90 → 102%）', async () => {
+  const { deps, emitted, emit } = renderFixture(async request => {
+    // 尾帧缓冲：实际帧数超出预估 total 是常态而非异常
+    request.onProgress?.(92, 90)
+    return RENDER_RESULT
+  })
+  await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)
+  const percents = emitted
+    .filter(e => e.type === 'anim/render-progress')
+    .map(e => (e.data as { percent: number }).percent)
+  assert.deepEqual(percents, [100], '102% 会进会话日志，面板进度条不该画到界外')
+})
+
+await checkA('opRender: 相对 outputPath 解析成绝对路径——适配器收到绝对路径，回执/事件同步', async () => {
+  const { deps, emitted, emit } = renderFixture(async request => {
+    assert.ok(isAbsolute(request.outputPath), `适配器应收到绝对路径，收到 ${request.outputPath}`)
+    return { ...RENDER_RESULT, outputPath: request.outputPath }
+  })
+  const result = await opRender(
+    deps,
+    { specId: 'gd', outputPath: 'test-animation.mp4' },
+    new AbortController().signal,
+    emit,
+  )
+  assert.ok(isAbsolute(result.outputPath), `回执应给绝对路径，收到 ${result.outputPath}`)
+  const start = emitted.find(e => e.type === 'anim/render-start')
+  assert.ok(isAbsolute((start!.data as { outputPath: string }).outputPath), 'render-start 事件的 outputPath 也是绝对路径')
 })
 
 console.log(`\n冒烟通过：${passed} 项`)

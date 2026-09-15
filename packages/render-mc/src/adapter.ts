@@ -106,8 +106,10 @@ export class MotionCanvasRenderer implements AnimRenderer {
   async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
     const resolutionScale = resolveResolutionScale(request.scale)
     const result = await this.#renderFrames(request.spec, signal, resolutionScale, request.onProgress)
-    const outputPath = request.outputPath || this.#defaultOutputPath
-    if (!outputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
+    const rawOutputPath = request.outputPath || this.#defaultOutputPath
+    if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
+    // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
+    const outputPath = resolve(rawOutputPath)
 
     const durationMs = specDurationMs(request.spec.scenes)
     await encodeFrames(result.frameDir, result.expected, request.spec.meta.fps, outputPath)

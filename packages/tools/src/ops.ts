@@ -9,6 +9,8 @@
  * 「一次修改对应一条事件」这个约束在类型上就钉死了。
  */
 
+import { resolve } from 'node:path'
+
 import type { AnimationSpec, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
 import { readAt, specDurationMs, validateSpec } from '@dsh-anim/spec'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
@@ -364,9 +366,16 @@ function createProgressReporter(
     if (step <= lastStep && done < total) return
     lastStep = step
     // jobId 在补发时才取值：缓冲期间 id 可能尚未产生
+    // 尾帧缓冲会让 done 略超预估 total（真机实测 92/90），percent 钳在 100
     emit(() => ({
       type: 'anim/render-progress',
-      data: { specId, jobId: jobIdBox.value ?? 'anim-render', done, total, percent: Math.round((done / total) * 100) },
+      data: {
+        specId,
+        jobId: jobIdBox.value ?? 'anim-render',
+        done,
+        total,
+        percent: Math.min(100, Math.round((done / total) * 100)),
+      },
     }))
   }
 }
@@ -404,7 +413,10 @@ export async function opRender(
 ): Promise<RenderResultView | RenderBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
-  const outputPath = args.outputPath ?? `${deps.outputDir}/${args.specId}.mp4`
+  // 相对路径在这里解析成绝对路径：ffmpeg 把相对路径按宿主进程 cwd 落盘，
+  // 回执必须给出文件的真实位置——真机教训：回显 "x.mp4" 让模型在会话目录
+  // 找不到文件，全盘搜索无果后只能重渲一遍。
+  const outputPath = resolve(args.outputPath ?? `${deps.outputDir}/${args.specId}.mp4`)
   if (signal.aborted) throw new AnimOpError('渲染已取消')
 
   if (jobs) {
