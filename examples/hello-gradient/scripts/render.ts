@@ -42,6 +42,7 @@ async function main(): Promise<void> {
 
   const { frameDir, frameCount } = await runtime.renderProject({
     workDir,
+    fps: spec.meta.fps,
     expectedFrames: expected,
     signal: new AbortController().signal,
     onProgress: (done, total) => process.stdout.write(`\r  已落盘 ${done}/${total} 帧`),

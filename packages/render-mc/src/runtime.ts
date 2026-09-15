@@ -11,7 +11,7 @@
  */
 
 import { exec as execCallback, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -236,7 +236,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       }
     },
 
-    async renderProject({ workDir, expectedFrames, signal, onProgress }) {
+    async renderProject({ workDir, fps, expectedFrames, signal, onProgress }) {
       const rootDir = join(workDir, outputDir)
       // 清掉上一轮产物：旧帧混进新片是最难发现的一类错误
       resetDir(rootDir)
@@ -348,7 +348,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         // 注意顺序：先等帧、再定位帧目录。exporter 的输出子目录是在首帧落盘时
         // 才创建的，点完 Render 立刻找目录只会拿到空的 output 根目录——而等待
         // 用的 collectFrames 会递归扫一层子目录，帧再多也救不回早已定错的目录。
-        const count = await waitForFrames(rootDir, expectedFrames, timeoutMs, signal, titleProgress)
+        const count = await waitForFrames(rootDir, expectedFrames, fps, timeoutMs, signal, titleProgress)
         setTitle(`帧渲染完成（${count} 帧），正在关闭浏览器…`)
         return { frameDir: findImageDir(rootDir), frameCount: count }
       } finally {
@@ -360,10 +360,23 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
   }
 }
 
-/** 等帧写满；帧数停滞即判定结束（渲染可能少出或多出 1-2 帧缓冲）。 */
-async function waitForFrames(
+/**
+ * 等帧写满。
+ *
+ * 停滞有三种结局，不能一概而论：
+ * - 写满 expected 后稳定 → 正常完成（多出的缓冲帧由 ffmpeg -frames:v 截掉）；
+ * - **尾部静止**：最后一幕动画结束、只剩 waitFor 静止收尾时，MC 编辑器会提前
+ *   约 0.5 秒停止出帧（实测每次渲染必现：462 帧的片子稳定差 10~17 帧）。
+ *   缺的帧与最后一帧画面相同，只要帧列从 000000 起连续、缺口不超过 1 秒，
+ *   就复制最后一帧补齐——即便偶尔误判，代价也只是片尾多定格 ≤1 秒，
+ *   远好于让每次带静止收尾的渲染都失败；
+ * - 其余停滞 = 真中断：渲染出的是一条短了几秒的残片，报错让上层重试，
+ *   比静默交片更负责任。
+ */
+export async function waitForFrames(
   dir: string,
   expected: number,
+  fps: number,
   timeoutMs: number,
   signal: AbortSignal,
   onProgress?: (done: number, total: number) => void,
@@ -371,6 +384,8 @@ async function waitForFrames(
   const started = Date.now()
   let last = -1
   let stableSince = Date.now()
+  // MC 提前停帧约 0.5 秒，按 1 秒留一倍余量；fps 很低时至少容 12 帧
+  const tailTolerance = Math.max(12, Math.ceil(fps))
   while (Date.now() - started < timeoutMs) {
     if (signal.aborted) throw new Error('渲染已取消')
     const n = safeCount(dir)
@@ -388,15 +403,45 @@ async function waitForFrames(
         + 'Motion Canvas 编辑器加载失败（检查 <workDir> 下 vite 的报错）。恢复窗口或修复后重试。',
       )
     }
-    // 帧断流：MC 偶尔少出 1-2 帧缓冲帧，可接受；差得多就是渲染中断，
-    // 与其静默出一条短几秒的片子，不如报错让上层重试
+    // 帧断流：先试尾部静止补偿，补不上才是真中断
     if (n > 0 && Date.now() - stableSince > 15_000) {
-      if (n >= expected - 2) break
+      if (n >= expected) break
+      if (expected - n <= tailTolerance && fillStaticTail(dir, expected)) {
+        onProgress?.(expected, expected)
+        break
+      }
       throw new Error(`帧产出在 ${n}/${expected} 处停滞超过 15 秒，渲染中断。请重试；若反复出现，降低分辨率或缩短时长。`)
     }
     await new Promise(r => setTimeout(r, 800))
   }
   return safeCount(dir)
+}
+
+/**
+ * 尾部静止补偿：把最后一帧复制到缺失的帧号上，补齐到 expected。
+ *
+ * 只有帧列从 000000 起完全连续才允许补——ffmpeg 的 %06d.png 图像序列遇到
+ * 第一个空洞就会停，不连续的帧列补了也出不了完整片子，那种情况必须报错。
+ */
+function fillStaticTail(dir: string, expected: number): boolean {
+  const frames = collectFrames(dir)
+  if (frames.length === 0 || frames.length >= expected) return false
+  for (let i = 0; i < frames.length; i++) {
+    if (frameIndex(frames[i]) !== i) return false
+  }
+  const lastFrame = frames[frames.length - 1]
+  const dot = lastFrame.lastIndexOf('.')
+  const ext = dot >= 0 ? lastFrame.slice(dot) : '.png'
+  for (let i = frames.length; i < expected; i++) {
+    copyFileSync(lastFrame, join(dirname(lastFrame), `${String(i).padStart(6, '0')}${ext}`))
+  }
+  return true
+}
+
+/** 帧文件名开头的 6 位序号；不带序号的文件返回 NaN（在连续性检查里会被拒）。 */
+function frameIndex(path: string): number {
+  const m = basename(path).match(/^(\d{6})/)
+  return m ? Number.parseInt(m[1]!, 10) : Number.NaN
 }
 
 function safeCount(dir: string): number {
