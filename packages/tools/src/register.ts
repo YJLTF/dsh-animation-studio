@@ -182,6 +182,32 @@ function coerceJsonParam(value: unknown, label: string): unknown {
   return parsed
 }
 
+/**
+ * 宿主服务可见性报告：anim_diagnose 用它把「事件落盘 / 后台渲染在真机上
+ * 到底走哪条路」变成可观测事实，而不是让我们对着回执猜。
+ */
+function hostServiceReport(ctx: Context, exec: { agent?: unknown }): Record<string, unknown> {
+  const read = (obj: unknown, key: string): unknown => {
+    try {
+      return (obj as Record<string, unknown>)?.[key]
+    } catch {
+      return undefined
+    }
+  }
+  const jobs = read(ctx, 'jobs')
+  const session = read(ctx, 'session')
+  const sessions = read(ctx, 'sessions')
+  const agentSession = read(read(exec, 'agent'), 'session') as { append?: unknown; snapshotEvents?: unknown }
+  return {
+    // 落盘链路：真机应依赖 agent.session；sessionOnCtx 为 true 说明宿主提供了 ctx 级 session
+    agentSessionAppendable: typeof agentSession?.append === 'function' && typeof agentSession?.snapshotEvents === 'function',
+    sessionOnCtx: typeof (session as { append?: unknown } | undefined)?.append === 'function',
+    sessionsRegistryOnCtx: typeof (sessions as { get?: unknown } | undefined)?.get === 'function',
+    // 后台渲染链路：jobsOnCtx 为 false 时渲染一律走同步回退
+    jobsOnCtx: typeof (jobs as { start?: unknown } | undefined)?.start === 'function',
+  }
+}
+
 /* ------------------------------------------------------------------ 注册 */
 
 export interface RegisterOptions {
@@ -228,8 +254,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
       },
       presentCall: () => ({ card: 'generic', title: '检查渲染环境', kind: 'read' }),
-      async execute(args) {
-        return await opDiagnose(deps, args) as never
+      async execute(args, exec) {
+        const result = await opDiagnose(deps, args)
+        return { ...result, host: hostServiceReport(ctx, exec) } as never
       },
     }),
   )

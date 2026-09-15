@@ -408,10 +408,14 @@ export async function opRender(
   if (signal.aborted) throw new AnimOpError('渲染已取消')
 
   if (jobs) {
-    try {
-      return await startBackgroundRender(args, { spec, renderer, outputPath }, emit, jobs, owner)
-    } catch {
-      // 发布失败（如 owner 没有附加 job controller）：退回同步，渲染能力照样可用
+    // 先带 owner（结果可归属、job_output/job_kill 的访问控制按 owner 走）；
+    // owner 没有附加 job controller 时退到无主任务；再不行退同步渲染。
+    for (const ownerCandidate of [owner, undefined]) {
+      try {
+        return await startBackgroundRender(args, { spec, renderer, outputPath }, emit, jobs, ownerCandidate)
+      } catch {
+        /* 发布失败，尝试下一档 */
+      }
     }
   }
   return await renderSync(args, { spec, renderer, outputPath }, signal, emit)
@@ -479,7 +483,8 @@ async function startBackgroundRender(
   const jobId = await jobs.start({
     kind: 'anim-render',
     label: `渲染「${spec.meta.title}」(${specId}) → ${outputPath}`,
-    owner,
+    // 无主任务按「省略 owner」的形状传，让宿主按缺省处理
+    ...(owner === undefined ? {} : { owner }),
     run,
   })
   const id = typeof jobId === 'string' ? jobId : String(jobId ?? 'anim-render')
