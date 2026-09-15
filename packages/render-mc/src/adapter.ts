@@ -18,11 +18,11 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { dirname, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
-import type { AnimationSpec } from '@dsh-anim/spec'
+import type { AnimationSpec, Asset } from '@dsh-anim/spec'
 import { sceneDurationMs, specDurationMs, truncateSpecAtMs } from '@dsh-anim/spec'
 
 import type { AnimRenderer, PreviewRequest, PreviewResult, RenderDiagnostics, RenderRequest, RenderResult } from './contract.ts'
@@ -141,6 +141,10 @@ export class MotionCanvasRenderer implements AnimRenderer {
     }
 
     mkdirSync(this.#workDir, { recursive: true })
+    // 资产物化：本地资产文件复制进渲染项目的 public/assets/（vite 的 public
+    // 目录 → 根 URL 可加载）。codegen 已把 image.src 的 asset:<id> 解析成
+    // /assets/<id>.<ext>，这里保证文件真的在。
+    copyAssetsToPublic(spec.assets, this.#workDir)
     await this.#runtime.materialize(files, this.#workDir)
 
     const totalMs = specDurationMs(spec.scenes)
@@ -211,6 +215,34 @@ export function collectFrames(dir: string): string[] {
 export function resetDir(dir: string): void {
   rmSync(dir, { recursive: true, force: true })
   mkdirSync(dir, { recursive: true })
+}
+
+/** 资产 id 进文件名前净化，与 codegen 的 URL 生成保持一致。 */
+function safeAssetName(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+/**
+ * 把 spec.assets 里的**本地文件**复制进渲染项目的 `public/assets/`。
+ * http(s) URL 资产不复制（浏览器直接加载）。资产缺失不抛错——
+ * codegen 已给出引用警告，渲染继续（缺图比整片渲染失败容易诊断）。
+ */
+export function copyAssetsToPublic(assets: Record<string, Asset>, workDir: string): string[] {
+  const copied: string[] = []
+  const publicDir = join(workDir, 'public', 'assets')
+  mkdirSync(publicDir, { recursive: true })
+  for (const [id, asset] of Object.entries(assets)) {
+    if (/^https?:\/\//.test(asset.src)) continue
+    const ext = extname(asset.src)
+    const target = join(publicDir, `${safeAssetName(id)}${ext}`)
+    try {
+      copyFileSync(resolve(asset.src), target)
+      copied.push(target)
+    } catch {
+      /* 资产文件缺失不拖垮渲染 */
+    }
+  }
+  return copied
 }
 
 /** 没有指定抽帧点时的默认采样：每幕的起点 + 每幕的中点（内容最丰富的时刻）。 */

@@ -21,7 +21,7 @@ export type ValidateResult =
   | { ok: true; spec: AnimationSpec; warnings: string[] }
   | { ok: false; errors: SpecError[]; warnings: string[] }
 
-const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'image', 'group', 'line', 'arrow', 'ellipse'])
+const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'ellipse', 'image', 'line', 'arrow', 'polygon', 'star', 'svg', 'group'])
 const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -162,6 +162,19 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
     }
     if (props.stroke === undefined) {
       c.warn(`图层 ${String(l.id)}（${l.type}）未指定 stroke，渲染端将按主题文字色兜底，否则线条不可见`)
+    }
+  }
+  if ((l.type === 'polygon' || l.type === 'star') && props) {
+    if (props.size === undefined && props.width === undefined && props.height === undefined) {
+      c.warn(`图层 ${String(l.id)}（${l.type}）未指定尺寸（size/width/height），渲染时按默认处理，可能过小或不可见`)
+    }
+    if (props.sides !== undefined && (!Number.isFinite(props.sides) || Number(props.sides) < 3)) {
+      c.fail(`${p}/props/sides`, `${l.type} 的 sides 应为 >= 3 的整数（角数/边数）`)
+    }
+  }
+  if (l.type === 'svg' && props) {
+    if (typeof props.svg !== 'string' || props.svg.trim() === '') {
+      c.warn(`图层 ${String(l.id)}（svg）未提供 svg 内容（props.svg 内嵌 SVG 字符串），渲染为空`)
     }
   }
 }

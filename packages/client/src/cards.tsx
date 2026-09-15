@@ -460,3 +460,17 @@ export function DiagnoseCard(props: ToolViewProps): ReactNode {
     </Card>
   )
 }
+
+/** anim_asset_import：素材登记。 */
+export function AssetCard(props: ToolViewProps): ReactNode {
+  const receipt = readReceipt(props.block)
+  if (!receipt) return <Fallback {...props} running="导入素材" />
+  return (
+    <Card title={`导入素材：${str(receipt, 'assetId') ?? ''}`}>
+      <div style={row}>
+        <span>{str(receipt, 'kind') ?? '—'}</span>
+        <span style={muted}>{str(receipt, 'src')}</span>
+      </div>
+    </Card>
+  )
+}

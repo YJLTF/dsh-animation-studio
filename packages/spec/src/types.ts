@@ -57,7 +57,12 @@ export interface Track {
 
 /* ------------------------------------------------------------------ 图层 */
 
-export type LayerType = 'text' | 'rect' | 'circle' | 'image' | 'group' | 'line' | 'arrow' | 'ellipse'
+export type LayerType =
+  | 'text' | 'rect' | 'circle' | 'ellipse' | 'image'
+  | 'line' | 'arrow'
+  | 'polygon' | 'star'
+  | 'svg'
+  | 'group'
 
 /**
  * 图层静态属性。列出的是**已知**字段（有类型提示），
@@ -107,6 +112,12 @@ export interface LayerProps {
   endArrow?: boolean
   /** 箭头大小（像素），默认 24。 */
   arrowSize?: number
+  // 正多边形（polygon）与星形（star）
+  /** polygon 的边数 / star 的角数（默认 6 / 5）。 */
+  sides?: number
+  // 内嵌 SVG（svg 图层）
+  /** 内嵌 SVG 字符串（svg 图层用，如 '<svg viewBox="0 0 100 100">…</svg>'）。 */
+  svg?: string
   // 分组
   /** group 图层的成员图层 id 列表（同一场景内）。变换属性作用于整组。 */
   children?: LayerId[]
@@ -160,7 +171,11 @@ export interface ThemeToken {
 
 export interface Asset {
   kind: 'image' | 'audio' | 'font' | 'svg'
-  /** 相对项目根目录的路径，或 http(s) URL。 */
+  /**
+   * 资产文件的绝对/相对路径，或 http(s) URL。
+   * 图层 props 里用 `asset:<AssetId>` 引用（如 image.src = "asset:ball"），
+   * 渲染端物化时把本地文件复制进项目并换成可加载的 URL。
+   */
   src: string
   alt?: string
 }

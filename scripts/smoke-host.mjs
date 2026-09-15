@@ -127,6 +127,7 @@ try {
 
 const names = registered.map(d => d.name).sort()
 assert.deepEqual(names, [
+  'anim_asset_import',
   'anim_create_spec',
   'anim_diagnose',
   'anim_draft_scene',
@@ -321,6 +322,7 @@ const fakeClientCtx = {
 }
 clientExports.apply(fakeClientCtx)
 assert.deepEqual(registeredViews.sort(), [
+  'anim_asset_import',
   'anim_create_spec',
   'anim_diagnose',
   'anim_draft_scene',

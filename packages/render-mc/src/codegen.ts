@@ -13,7 +13,9 @@
  *    直接把 makeScene2D 内联进 scenes 数组，渲染器会在 reloadScenes 里崩掉。
  */
 
-import type { AnimationSpec, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
+import { extname } from 'node:path'
+
+import type { AnimationSpec, Asset, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
 import { sceneDurationMs, tweensOf } from '@dsh-anim/spec'
 
 export interface GeneratedFile {
@@ -54,6 +56,11 @@ const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   arrow: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
   // MC 没有独立的 Ellipse 节点：椭圆 = Circle + width/height（官方用法）
   ellipse: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  // MC Polygon 是正多边形（sides 边数 + radius 角圆角）；star 用 Path + codegen 内置星形 path
+  polygon: { sides: 'sides', size: 'size', radius: 'radius', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  star: { data: 'data', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  // MC SVG 组件只接受内嵌 svg 字符串（不是文件路径）；文件资产走 image 图层
+  svg: { svg: 'svg', width: 'width', height: 'height' },
 }
 
 /**
@@ -78,6 +85,9 @@ const COMPONENT: Record<LayerType, string | null> = {
   line: 'Line',
   arrow: 'Line', // Line + endArrow（Curve 内建箭头，arrowSize 默认 24）
   ellipse: 'Circle',
+  polygon: 'Polygon',
+  star: 'Path', // codegen 内置星形 path（MC 3.17 没有 Star 组件）
+  svg: 'SVG',
 }
 
 /* -------------------------------------------------------------- 工具函数 */
@@ -95,19 +105,44 @@ function litProp(value: JsonValue): string {
   return lit(value as KeyframeValue)
 }
 
+/** 资产 id 进 URL/文件名前净化：只留 [A-Za-z0-9._-]，防路径穿越。 */
+function sanitizeAssetId(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, '_')
+}
+
+/**
+ * 五角星（任意角数）的 SVG path 字符串，外接圆半径 = size/2，中心在原点。
+ * MC 3.17 没有 Star 组件，用 Path 组件 + 生成 path 表达，模型不需要写 path。
+ */
+export function starPath(size: number, sides: number): string {
+  const n = Math.max(3, Math.round(sides))
+  const R = size / 2
+  const r = (R * Math.sin(Math.PI / (2 * n))) / Math.sin(Math.PI / n)
+  const pts: string[] = []
+  for (let i = 0; i < 2 * n; i++) {
+    const rad = i % 2 === 0 ? R : r
+    const a = -Math.PI / 2 + (i * Math.PI) / n
+    pts.push(`${num(Math.cos(a) * rad)},${num(Math.sin(a) * rad)}`)
+  }
+  return `M ${pts.join(' L ')} Z`
+}
+
 /**
  * 按类型把 props 归一化成最终要写进 JSX 的属性表，并产出警告。
  * 处理三类「模型常写错、静默画不出来」的形态：
  * - circle 的 radius/r → size×2（MC Circle 没有 radius 信号）；
  * - circle 缺尺寸 → 默认 size=100（MC 默认 0×0 不可见）；
- * - 封闭形状（rect/circle/ellipse）既无 fill 也无 stroke → 主题文字色兜底；
- * - line/arrow 缺 stroke → 主题文字色兜底；arrow 默认开 endArrow。
+ * - 封闭形状（rect/circle/ellipse/polygon/star）既无 fill 也无 stroke → 主题文字色兜底；
+ * - line/arrow 缺 stroke → 主题文字色兜底；arrow 默认开 endArrow；
+ * - star 的 sides/size → 生成 Path data；polygon 缺省 sides=6、size 兜底；
+ * - image.src 的 `asset:<id>` 引用 → 解析成渲染项目内可加载的 URL。
  */
 function normalizeLayerProps(
   type: LayerType,
   props: LayerProps,
   defaultTextFill: string,
   warnings: string[],
+  assets: Record<string, Asset>,
 ): Record<string, JsonValue> {
   const out: Record<string, JsonValue> = {}
   for (const [k, v] of Object.entries(props)) {
@@ -119,7 +154,7 @@ function normalizeLayerProps(
     delete out.children
     return out
   }
-  if ((type === 'rect' || type === 'circle' || type === 'ellipse') && out.fill === undefined && out.stroke === undefined) {
+  if ((type === 'rect' || type === 'circle' || type === 'ellipse' || type === 'polygon' || type === 'star') && out.fill === undefined && out.stroke === undefined) {
     out.fill = defaultTextFill
     warnings.push(`图层（${type}）既无 fill 也无 stroke，已按主题文字色填充兜底`)
   }
@@ -147,6 +182,39 @@ function normalizeLayerProps(
     }
     if (type === 'arrow' && out.endArrow === undefined && out.startArrow === undefined) {
       out.endArrow = true
+    }
+  }
+  if (type === 'polygon') {
+    out.sides = out.sides ?? 6
+    if (out.size === undefined && out.width === undefined && out.height === undefined) {
+      out.size = 100
+      warnings.push('polygon 图层未指定尺寸（size/width/height），已按 size=100 兜底')
+    }
+  }
+  if (type === 'star') {
+    const sides = Number(out.sides ?? 5)
+    let size = Number(out.size ?? out.width ?? 0)
+    delete out.sides
+    delete out.size
+    delete out.width
+    delete out.height
+    if (!Number.isFinite(size) || size <= 0) {
+      size = 100
+      warnings.push('star 图层尺寸异常（size 应 > 0），已按 size=100 生成星形')
+    }
+    out.data = starPath(size, sides)
+  }
+  if (type === 'image' && typeof out.src === 'string' && out.src.startsWith('asset:')) {
+    const assetId = out.src.slice('asset:'.length)
+    const asset = assets[assetId]
+    if (!asset) {
+      warnings.push(`image 图层引用了未登记的资产 ${assetId}（用 anim_asset_import 登记后再引用）`)
+    } else if (/^https?:\/\//.test(asset.src)) {
+      out.src = asset.src // http URL 资产原样透传，浏览器直接加载
+    } else {
+      const ext = extname(asset.src)
+      out.src = `/assets/${sanitizeAssetId(assetId)}${ext}`
+      warnings.push(`image 图层引用资产 ${assetId}，已解析为 /assets/${sanitizeAssetId(assetId)}${ext}`)
     }
   }
   return out
@@ -246,7 +314,14 @@ function easeExpr(
 
 /* ------------------------------------------------------------ 场景生成 */
 
-function genSceneFile(scene: Scene, index: number, background: string, defaultTextFill: string, warnings: string[]): GeneratedFile {
+function genSceneFile(
+  scene: Scene,
+  index: number,
+  background: string,
+  defaultTextFill: string,
+  assets: Record<string, Asset>,
+  warnings: string[],
+): GeneratedFile {
   const components = new Set<string>()
   const coreImports = new Set<string>()
   const easingImports = new Set<string>()
@@ -304,7 +379,7 @@ function genSceneFile(scene: Scene, index: number, background: string, defaultTe
     const attrs = [`ref={${name}}`]
     const allowed: Record<string, string> = { ...STATIC_PROPS[layer.type] }
     for (const key of COMMON_PROPS) allowed[key] = key
-    const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings)
+    const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings, assets)
     for (const [rawProp, value] of Object.entries(normalized)) {
       let prop = rawProp
       // 模型几乎必然写过 color：语义就是填充色，按 fill 处理而不是丢弃
@@ -506,7 +581,7 @@ export function generateProject(
   const files: GeneratedFile[] = [{ path: 'anim-easing.ts', content: EASING_FILE }]
 
   spec.scenes.forEach((scene, i) => {
-    files.push(genSceneFile(scene, i, background, defaultTextFill, warnings))
+    files.push(genSceneFile(scene, i, background, defaultTextFill, spec.assets, warnings))
   })
 
   const imports = spec.scenes.map((s, i) => `import s${i} from './scenes/s${i}-${sanitize(s.id)}?scene';`)

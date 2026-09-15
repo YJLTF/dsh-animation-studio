@@ -2,7 +2,7 @@
 
 给 [DeepSeek Harness（DSH）](https://deepseek-harness.github.io/deepseek-harness/) 做的**教学动画制作工作台**插件：一套内置在教学会话里的"教学视频 agent"。
 
-你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 9 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程——中途可以随时抽查画面、把某个关键帧挪几百毫秒、或者撤销上一步。模型全程不写动画代码，只读写一份数据文档。
+你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 10 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程——中途可以随时抽查画面、把某个关键帧挪几百毫秒、或者撤销上一步。模型全程不写动画代码，只读写一份数据文档。
 
 基于 **dsh 0.1.6-alpha.1** 真机实证开发（类型开发基线 0.1.5-rc.2，peer 依赖声明为 `>=0.1.5-rc.2`），可无缝配合 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
 
@@ -29,7 +29,7 @@
 
 ## 特性
 
-- **9 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（按 JSON Pointer 精确读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_preview`（降分辨率抽帧）、`anim_render`（整片 MP4）。
+- **10 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（按 JSON Pointer 精确读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_asset_import`（素材登记进 spec.assets，图层用 `src="asset:<id>"` 引用）、`anim_preview`（降分辨率抽帧）、`anim_render`（整片 MP4）。
 - **绝对毫秒时间线 IR**：所有时间都是场景内绝对毫秒，可动画属性统一收进轨道关键帧；内置 linear / easeIn/Out/InOut / cubicBezier / spring 缓动。
 - **写入走 JSON Patch（RFC 6902 子集）**：改完整份校验，不通过整批回滚；每次修改同时记录正向 ops 与反向 inverse，撤销不需要重新推理。补丁入参在边界上做收敛校验，坏 op 立刻以可读的报错返回。
 - **事件溯源**：spec 的每次变更都是一条自包含事件（`anim/spec-created` / `anim/spec-patched` / …），`foldEvents` 从事件流还原状态——可回放、可 fork，恢复与撤销共用同一份历史。事件载荷在边界上做了深清理，能通过 dsh 的无损 JSON 严格校验。
@@ -78,7 +78,7 @@ pnpm build            # esbuild 打包出 lib/index.js（宿主面）+ lib/clien
 dsh plugin --profile web add F:\path\to\dsh-animation-studio
 ```
 
-重启 DSH 后，会话里就会出现 9 个 `anim_*` 工具；`dsh web` 下每次工具调用还会渲染成会话卡片（含视频预览）。
+重启 DSH 后，会话里就会出现 10 个 `anim_*` 工具；`dsh web` 下每次工具调用还会渲染成会话卡片（含视频预览）。
 
 ### 方式二：打包成离线安装包（无网络环境）
 
@@ -160,6 +160,7 @@ AI：anim_diagnose   → 环境自检
 | `anim_get` | 按 JSON Pointer 精确读取 spec 片段 |
 | `anim_patch` | 结构化补丁修改（唯一写途径），返回 inverse |
 | `anim_undo` | 撤销上一次修改 |
+| `anim_asset_import` | 素材登记（image/svg/audio/font）进 spec.assets；本地文件复制进插件资产目录，图层用 `src="asset:<id>"` 引用 |
 | `anim_preview` | 低分辨率抽帧检查效果（只渲染到最晚抽帧点，不渲整片） |
 | `anim_render` | 渲染成 MP4（可只渲指定场景抽查；宿主支持时转后台任务，立即返回 jobId） |
 
@@ -183,11 +184,11 @@ pnpm build       # esbuild 打包插件 → lib/index.js（宿主面）+ lib/cli
 pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟（含无损 JSON 事件校验，无需浏览器）
 ```
 
-冒烟测试覆盖 spec 校验 / patch 可逆 / 时间线展开与截短 / codegen 结构 / store 回滚撤销 / 事件流 fold / 渲染注册表 / 渲染后台化的事件序与同步回退 / `/dsh-anim` 请求内核（状态 API、媒体放行边界、Range/ETag），以及构建产物在真实 cordis 环境里的挂载、执行、会话恢复、web 路由注册与 client bundle 包装契约（`__ModuleLoader__` 登记、entry id、9 张卡片的插槽注册）。浏览器渲染链路（vite / puppeteer / ffmpeg）不在冒烟范围内，由 `examples/hello-gradient` 的 `scripts/render.ts` 走与 `anim_render` 完全相同的运行时路径，可当渲染链路的手动诊断入口用；卡片的真实渲染与视频播放需在 `dsh web` 真机验收。
+冒烟测试覆盖 spec 校验 / patch 可逆 / 时间线展开与截短 / codegen 结构 / store 回滚撤销 / 事件流 fold / 渲染注册表 / 渲染后台化的事件序与同步回退 / `/dsh-anim` 请求内核（状态 API、媒体放行边界、Range/ETag），以及构建产物在真实 cordis 环境里的挂载、执行、会话恢复、web 路由注册与 client bundle 包装契约（`__ModuleLoader__` 登记、entry id、10 张卡片的插槽注册）。浏览器渲染链路（vite / puppeteer / ffmpeg）不在冒烟范围内，由 `examples/hello-gradient` 的 `scripts/render.ts` 走与 `anim_render` 完全相同的运行时路径，可当渲染链路的手动诊断入口用；卡片的真实渲染与视频播放需在 `dsh web` 真机验收。
 
 ## 已知限制与说明
 
-- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / group`（0.3.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；group 用 `children` 引用成员图层，变换作用于整组（MVP 单层分组）。不支持的属性会以警告形式降级而不是失败。
+- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / group`（0.3.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；polygon 是正多边形（`sides`+`size`）、star 自动生成星形（`size`+`sides`）；svg 用内嵌 SVG 字符串；image 的 `src` 可写 `asset:<assetId>` 引用素材；group 用 `children` 引用成员图层，变换作用于整组（MVP 单层分组）。不支持的属性会以警告形式降级而不是失败。
 - 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
 - **工作台面板是只读的**（0.2.0 M2 范围）：卡片只展示状态与产物，"撤销这步 / 预览第 N 幕"按钮驱动的最简交互（P2）未做；面板功能依赖 `dsh web`（webServer 路由 + 浏览器插槽），headless CLI 会话只有工具回执、没有卡片。
 - `/dsh-anim/media` 的放行规则是「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg`）；把产物导出到 outputDir 之外的任意位置再用面板播放，前提是该路径出现在某次工具回执里。

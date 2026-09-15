@@ -9,7 +9,7 @@
  * 用法：pnpm smoke
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
@@ -28,7 +28,7 @@ import type { AnimationSpec, LayerType } from '../packages/spec/src/index.ts'
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { opRender } from '../packages/tools/src/ops.ts'
+import { opRender, opAssetImport } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
@@ -220,7 +220,45 @@ check('codegen: 新元素类型——group 组合、line/arrow 折线箭头、el
   assert.deepEqual(warnings, [], JSON.stringify(warnings))
 })
 
-check('validate+codegen: 8 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
+check('codegen: M1 新元素——polygon/star/svg 与 image 资产引用', () => {
+  const spec = demoSpec()
+  spec.assets = {
+    icon: { kind: 'image', src: '/tmp/icon.png' },
+    web: { kind: 'image', src: 'https://example.com/a.png' },
+  }
+  spec.scenes[0].layers = [
+    { id: 'p', name: '多边形', type: 'polygon', props: { sides: 3, size: 120, fill: '#4C9AFF' }, tracks: [] },
+    { id: 's', name: '星', type: 'star', props: { size: 100, fill: '#FFB020' }, tracks: [] },
+    { id: 'sv', name: 'svg', type: 'svg', props: { svg: '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="red"/></svg>' }, tracks: [] },
+    { id: 'im', name: '图', type: 'image', props: { src: 'asset:icon', width: 60 }, tracks: [] },
+    { id: 'im2', name: '图2', type: 'image', props: { src: 'asset:web', width: 60 }, tracks: [] },
+  ]
+  const { files, warnings } = generateProject(spec)
+  const s = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // polygon：Polygon 组件 + sides 透传
+  assert.match(s, /import \{makeScene2D, Img, Path, Polygon, SVG\} from '@motion-canvas\/2d'/)
+  assert.match(s, /const n0_p = createRef<Polygon>\(\);/)
+  assert.match(s, /sides=\{3\} size=\{120\}/)
+  // star：Path 组件 + 内置星形 path（首字母 M，闭合 Z）
+  assert.match(s, /const n1_s = createRef<Path>\(\);/)
+  assert.match(s, /data=\{"M [^"]+Z"\}/)
+  // svg：内嵌字符串（JSX 里引号被 JSON 转义）
+  assert.match(s, /const n2_sv = createRef<SVG>\(\);/)
+  assert.match(s, /svg=\{"<svg viewBox=\\"/)
+  // image 资产引用：本地文件 → 项目根 URL；http URL → 原样
+  assert.match(s, /src=\{?\"\/assets\/icon\.png\"\}?/)
+  assert.match(s, /src=\{?\"https:\/\/example\.com\/a\.png\"\}?/)
+  assert.ok(warnings.some(w => w.includes('/assets/icon.png')), JSON.stringify(warnings))
+})
+
+check('codegen: image 引用未登记资产 → 警告且 src 保持原样', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [{ id: 'im', name: '图', type: 'image', props: { src: 'asset:ghost' }, tracks: [] }]
+  const { warnings } = generateProject(spec)
+  assert.ok(warnings.some(w => w.includes('未登记') && w.includes('ghost')), JSON.stringify(warnings))
+})
+
+check('validate+codegen: 11 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
   const types: Array<{ type: LayerType; props: Record<string, unknown> }> = [
     { type: 'text', props: { text: 'x' } },
     { type: 'rect', props: { width: 100, height: 50, fill: '#fff' } },
@@ -230,6 +268,9 @@ check('validate+codegen: 8 种图层类型三处一致（validate 放行、codeg
     { type: 'line', props: { points: [[0, 0], [10, 10]], stroke: '#fff' } },
     { type: 'arrow', props: { points: [[0, 0], [10, 10]], stroke: '#fff' } },
     { type: 'ellipse', props: { width: 100, height: 60, fill: '#fff' } },
+    { type: 'polygon', props: { size: 80, fill: '#fff' } },
+    { type: 'star', props: { size: 80, fill: '#fff' } },
+    { type: 'svg', props: { svg: '<svg/>' } },
   ]
   for (const t of types) {
     const spec = demoSpec()
@@ -238,6 +279,33 @@ check('validate+codegen: 8 种图层类型三处一致（validate 放行、codeg
     const { files } = generateProject(spec)
     assert.ok(files.some(f => f.path === 'scenes/s0-intro.tsx'), `${t.type} 应产出场景文件`)
   }
+})
+
+await checkA('opAssetImport: 本地文件复制进资产目录并 patch 进 spec，事件带 ops/inverse；坏输入被拒', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'anim-asset-'))
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  const emitted: AnimEvent[] = []
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: tmp }
+  const src = join(tmp, 'icon.png')
+  writeFileSync(src, 'png-bytes')
+
+  const r = opAssetImport(deps, { specId: 'gd', assetId: 'icon', kind: 'image', src }, e => emitted.push(e))
+  assert.equal(r.assetId, 'icon')
+  assert.ok(isAbsolute(r.src), `回执 src 应为绝对路径，收到 ${r.src}`)
+  assert.ok(existsSync(r.src), '资产文件应被复制进插件资产目录')
+  assert.equal(store.get('gd').assets.icon.kind, 'image')
+  assert.equal(store.get('gd').assets.icon.src, r.src)
+  assert.equal(emitted[0].type, 'anim/spec-patched')
+  assert.ok(Array.isArray((emitted[0].data as { ops: unknown }).ops), '事件应带 ops 载荷')
+
+  // 坏输入：文件不存在 / 扩展名与类型不匹配 / 重复 assetId / 非法 assetId
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'x', kind: 'image', src: join(tmp, 'nope.png') }, () => {}), /文件不存在/)
+  const txt = join(tmp, 'notes.txt')
+  writeFileSync(txt, 'hi')
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'x', kind: 'image', src: txt }, () => {}), /不支持扩展名/)
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'icon', kind: 'image', src }, () => {}), /已存在/)
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'bad id!', kind: 'image', src }, () => {}), /assetId/)
 })
 
 /* ------------------------------------------------------------------ host */

@@ -9,9 +9,10 @@
  * 「一次修改对应一条事件」这个约束在类型上就钉死了。
  */
 
-import { resolve } from 'node:path'
+import { copyFileSync, mkdirSync, statSync } from 'node:fs'
+import { extname, join, resolve } from 'node:path'
 
-import type { AnimationSpec, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
+import type { AnimationSpec, JsonValue, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
 import { readAt, specDurationMs, validateSpec } from '@dsh-anim/spec'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
@@ -549,6 +550,94 @@ async function renderSync(
       data: { specId, jobId: 'sync', outputPath, status: 'failed', error: message },
     })
     throw err
+  }
+}
+
+/* ------------------------------------------------------------------ 资产导入 */
+
+export const ASSET_KINDS = ['image', 'svg', 'audio', 'font'] as const
+export type AssetKind = (typeof ASSET_KINDS)[number]
+
+/** 资产类型 → 可接受的扩展名（不含点）。 */
+const ASSET_EXT: Record<AssetKind, string[]> = {
+  image: ['png', 'jpg', 'jpeg', 'gif', 'webp'],
+  svg: ['svg'],
+  audio: ['mp3', 'wav', 'm4a', 'ogg', 'aac'],
+  font: ['ttf', 'otf', 'woff', 'woff2'],
+}
+
+export interface AssetImportArgs {
+  specId: string
+  assetId: string
+  kind: AssetKind
+  /** 本地文件路径或 http(s) URL。 */
+  src: string
+  alt?: string
+}
+
+export type AssetImportResult = {
+  specId: string
+  assetId: string
+  kind: AssetKind
+  /** 解析后的 src：本地文件复制到 <outputDir>/assets/ 的绝对路径；URL 原样。 */
+  src: string
+  next: string
+}
+
+/**
+ * 登记一份资产进 spec.assets。
+ *
+ * 本地文件会被复制进插件的资产目录（<outputDir>/assets/），渲染时再复制进
+ * 渲染项目（见 render-mc 的 copyAssetsToPublic）；http(s) URL 原样登记，
+ * 渲染时浏览器直接加载。登记即写 spec（patch + 事件），撤销 / 回放天然可用。
+ */
+export function opAssetImport(deps: AnimDeps, args: AssetImportArgs, emit: Emit): AssetImportResult {
+  if (!deps.store.has(args.specId)) throw new AnimOpError(`spec ${args.specId} 不存在，先调 anim_create_spec`)
+  if (!ASSET_KINDS.includes(args.kind)) throw new AnimOpError(`资产类型应为 ${ASSET_KINDS.join(' / ')}，收到 ${String(args.kind)}`)
+  if (!/^[A-Za-z0-9._-]+$/.test(args.assetId)) throw new AnimOpError('assetId 只能含字母/数字/._-（会被用作文件名与 URL）')
+  if (deps.store.get(args.specId).assets[args.assetId]) {
+    throw new AnimOpError(`资产 ${args.assetId} 已存在，覆盖请用 anim_patch 改 /assets/${args.assetId}`)
+  }
+  const ext = extname(args.src).slice(1).toLowerCase()
+  if (!ASSET_EXT[args.kind].includes(ext)) {
+    throw new AnimOpError(`资产类型 ${args.kind} 不支持扩展名 .${ext || '(无)'}，可选：${ASSET_EXT[args.kind].join(' / ')}`)
+  }
+
+  let resolvedSrc: string
+  if (/^https?:\/\//.test(args.src)) {
+    resolvedSrc = args.src
+  } else {
+    const abs = resolve(args.src)
+    try {
+      statSync(abs)
+    } catch {
+      throw new AnimOpError(`文件不存在：${abs}`)
+    }
+    const dir = join(deps.outputDir, 'assets')
+    mkdirSync(dir, { recursive: true })
+    resolvedSrc = join(dir, `${args.assetId.replace(/[^A-Za-z0-9._-]/g, '_')}.${ext}`)
+    copyFileSync(abs, resolvedSrc)
+  }
+
+  const value = { kind: args.kind, src: resolvedSrc, ...(args.alt === undefined ? {} : { alt: args.alt }) }
+  const ops: PatchOp[] = [{ op: 'add', path: `/assets/${args.assetId}`, value: value as unknown as JsonValue }]
+  const { inverse } = deps.store.patch(args.specId, ops, `导入资产 ${args.assetId}`)
+  emit({
+    type: 'anim/spec-patched',
+    data: {
+      specId: args.specId,
+      ops,
+      inverse,
+      note: `导入资产 ${args.assetId}`,
+      durationMs: deps.store.durationMs(args.specId),
+    },
+  })
+  return {
+    specId: args.specId,
+    assetId: args.assetId,
+    kind: args.kind,
+    src: resolvedSrc,
+    next: `资产 ${args.assetId} 已登记（${args.kind}）。在图层 props 里用 src="asset:${args.assetId}" 引用它。`,
   }
 }
 

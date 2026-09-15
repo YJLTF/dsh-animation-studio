@@ -20,8 +20,10 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { PatchOp } from '@dsh-anim/spec'
 
 import type { AnimEvent } from './events.ts'
-import type { AnimDeps, AnimJobsService } from './ops.ts'
+import type { AnimDeps, AnimJobsService, AssetKind } from './ops.ts'
 import {
+  ASSET_KINDS,
+  opAssetImport,
   opCreateSpec,
   opDiagnose,
   opDraftScene,
@@ -415,10 +417,12 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
           required: true,
           description:
             '场景对象：{ id, name, durationMs, layers: [{ id, name, type, props: {...}, tracks: [{ id, target: "props.x", keys: [{ atMs, value, ease }] }] }], transition?: { kind, durationMs } }。'
-            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | group。'
-            + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size；不要写 width/height 之外的尺寸。'
-            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边；arrow 自动带末端箭头（endArrow），画线进度用 start/end（0~1）轨道。'
-            + 'group 用 children: [成员图层id...] 组合，变换属性（x/y/scale/rotation/opacity）作用于整组，成员自己的动画不受影响。'
+            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | group。'
+            + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size。'
+            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边；arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
+            + 'polygon 用 sides（边数）+ size（正多边形）；star 用 size + sides（角数，默认 5），形状自动生成。'
+            + 'svg 用 svg 内嵌 SVG 字符串。image 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材。'
+            + 'group 用 children: [成员图层id...] 组合，变换属性作用于整组，成员自己的动画不受影响。'
             + '所有时间都是场景内绝对毫秒。坐标系：props.x/y 的原点在画布中心（x 右正、y 下正），画布左上角是 (-宽/2, -高/2)——不是 web 的左上角原点，居中就是 x=0,y=0；'
             + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」与缺尺寸/缺描边兜底），改完再写下一幕。',
         },
@@ -531,6 +535,35 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         const inverse = deps.store.undo(args.specId)
         if (!inverse) throw new Error(`spec ${args.specId} 没有可撤销的修改`)
         return await opPatch(deps, { specId: args.specId, ops: inverse, note: '撤销上一步' }, emit) as never
+      },
+    }),
+  )
+
+  /* --- anim_asset_import：素材进 spec.assets，图层用 src="asset:<id>" 引用 --- */
+  register(
+    defineTool({
+      name: 'anim_asset_import',
+      description:
+        '登记一份素材（图片/svg/音频/字体）进 spec 的 assets，返回 assetId。'
+        + '本地文件会被复制进插件资产目录，http URL 原样登记。之后在图层 props 里用 src="asset:<assetId>" 引用它'
+        + '（如 image 图层）。素材是共享资源：一次导入，多个图层可用。',
+      parameters: {
+        specId: { type: 'string', required: true, description: 'spec id' },
+        assetId: { type: 'string', required: true, description: '资产标识（字母/数字/._-），如 gradient-icon' },
+        kind: { type: 'string', required: true, description: '资产类型：image / svg / audio / font' },
+        src: { type: 'string', required: true, description: '本地文件路径（任意位置，会被复制）或 http(s) URL' },
+        alt: { type: 'string', description: '可读说明' },
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => text(JSON.stringify(value, null, 2)),
+        presentationMeta: (_args, value) => value as never,
+      },
+      presentCall: args => ({ card: 'generic', title: `导入素材 ${args.assetId} → ${args.specId}`, kind: 'edit' }),
+      execute: args => {
+        const kind = args.kind as AssetKind
+        if (!ASSET_KINDS.includes(kind)) throw new Error(`资产类型应为 ${ASSET_KINDS.join(' / ')}`)
+        return Promise.resolve(opAssetImport(deps, { ...args, kind }, emit) as never)
       },
     }),
   )

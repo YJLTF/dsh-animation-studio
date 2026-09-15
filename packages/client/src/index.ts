@@ -18,6 +18,7 @@
 import type { ComponentType } from 'react'
 
 import {
+  AssetCard,
   CreatedCard,
   DiagnoseCard,
   PatchCard,
@@ -52,6 +53,7 @@ const VIEWS: Readonly<Record<string, ComponentType<ToolViewProps>>> = {
   anim_undo: UndoCard,
   anim_preview: PreviewCard,
   anim_render: RenderCard,
+  anim_asset_import: AssetCard,
 }
 
 interface ClientContext {

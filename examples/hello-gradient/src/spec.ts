@@ -216,6 +216,44 @@ export const spec: AnimationSpec = {
           ],
         },
         {
+          id: 'sum-star',
+          name: '强调星',
+          type: 'star',
+          props: { size: 44, fill: '#FFB020', x: 270, y: -30 },
+          tracks: [
+            {
+              id: 'star-pop',
+              target: 'props.scale',
+              keys: [
+                { atMs: 1100, value: 0 },
+                { atMs: 1600, value: 1, ease: { kind: 'spring', stiffness: 220, damping: 12 } },
+              ],
+            },
+          ],
+        },
+        {
+          id: 'sum-check',
+          name: '对勾',
+          type: 'svg',
+          props: {
+            svg: '<svg viewBox="0 0 24 24" fill="none"><path d="M4 12.5 L9.5 18 L20 6" stroke="#7DD87D" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            width: 36,
+            height: 36,
+            x: -290,
+            y: -30,
+          },
+          tracks: [
+            {
+              id: 'check-fade',
+              target: 'props.opacity',
+              keys: [
+                { atMs: 1400, value: 0 },
+                { atMs: 1800, value: 1 },
+              ],
+            },
+          ],
+        },
+        {
           id: 'sum-tip',
           name: '补充',
           type: 'text',
