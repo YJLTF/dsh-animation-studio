@@ -1,13 +1,14 @@
 /**
- * Motion Canvas 的默认运行时：起 vite dev server + 有头 Chromium + 点 Render。
+ * Motion Canvas 的默认运行时：起 vite dev server + 无头浏览器 + 点 Render。
  *
  * 为什么是这个形状——Motion Canvas 3.17 **没有 CLI**：官方只在编辑器 UI 里提供
  * RENDER 按钮，落盘机制是浏览器把每帧 base64 通过 dev server 的 WebSocket 发回来
  * （见 vite-plugin 的 exporterPlugin）。所以要自动渲染，只能把编辑器开起来再按按钮。
  *
- * 浏览器必须「有头」：Stage 需要 WebGL，纯 headless Chromium 拿不到 GL 上下文，
- * 渲染器会在 reloadScenes 阶段崩掉。桌面系统（Windows/macOS）有真实显示服务器，
- * 直接开有头浏览器即可；无显示的 Linux 服务器则由 Xvfb 提供虚拟显示。
+ * 默认 headless（没有窗口，渲染不打扰用户）：2026-09 实测 Edge 152 的新 headless
+ * 配合 SwiftShader 能拿到 WebGL 上下文、完整出片。旧结论「纯 headless 拿不到 GL、
+ * 必须有头」基于旧版 headless，已过时；headless:false 保留作调试后门，
+ * 「有头 + Linux 无显示时上 Xvfb」的旧逻辑只为它服务。
  */
 
 import { exec as execCallback, spawn } from 'node:child_process'
@@ -34,7 +35,13 @@ export interface DefaultRuntimeOptions {
   outputDir?: string
   /** Chromium/Chrome 可执行文件路径；省略时依次查 CHROME_PATH 与各平台常见位置。 */
   chromiumPath?: string
-  /** Xvfb 显示号（仅 Linux 无 DISPLAY 时使用）。 */
+  /**
+   * 无头渲染（默认 true）：没有窗口，进度只经 onProgress 上报。
+   * 显式传 false 走有头模式用于调试——窗口标题会显示渲染状态条，
+   * Linux 无显示时需要 Xvfb（旧方案，部分环境 headless 拿不到 GL 时兜底）。
+   */
+  headless?: boolean
+  /** Xvfb 显示号（仅 headless:false 且 Linux 无 DISPLAY 时使用）。 */
   display?: string
   /** 单次渲染的墙钟上限，默认 30 分钟。 */
   timeoutMs?: number
@@ -78,7 +85,7 @@ function findChromium(explicit?: string): string | undefined {
  * 这一层的价值在于**报错要可操作**：说「渲染失败」没用，要说「缺 ffmpeg，装它」。
  * 依赖清单不是猜的，是踩出来的：Xvfb 缺失 = 拿不到 GL；字体缺失 = 中文变豆腐块。
  */
-export async function probeEnvironment(options: { chromiumPath?: string } = {}): Promise<RenderDiagnostics> {
+export async function probeEnvironment(options: { chromiumPath?: string; headless?: boolean } = {}): Promise<RenderDiagnostics> {
   const issues: string[] = []
   const details: Record<string, string> = {}
 
@@ -96,10 +103,11 @@ export async function probeEnvironment(options: { chromiumPath?: string } = {}):
   if (ffmpeg) details['ffmpeg'] = ffmpeg
   else issues.push('未找到 ffmpeg：帧合成 MP4 需要它（apt install ffmpeg / winget install ffmpeg）')
 
-  if (process.platform === 'linux' && !process.env.DISPLAY) {
+  // Xvfb 只在有头模式下才是硬依赖；默认 headless 不需要任何显示服务器
+  if (!options.headless && process.platform === 'linux' && !process.env.DISPLAY) {
     const xvfb = await which('Xvfb')
     if (xvfb) details['Xvfb'] = xvfb
-    else issues.push('未找到 Xvfb：无显示的 Linux 需要虚拟显示才能拿到 WebGL 上下文（apt install xvfb）')
+    else issues.push('未找到 Xvfb：有头模式下无显示的 Linux 需要虚拟显示才能拿到 WebGL 上下文（apt install xvfb）')
   }
 
   // 中文字体：缺了不会报错，只会渲成方块，所以必须主动查
@@ -219,10 +227,11 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
   const chromiumPath = findChromium(options.chromiumPath)
   const outputDir = options.outputDir ?? 'output'
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT
+  const headless = options.headless ?? true
 
   return {
     async probe() {
-      return probeEnvironment({ chromiumPath: options.chromiumPath })
+      return probeEnvironment({ chromiumPath: options.chromiumPath, headless })
     },
 
     async materialize(files, workDir) {
@@ -239,9 +248,8 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       // 清掉上一轮产物：旧帧混进新片是最难发现的一类错误
       resetDir(rootDir)
 
-      // Linux 服务器无显示时用 Xvfb 提供虚拟显示；已有 DISPLAY（桌面 Linux）或
-      // 桌面系统（Windows/macOS）直接用真实显示
-      const linuxNoDisplay = process.platform === 'linux' && !process.env.DISPLAY
+      // Xvfb 只服务于「有头调试 + Linux 无显示」的组合；默认 headless 不需要
+      const linuxNoDisplay = !headless && process.platform === 'linux' && !process.env.DISPLAY
       const xvfb = linuxNoDisplay ? spawn('Xvfb', [display, '-screen', '0', '1920x1080x24'], { stdio: 'ignore' }) : undefined
       if (linuxNoDisplay) await new Promise(r => setTimeout(r, 2000))
       if (chromiumPath === undefined) {
@@ -284,7 +292,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       try {
         browser = await puppeteer.launch({
           executablePath: chromiumPath,
-          headless: false,
+          headless,
           env: linuxNoDisplay ? { ...process.env, DISPLAY: display } : process.env,
           args: [
             '--no-sandbox',
@@ -311,8 +319,8 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         await page.setViewport({ width: 1600, height: 900 })
         await page.bringToFront()
 
-        // 窗口标题就是给用户看的渲染状态条（有头窗口没法藏，索性说清楚
-        // 它在干什么）；标题更新失败绝不影响渲染本身
+        // 有头调试时窗口标题就是渲染状态条；默认 headless 没有窗口，进度只走
+        // onProgress。标题更新失败绝不影响渲染本身
         let lastTitleAt = 0
         const setTitle = (text: string): void => {
           // 包的 TS lib 无 DOM，document 经 globalThis 转型；函数体跑在浏览器里

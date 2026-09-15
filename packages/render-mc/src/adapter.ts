@@ -4,9 +4,10 @@
  * 它把 AnimationSpec 编译成 Motion Canvas 项目源码，再驱动 headless 浏览器出帧、
  * 交给 ffmpeg 合成 MP4。三条踩过的坑固化成代码里的显式处理：
  *
- * 1. **WebGL**：纯 headless Chromium 拿不到 GL 上下文，渲染器会直接崩。
- *    必须 Xvfb 虚拟显示 + 有头模式 + SwiftShader。所以本模块不自作主张地
- *    改浏览器参数，而是 `diagnose()` 把它查出来、让上层决定怎么办。
+ * 1. **WebGL**：SwiftShader 软渲染是出帧的钥匙。2026-09 实测 Edge 152 的新
+ *    headless 配合 SwiftShader 能完整出片（旧版 headless 拿不到 GL，才有
+ *    「必须有头 + Xvfb」的旧方案，现仅作调试后门保留）。所以本模块不自作
+ *    主张地改浏览器参数，而是 `diagnose()` 把它查出来、让上层决定怎么办。
  * 2. **`?scene` 导入**：见 codegen.ts 头注释，场景只能以 `?scene` 形式进入 makeProject。
  * 3. **帧落盘子目录**：image-sequence exporter 把帧写进 `output/<project>/`，
  *    收集时必须递归，别只扫顶层。
