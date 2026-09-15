@@ -45,15 +45,41 @@ export interface AnimSpecPatchedData {
   durationMs: number
 }
 
-/** 渲染任务结束。路径、帧数、时长都记下来，回放旧会话时卡片才重建得出来。 */
+/** 渲染任务开始。后台任务与同步渲染都会先发这条，UI 用它立起进度条。 */
+export interface AnimRenderStartData {
+  specId: string
+  /** 后台任务为 ctx.jobs 的品牌化 id（形如 anim-render-1）；同步回退为 'sync'。 */
+  jobId: string
+  outputPath: string
+  /** 只渲染指定场景时才有（按无损 JSON 约束条件展开，不留 undefined 属性）。 */
+  scenes?: number[]
+  scale?: number
+}
+
+/** 渲染进度。按 5% 一档节流——事件要落盘，不能每帧都发。 */
+export interface AnimRenderProgressData {
+  specId: string
+  jobId: string
+  done: number
+  total: number
+  percent: number
+}
+
+/**
+ * 渲染任务结束。路径、帧数、时长都记下来，回放旧会话时卡片才重建得出来。
+ * `status` 缺省即 completed；killed / failed 时帧数字段无意义，允许缺省。
+ */
 export interface AnimRenderFinishedData {
   specId: string
   jobId: string
   outputPath: string
-  frameCount: number
-  durationMs: number
-  width: number
-  height: number
+  frameCount?: number
+  durationMs?: number
+  width?: number
+  height?: number
+  status?: 'killed' | 'failed'
+  /** status 为 failed 时的人类可读原因。 */
+  error?: string
 }
 
 /** 事件名 → 载荷。新增事件时同步更新 `plugins.d.ts` 里对 `SessionEventMap` 的合并声明。 */
@@ -61,6 +87,8 @@ export interface AnimEventDataMap {
   'anim/spec-created': AnimSpecCreatedData
   'anim/outline-updated': AnimOutlineData
   'anim/spec-patched': AnimSpecPatchedData
+  'anim/render-start': AnimRenderStartData
+  'anim/render-progress': AnimRenderProgressData
   'anim/render-finished': AnimRenderFinishedData
 }
 

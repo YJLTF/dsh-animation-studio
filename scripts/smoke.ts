@@ -13,14 +13,32 @@ import assert from 'node:assert/strict'
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
 import { generateProject, generateProjectMeta } from '../packages/render-mc/src/index.ts'
-import { applyPatch, sceneDurationMs, specDurationMs, tweensOf, validateSpec } from '../packages/spec/src/index.ts'
+import {
+  applyPatch,
+  sceneDurationMs,
+  specDurationMs,
+  truncateSpecAtMs,
+  tweensOf,
+  validateSpec,
+} from '../packages/spec/src/index.ts'
 import type { AnimationSpec } from '../packages/spec/src/index.ts'
-import { AnimRendererRegistry, SpecStore, foldEvents } from '../packages/tools/src/index.ts'
+import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
+import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
+import type { AnimEvent } from '../packages/tools/src/events.ts'
+import { opRender } from '../packages/tools/src/ops.ts'
+import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
+import type { AnimRenderer } from '../packages/tools/src/render.ts'
 
 let passed = 0
 
 function check(name: string, fn: () => void): void {
   fn()
+  passed++
+  console.log(`  ✔ ${name}`)
+}
+
+async function checkA(name: string, fn: () => Promise<void>): Promise<void> {
+  await fn()
   passed++
   console.log(`  ✔ ${name}`)
 }
@@ -177,6 +195,214 @@ check('registry: 注册默认后端、按名获取、注销后回落', () => {
   assert.equal(registry.get('fake').name, 'fake')
   dispose()
   assert.throws(() => registry.get(), /尚未注册/)
+})
+
+/* --------------------------------------------------- 0.2.0：截短 / 恢复 / 后台渲染 */
+
+function twoSceneSpec(): AnimationSpec {
+  const spec = demoSpec()
+  spec.scenes.push({
+    id: 'second',
+    name: '第二幕',
+    durationMs: 2000,
+    layers: [
+      {
+        id: 'ball',
+        name: '球',
+        type: 'circle',
+        props: { radius: 40, fill: '#FFB020' },
+        tracks: [
+          { id: 'move', target: 'props.x', keys: [{ atMs: 0, value: 0 }, { atMs: 1500, value: 200 }] },
+          // 整条轨道都在常见截断点之后——截短后应整条消失
+          { id: 'late', target: 'props.opacity', keys: [{ atMs: 1800, value: 0.5 }] },
+        ],
+      },
+    ],
+  })
+  return spec
+}
+
+check('truncate: 幕后截断零拷贝；幕中截断收紧时长、过滤越界关键帧、原 spec 不动', () => {
+  const spec = twoSceneSpec()
+  assert.equal(specDurationMs(spec.scenes), 4000)
+
+  // 截断点在片尾之外：原样返回（引用相等）
+  assert.equal(truncateSpecAtMs(spec, 99999), spec)
+  assert.throws(() => truncateSpecAtMs(spec, 0), /cutMs/)
+
+  const cut = truncateSpecAtMs(spec, 3000) // 落在第二幕中部
+  assert.equal(cut.scenes.length, 2)
+  assert.equal(specDurationMs(cut.scenes), 3000)
+  const second = cut.scenes[1]
+  assert.equal(second.durationMs, 1000)
+  const move = second.layers[0].tracks.find(t => t.id === 'move')!
+  assert.deepEqual(move.keys.map(k => k.atMs), [0], '越界的 1500ms 关键帧应被过滤')
+  assert.equal(second.layers[0].tracks.some(t => t.id === 'late'), false, '整条越界的轨道应被丢弃')
+  assert.ok(validateSpec(cut, { allowEmptyScenes: true }).ok, '截短后的 spec 仍要通过校验')
+  // 原 spec 不被修改
+  assert.equal(spec.scenes[1].durationMs, 2000)
+  assert.equal(spec.scenes[1].layers[0].tracks.length, 2)
+})
+
+check('foldEvents: 渲染类事件不影响 spec 状态，带失败状态的载荷也不崩', () => {
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  const replay = foldEvents([
+    { type: 'anim/spec-created', data: { specId: 'gd', spec: store.get('gd') } },
+    { type: 'anim/render-start', data: { specId: 'gd', jobId: 'anim-render-1', outputPath: 'out.mp4' } },
+    { type: 'anim/render-progress', data: { specId: 'gd', jobId: 'anim-render-1', done: 5, total: 10, percent: 50 } },
+    { type: 'anim/render-finished', data: { specId: 'gd', jobId: 'anim-render-1', outputPath: 'out.mp4', frameCount: 240 } },
+    { type: 'anim/render-finished', data: { specId: 'gd', jobId: 'x', outputPath: 'o.mp4', status: 'failed', error: 'boom' } },
+  ])
+  assert.equal(replay.list().length, 1)
+  assert.equal(replay.get('gd').meta.title, '冒烟样片')
+})
+
+check('store: adopt 整体并入（含撤销历史）——会话恢复的语义', () => {
+  const source = new SpecStore()
+  source.create('gd', demoSpec())
+  source.patch('gd', [{ op: 'replace', path: '/meta/title', value: '第二版' }])
+  const target = new SpecStore()
+  target.adopt(source)
+  assert.equal(target.get('gd').meta.title, '第二版')
+  target.undo('gd')
+  assert.equal(target.get('gd').meta.title, '冒烟样片', '恢复后的撤销历史应该可用')
+})
+
+/** 渲染测试共用脚手架：假后端 + 事件收集器。 */
+function renderFixture(renderImpl: AnimRenderer['render']) {
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  const emitted: AnimEvent[] = []
+  const emit = (event: AnimEvent): void => {
+    emitted.push(event)
+  }
+  const registry = new AnimRendererRegistry()
+  registry.register(
+    {
+      name: 'fake',
+      diagnose: async () => ({ renderer: 'fake', ok: true, issues: [] }),
+      preview: async () => {
+        throw new Error('preview 未在本测试中使用')
+      },
+      render: renderImpl,
+    },
+    { isDefault: true },
+  )
+  const deps: AnimDeps = { store, renderers: registry, outputDir: '.tmp' }
+  return { deps, emitted, emit }
+}
+
+const RENDER_RESULT = {
+  outputPath: '.tmp/gd.mp4',
+  frameCount: 240,
+  durationMs: 2000,
+  width: 1280,
+  height: 720,
+  renderer: 'fake',
+}
+
+await checkA('opRender: 有 jobs 走后台——回执立即返回 jobId，事件按 start → progress → finished 落盘', async () => {
+  const { deps, emitted, emit } = renderFixture(async request => {
+    request.onProgress?.(5, 10)
+    request.onProgress?.(10, 10)
+    return RENDER_RESULT
+  })
+  let started = 0
+  const jobs: AnimJobsService = {
+    start(spec) {
+      started++
+      spec.run()
+      return 'anim-render-7'
+    },
+  }
+  const ticket = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit, jobs, {})
+  assert.equal(started, 1)
+  assert.equal(ticket.kind, 'background')
+  assert.equal(ticket.jobId, 'anim-render-7')
+
+  // 前三条事件的顺序钉死：start 先立起进度条，缓冲的进度随后补发
+  assert.deepEqual(
+    emitted.slice(0, 3).map(e => e.type),
+    ['anim/render-start', 'anim/render-progress', 'anim/render-progress'],
+  )
+  assert.equal((emitted[0].data as { jobId: string }).jobId, 'anim-render-7')
+  // 5%/一档节流：10 帧里报 5 和 10 → 恰好 50% 与 100% 两条
+  const percents = emitted.filter(e => e.type === 'anim/render-progress').map(e => (e.data as { percent: number }).percent)
+  assert.deepEqual(percents, [50, 100])
+
+  await Promise.resolve()
+  await Promise.resolve()
+  const finished = emitted.find(e => e.type === 'anim/render-finished')
+  assert.ok(finished, 'done 结算后应有 render-finished')
+  assert.equal((finished.data as { frameCount?: number }).frameCount, 240)
+  assert.ok(!('status' in finished.data), '成功完成不应带 status')
+})
+
+await checkA('opRender: job_kill 触发 cancel → killed 事件', async () => {
+  let handle: { done: Promise<unknown> } | undefined
+  const { deps, emitted, emit } = renderFixture(
+    (_request, signal): Promise<{ outputPath: string; frameCount: number; durationMs: number; width: number; height: number; renderer: string }> =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('渲染已取消')))
+      }),
+  )
+  const jobs: AnimJobsService = {
+    start(spec) {
+      const h = spec.run()
+      handle = { done: h.done }
+      h.cancel('用户要求终止')
+      return 'anim-render-9'
+    },
+  }
+  const ticket = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit, jobs)
+  assert.equal(ticket.kind, 'background')
+  await handle!.done
+  const finished = emitted.find(e => e.type === 'anim/render-finished')
+  assert.ok(finished)
+  const data = finished.data as { status?: string; frameCount?: number }
+  assert.equal(data.status, 'killed')
+  assert.equal(data.frameCount, undefined, 'killed 时帧数字段无意义，应缺省')
+})
+
+await checkA('opRender: 无 jobs 或 start 抛错都退回同步路径，行为与 0.1.x 一致', async () => {
+  // (1) 宿主没有 jobs 服务
+  {
+    const { deps, emitted, emit } = renderFixture(async () => RENDER_RESULT)
+    const result = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)
+    assert.equal(result.kind, 'sync', '同步路径直接返回渲染结果')
+    assert.deepEqual(
+      emitted.map(e => e.type),
+      ['anim/render-start', 'anim/render-finished'],
+    )
+    assert.equal((emitted[0].data as { jobId: string }).jobId, 'sync')
+  }
+  // (2) jobs.start 抛错（如 owner 没有附加 job controller）
+  {
+    const { deps, emitted, emit } = renderFixture(async () => RENDER_RESULT)
+    const jobs: AnimJobsService = {
+      start() {
+        throw new Error('owner has no attached job controller')
+      },
+    }
+    const result = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit, jobs, {})
+    assert.equal(result.kind, 'sync')
+    assert.deepEqual(emitted.map(e => e.type), ['anim/render-start', 'anim/render-finished'])
+  }
+  // (3) 同步渲染失败也要发 failed 事件再抛
+  {
+    const { deps, emitted, emit } = renderFixture(async () => {
+      throw new Error('ffmpeg 缺失')
+    })
+    await assert.rejects(
+      opRender(deps, { specId: 'gd' }, new AbortController().signal, emit),
+      /ffmpeg 缺失/,
+    )
+    const finished = emitted.find(e => e.type === 'anim/render-finished')
+    assert.ok(finished)
+    assert.equal((finished.data as { status?: string }).status, 'failed')
+    assert.match((finished.data as { error?: string }).error ?? '', /ffmpeg/)
+  }
 })
 
 console.log(`\n冒烟通过：${passed} 项`)

@@ -17,7 +17,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JsonValue, PatchOp } from '@dsh-anim/spec'
 
 import type { AnimEvent } from './events.ts'
-import type { AnimDeps } from './ops.ts'
+import type { AnimDeps, AnimJobsService } from './ops.ts'
 import {
   opCreateSpec,
   opDiagnose,
@@ -76,6 +76,15 @@ function probe(ctx: Context, key: string): unknown {
   } catch {
     return undefined
   }
+}
+
+/**
+ * 探测宿主的 ctx.jobs 服务（结构探测：宿主侧类型不在本包的类型面上）。
+ * 没有该服务时渲染类工具自动走同步路径，行为与 0.1.x 一致。
+ */
+function probeJobs(ctx: Context): AnimJobsService | undefined {
+  const jobs = probe(ctx, 'jobs') as { start?: unknown } | undefined
+  return jobs && typeof jobs.start === 'function' ? (jobs as AnimJobsService) : undefined
 }
 
 export function resolveEventSink(ctx: Context): EventSink {
@@ -396,7 +405,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_render',
       description:
-        '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景做抽查。',
+        '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景抽查。'
+        + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
+        + '否则同步等待到出片为止。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         outputPath: { type: 'string', description: '输出 MP4 路径，省略则用默认目录' },
@@ -411,13 +422,21 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'terminal', title: `anim render ${args.specId}` }),
-      presentResult: (_args, result) => ({
-        card: 'generic',
-        title: '渲染完成',
-        content: result.content,
-      }),
+      presentResult: (_args, result) => {
+        // 纯函数：从已渲染内容里区分「已转后台」与「同步出片」两种回执
+        let title = '渲染完成'
+        try {
+          const first = result.content[0] as { text?: string } | undefined
+          const parsed = typeof first?.text === 'string' ? (JSON.parse(first.text) as { kind?: string }) : undefined
+          if (parsed?.kind === 'background') title = '渲染已转后台任务'
+        } catch {
+          /* 解析不出就维持默认标题 */
+        }
+        return { card: 'generic', title, content: result.content }
+      },
       async execute(args, exec) {
-        return (await opRender(deps, args, exec.signal, emit)) as never
+        const owner = (exec as { agent?: unknown }).agent
+        return (await opRender(deps, args, exec.signal, emit, probeJobs(ctx), owner)) as never
       },
     }),
   )

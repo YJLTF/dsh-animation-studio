@@ -175,4 +175,31 @@ const diag = await byName['anim_diagnose'].execute({}, exec)
 assert.equal(typeof diag.ok, 'boolean')
 console.log(`  ✔ anim_diagnose 可调用（当前环境 ok=${diag.ok}）`)
 
+// ---- 会话恢复：新挂载从同一份日志 fold，旧 spec（连同撤销历史）应原样可用 ----
+const registered2 = []
+const ctx2 = new Context()
+ctx2.provide('tools', {
+  register(definition) {
+    registered2.push(definition)
+    return () => {}
+  },
+})
+ctx2.provide('session', {
+  append(type, data) {
+    assertLosslessJson(data, `event ${type}.data`)
+    sessionLog.push({ type, data })
+  },
+  snapshotEvents: () => sessionLog,
+})
+await ctx2.plugin(plugin, {})
+
+const byName2 = Object.fromEntries(registered2.map(d => [d.name, d]))
+const got2 = await byName2['anim_get'].execute({ specId: 'smoke', path: '/scenes/0/layers/0/props/text' }, exec)
+assert.equal(got2.value, '你好', '二次挂载应能读到重启前的 spec')
+// fold 重建的撤销历史也要可用
+const undone2 = await byName2['anim_undo'].execute({ specId: 'smoke' }, exec)
+assert.equal(undone2.applied, 1)
+assert.equal(sessionLog.at(-1).type, 'anim/spec-patched')
+console.log('  ✔ 会话恢复：二次挂载从事件流 fold 出 spec，撤销历史可用')
+
 console.log('\n宿主挂载冒烟通过')

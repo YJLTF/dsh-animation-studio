@@ -25,6 +25,7 @@ await build({
   sourcemap: 'linked',
   alias: {
     '@dsh-anim/spec': resolve('packages/spec/src/index.ts'),
+    '@dsh-anim/store': resolve('packages/store/src/index.ts'),
     '@dsh-anim/render-mc': resolve('packages/render-mc/src/index.ts'),
   },
   external: [

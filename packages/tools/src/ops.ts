@@ -11,10 +11,10 @@
 
 import type { AnimationSpec, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
 import { readAt, specDurationMs, validateSpec } from '@dsh-anim/spec'
+import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
-import type { AnimRendererRegistry } from './render.ts'
-import { SpecStore, SpecStoreError } from './store.ts'
+import type { AnimRenderer, AnimRendererRegistry } from './render.ts'
 
 export interface AnimDeps {
   store: SpecStore
@@ -277,29 +277,262 @@ export async function opPreview(
   }
 }
 
+/**
+ * dsh `ctx.jobs` 的最小结构接口。
+ *
+ * 宿主侧类型不在本包的类型面上（与 EventSink 同一个处境），运行时按结构探测
+ * 后使用；字段语义以官方 jobs 子系统文档为准：
+ * - `start()` 预检通过后**同步**调用一次 `run()`，返回品牌化 JobId（形如 anim-render-1）；
+ * - `run()` 返回 `{ cancel, done, readOutput? }`，done 在资源释放后 resolve、不应 reject；
+ * - 模型侧的 job_output / job_kill 由 dsh-tool-jobs 提供，本插件不必自己造。
+ */
+export interface AnimJobHandle {
+  cancel(reason?: unknown): unknown
+  done: Promise<{ status?: 'completed' | 'killed' | 'failed'; detail?: unknown; output?: unknown }>
+}
+
+export interface AnimJobsService {
+  start(spec: {
+    kind: string
+    label: string
+    owner?: unknown
+    run: () => AnimJobHandle
+  }): unknown
+}
+
+export interface RenderArgs {
+  specId: string
+  outputPath?: string
+  scenes?: number[]
+  scale?: number
+  renderer?: string
+}
+
+export interface RenderResultView {
+  /** 区分回执：sync = 同步出片；background = 已转后台任务（见 RenderBackgroundTicket）。 */
+  kind: 'sync'
+  outputPath: string
+  frameCount: number
+  durationMs: number
+  width: number
+  height: number
+  renderer: string
+}
+
+/** 后台模式下工具的即时回执：真正的渲染结果经 job_output / 完成通知到达。 */
+export interface RenderBackgroundTicket {
+  kind: 'background'
+  jobId: string
+  specId: string
+  outputPath: string
+  next: string
+}
+
+/** 进度事件按 5% 一档节流：事件直接落会话日志，每帧一发等于往回放流里灌水。 */
+const PROGRESS_STEPS = 20
+
+/**
+ * 渲染事件按因果序落盘的保障。
+ *
+ * jobs.start 是**同步**调用 run() 的，品牌化 jobId 要等 start 返回才已知；
+ * 极端情况下（同步完成的假后端、立即 abort）渲染可能在 id 产生前就结算。
+ * 所以渲染事件都以 thunk 形式过这道闸：id 未定先缓冲，id 确定后统一补发，
+ * 落盘顺序恒为 render-start → render-progress… → render-finished，且载荷里
+ * 的 jobId 不会错。
+ */
+function createRenderEventGate(emit: Emit, jobIdBox: { value: string | null }) {
+  const deferred: Array<() => AnimEvent> = []
+  const pass = (make: () => AnimEvent): void => {
+    if (jobIdBox.value) emit(make())
+    else deferred.push(make)
+  }
+  const flush = (): void => {
+    for (const make of deferred.splice(0)) emit(make())
+  }
+  return { pass, flush }
+}
+
+function createProgressReporter(
+  specId: string,
+  jobIdBox: { value: string | null },
+  emit: (make: () => AnimEvent) => void,
+) {
+  let lastStep = -1
+  return (done: number, total: number): void => {
+    if (!(total > 0) || done < 0) return
+    const step = Math.min(PROGRESS_STEPS, Math.floor((done / total) * PROGRESS_STEPS))
+    if (step <= lastStep && done < total) return
+    lastStep = step
+    // jobId 在补发时才取值：缓冲期间 id 可能尚未产生
+    emit(() => ({
+      type: 'anim/render-progress',
+      data: { specId, jobId: jobIdBox.value ?? 'anim-render', done, total, percent: Math.round((done / total) * 100) },
+    }))
+  }
+}
+
+function emitRenderStart(emit: Emit, specId: string, jobId: string, outputPath: string, args: RenderArgs): void {
+  emit({
+    type: 'anim/render-start',
+    data: {
+      specId,
+      jobId,
+      outputPath,
+      // 可选字段按无损 JSON 约束条件展开，不留 undefined 属性值
+      ...(args.scenes ? { scenes: args.scenes } : {}),
+      ...(args.scale === undefined ? {} : { scale: args.scale }),
+    },
+  })
+}
+
+/**
+ * 渲染成 MP4。
+ *
+ * 宿主提供 ctx.jobs 时走后台任务：工具立即返回 jobId，进度以 render-progress
+ * 事件可见，模型用 job_output 收集结果、job_kill 终止。任务一旦发布，取消只认
+ * 任务自己的 cancel 信号——外层 exec.signal 的取消只是不再等待，不杀已发布的
+ * 工作（官方 jobs 文档写明的约定）。宿主没有 jobs 服务或发布失败时退回同步
+ * 渲染：调用方 await 到出片为止，进度事件照发。
+ */
 export async function opRender(
   deps: AnimDeps,
-  args: { specId: string; outputPath?: string; scenes?: number[]; scale?: number; renderer?: string },
+  args: RenderArgs,
   signal: AbortSignal,
   emit: Emit,
-): Promise<{ outputPath: string; frameCount: number; durationMs: number; width: number; height: number; renderer: string }> {
+  jobs?: AnimJobsService,
+  owner?: unknown,
+): Promise<RenderResultView | RenderBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
   const outputPath = args.outputPath ?? `${deps.outputDir}/${args.specId}.mp4`
-  const result = await renderer.render({ spec, outputPath, scenes: args.scenes, scale: args.scale }, signal)
-  emit({
-    type: 'anim/render-finished',
-    data: {
-      specId: args.specId,
-      jobId: 'sync',
-      outputPath: result.outputPath,
-      frameCount: result.frameCount,
-      durationMs: result.durationMs,
-      width: result.width,
-      height: result.height,
+  if (signal.aborted) throw new AnimOpError('渲染已取消')
+
+  if (jobs) {
+    try {
+      return await startBackgroundRender(args, { spec, renderer, outputPath }, emit, jobs, owner)
+    } catch {
+      // 发布失败（如 owner 没有附加 job controller）：退回同步，渲染能力照样可用
+    }
+  }
+  return await renderSync(args, { spec, renderer, outputPath }, signal, emit)
+}
+
+async function startBackgroundRender(
+  args: RenderArgs,
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string },
+  emit: Emit,
+  jobs: AnimJobsService,
+  owner: unknown,
+): Promise<RenderBackgroundTicket> {
+  const { spec, renderer, outputPath } = resolved
+  const specId = args.specId
+  const controller = new AbortController()
+  const jobIdBox: { value: string | null } = { value: null }
+  const gate = createRenderEventGate(emit, jobIdBox)
+  const progress = createProgressReporter(specId, jobIdBox, gate.pass)
+
+  const finishedId = (): string => jobIdBox.value ?? 'anim-render'
+  const run = (): AnimJobHandle => ({
+    cancel: (reason?: unknown) => {
+      controller.abort(reason instanceof Error ? reason : new Error(reason ? String(reason) : '渲染任务被终止'))
     },
+    done: renderer
+      .render(
+        { spec, outputPath, scenes: args.scenes, scale: args.scale, onProgress: progress },
+        controller.signal,
+      )
+      .then(
+        result => {
+          gate.pass(() => ({
+            type: 'anim/render-finished',
+            data: {
+              specId,
+              jobId: finishedId(),
+              outputPath: result.outputPath,
+              frameCount: result.frameCount,
+              durationMs: result.durationMs,
+              width: result.width,
+              height: result.height,
+            },
+          }))
+          return { status: 'completed' as const, output: result }
+        },
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err)
+          if (controller.signal.aborted) {
+            gate.pass(() => ({
+              type: 'anim/render-finished',
+              data: { specId, jobId: finishedId(), outputPath, status: 'killed' },
+            }))
+            return { status: 'killed' as const, detail: message }
+          }
+          gate.pass(() => ({
+            type: 'anim/render-finished',
+            data: { specId, jobId: finishedId(), outputPath, status: 'failed', error: message },
+          }))
+          return { status: 'failed' as const, detail: message }
+        },
+      ),
   })
-  return result
+
+  // await 兼容同步/异步两种 start 签名；发布失败向上抛，由 opRender 退回同步
+  const jobId = await jobs.start({
+    kind: 'anim-render',
+    label: `渲染「${spec.meta.title}」(${specId}) → ${outputPath}`,
+    owner,
+    run,
+  })
+  const id = typeof jobId === 'string' ? jobId : String(jobId ?? 'anim-render')
+  jobIdBox.value = id
+  emitRenderStart(emit, specId, id, outputPath, args)
+  gate.flush()
+  return {
+    kind: 'background',
+    jobId: id,
+    specId,
+    outputPath,
+    next: '渲染已在后台进行。用 job_output 收集进度与结果；需要终止时用 job_kill。',
+  }
+}
+
+async function renderSync(
+  args: RenderArgs,
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string },
+  signal: AbortSignal,
+  emit: Emit,
+): Promise<RenderResultView> {
+  const { spec, renderer, outputPath } = resolved
+  const specId = args.specId
+  const jobIdBox: { value: string | null } = { value: 'sync' }
+  const gate = createRenderEventGate(emit, jobIdBox)
+  const progress = createProgressReporter(specId, jobIdBox, gate.pass)
+  emitRenderStart(emit, specId, 'sync', outputPath, args)
+  try {
+    const result = await renderer.render(
+      { spec, outputPath, scenes: args.scenes, scale: args.scale, onProgress: progress },
+      signal,
+    )
+    emit({
+      type: 'anim/render-finished',
+      data: {
+        specId,
+        jobId: 'sync',
+        outputPath: result.outputPath,
+        frameCount: result.frameCount,
+        durationMs: result.durationMs,
+        width: result.width,
+        height: result.height,
+      },
+    })
+    return { ...result, kind: 'sync' as const }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    emit({
+      type: 'anim/render-finished',
+      data: { specId, jobId: 'sync', outputPath, status: 'failed', error: message },
+    })
+    throw err
+  }
 }
 
 /* ------------------------------------------------------------------ 自检 */

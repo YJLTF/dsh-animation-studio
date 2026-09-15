@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@dsh-anim/render-mc": "workspace:*",
-    "@dsh-anim/spec": "workspace:*"
+    "@dsh-anim/spec": "workspace:*",
+    "@dsh-anim/store": "workspace:*"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
