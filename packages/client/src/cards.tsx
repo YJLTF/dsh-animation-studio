@@ -260,17 +260,76 @@ export function UndoCard(props: ToolViewProps): ReactNode {
   )
 }
 
-/** anim_get：读 spec。内容客户端要用时再拉 /dsh-anim/api/spec，卡片只带定位。 */
+/** anim_get：读 spec。内容按需拉 /dsh-anim/api/spec，展开时显示读取到的片段。 */
 export function ReadCard(props: ToolViewProps): ReactNode {
   const receipt = readReceipt(props.block)
   if (!receipt) return <Fallback {...props} running="读取 spec" />
+  const specId = str(receipt, 'specId')
+  const rawPath = str(receipt, 'path')
+  // meta 里整份读取记为 '(整份)'；只有真实 JSON Pointer 才按路径取片段
+  const pointer = rawPath !== undefined && rawPath !== '(整份)' ? rawPath : ''
   return (
-    <Card title={`读取 ${str(receipt, 'specId') ?? ''}`}>
+    <Card title={`读取 ${specId ?? ''}`}>
       <div style={row}>
-        <span style={muted}>{str(receipt, 'path') ?? '(整份)'}</span>
+        <span style={muted}>{rawPath ?? '(整份)'}</span>
         <span style={muted}>时长 {formatMs(num(receipt, 'durationMs'))}</span>
       </div>
+      {specId !== undefined && <SpecContent specId={specId} pointer={pointer} />}
     </Card>
+  )
+}
+
+/** JSON Pointer（RFC 6901）的最小客户端实现；路径走不通返回 undefined。 */
+function pointerGet(root: unknown, pointer: string): unknown {
+  let cur: unknown = root
+  for (const raw of pointer.split('/')) {
+    if (raw === '') continue
+    const token = raw.replace(/~1/g, '/').replace(/~0/g, '~')
+    if (Array.isArray(cur)) {
+      const i = Number(token)
+      if (!Number.isInteger(i) || i < 0 || i >= cur.length) return undefined
+      cur = cur[i]
+    } else if (cur !== null && typeof cur === 'object') {
+      cur = (cur as Record<string, unknown>)[token]
+    } else {
+      return undefined
+    }
+  }
+  return cur
+}
+
+/**
+ * ReadCard 的「查看读取内容」：展开时才拉 /dsh-anim/api/spec（meta 刻意不带
+ * spec 内容），按调用里的 JSON Pointer 取片段展示——此前这条数据通道只有
+ * API 没有 UI，用户在面板上反而看不到模型读到了什么（优化清单 O17）。
+ */
+function SpecContent(props: { specId: string; pointer: string }): ReactNode {
+  const [state, setState] = useState<{ status: 'idle' | 'loading' | 'ok' | 'error'; text?: string }>({ status: 'idle' })
+  const load = (): void => {
+    setState({ status: 'loading' })
+    void fetch(`/dsh-anim/api/spec?id=${encodeURIComponent(props.specId)}`)
+      .then(async res => {
+        if (!res.ok) throw new Error(String(res.status))
+        const data = (await res.json()) as { spec?: unknown }
+        const text = JSON.stringify(pointerGet(data.spec, props.pointer) ?? null, null, 2)
+        setState({
+          status: 'ok',
+          text: text.length <= 4000 ? text : `${text.slice(0, 4000)}\n…（已截断，共 ${text.length} 字符）`,
+        })
+      })
+      .catch(() => setState({ status: 'error' }))
+  }
+  return (
+    <details
+      onToggle={event => {
+        if ((event.currentTarget as HTMLDetailsElement).open && state.status === 'idle') load()
+      }}
+    >
+      <summary style={{ ...muted, cursor: 'pointer' }}>查看读取内容</summary>
+      {state.status === 'loading' && <div style={muted}>加载中…</div>}
+      {state.status === 'error' && <div style={muted}>工作台服务不可达，读不到内容（可能由宿主重启）。</div>}
+      {state.status === 'ok' && <pre style={preBox}>{state.text}</pre>}
+    </details>
   )
 }
 
@@ -294,16 +353,18 @@ export function PreviewCard(props: ToolViewProps): ReactNode {
           const path = frame.path as string
           return (
             <figure key={i} style={figure} title={path}>
-              {/* 路由不可达/文件被清理时隐藏图块，保留时间标注与路径提示 */}
-              <img
-                style={thumb}
-                src={mediaUrl(path)}
-                alt={str(frame, 'atMs') !== undefined ? `${formatMs(num(frame, 'atMs'))} 处画面` : '预览帧'}
-                loading="lazy"
-                onError={event => {
-                  ;(event.currentTarget as HTMLImageElement).style.visibility = 'hidden'
-                }}
-              />
+              {/* 路由不可达/文件被清理时隐藏图块，保留时间标注；点图在新标签看原帧 */}
+              <a href={mediaUrl(path)} target="_blank" rel="noreferrer">
+                <img
+                  style={thumb}
+                  src={mediaUrl(path)}
+                  alt={str(frame, 'atMs') !== undefined ? `${formatMs(num(frame, 'atMs'))} 处画面` : '预览帧'}
+                  loading="lazy"
+                  onError={event => {
+                    ;(event.currentTarget as HTMLImageElement).style.visibility = 'hidden'
+                  }}
+                />
+              </a>
               <figcaption style={caption}>{formatMs(num(frame, 'atMs'))}</figcaption>
             </figure>
           )
@@ -357,22 +418,45 @@ function BackgroundTicket(props: { receipt: Receipt; openFile?: ToolViewProps['o
 
   useEffect(() => {
     if (!jobId) return
+    const id: string = jobId
     let alive = true
-    const tick = async (): Promise<void> => {
+    let timer: ReturnType<typeof setInterval> | undefined = setInterval(tick, 2000)
+    let misses = 0
+    // 落定（completed/failed/killed）即停表、连续不可达退避到 10s：渲染完成的
+    // 卡片不该在余下的会话里每 2s 打一次状态 API（优化清单 O11）
+    async function tick(): Promise<void> {
       try {
-        const job = await fetchRenderStatus(jobId)
+        const job = await fetchRenderStatus(id)
         if (!alive) return
         setUnreachable(job === null)
-        if (job !== null) setStatus(job)
+        if (job === null) {
+          misses += 1
+          if (misses === 3 && timer) {
+            clearInterval(timer)
+            timer = setInterval(tick, 10_000)
+          }
+          return
+        }
+        misses = 0
+        setStatus(job)
+        if (job.status !== 'running' && timer) {
+          clearInterval(timer)
+          timer = undefined
+        }
       } catch {
-        if (alive) setUnreachable(true)
+        if (!alive) return
+        setUnreachable(true)
+        misses += 1
+        if (misses === 3 && timer) {
+          clearInterval(timer)
+          timer = setInterval(tick, 10_000)
+        }
       }
     }
     void tick()
-    const timer = setInterval(tick, 2000)
     return () => {
       alive = false
-      clearInterval(timer)
+      if (timer) clearInterval(timer)
     }
   }, [jobId])
 
@@ -469,7 +553,7 @@ export function AssetCard(props: ToolViewProps): ReactNode {
     <Card title={`导入素材：${str(receipt, 'assetId') ?? ''}`}>
       <div style={row}>
         <span>{str(receipt, 'kind') ?? '—'}</span>
-        <span style={muted}>{str(receipt, 'src')}</span>
+        <span style={{ ...muted, wordBreak: 'break-all' }}>{str(receipt, 'src')}</span>
       </div>
     </Card>
   )

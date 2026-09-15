@@ -15,9 +15,18 @@ import { isAbsolute, join } from 'node:path'
 
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
-import { generateProject, generateProjectMeta } from '../packages/render-mc/src/index.ts'
+import {
+  ANIMATABLE_BY_TYPE,
+  COMPONENT,
+  generateProject,
+  generateProjectMeta,
+  MotionCanvasRenderer,
+  pickScenes,
+  STATIC_PROPS,
+} from '../packages/render-mc/src/index.ts'
 import {
   applyPatch,
+  LAYER_TYPES,
   sceneDurationMs,
   specDurationMs,
   truncateSpecAtMs,
@@ -300,6 +309,57 @@ check('validate: code 缺 code 内容 / math 缺 tex 有软警告，language 非
   assert.equal(mk({ id: 'c2', name: '代码2', type: 'code', props: { code: 'x', language: 42 }, tracks: [] }).ok, false)
 })
 
+check('枚举一致性: LAYER_TYPES 与 codegen 三张表零漂移（0.3.x O14 防线）', () => {
+  const expected = [...LAYER_TYPES].sort()
+  assert.equal(new Set(expected).size, expected.length, 'LAYER_TYPES 本身不应有重复项')
+  assert.deepEqual(Object.keys(STATIC_PROPS).sort(), expected, 'STATIC_PROPS 键应与 LAYER_TYPES 一致')
+  assert.deepEqual(Object.keys(COMPONENT).sort(), expected, 'COMPONENT 键应与 LAYER_TYPES 一致')
+  assert.deepEqual(Object.keys(ANIMATABLE_BY_TYPE).sort(), expected, 'ANIMATABLE_BY_TYPE 键应与 LAYER_TYPES 一致')
+})
+
+check('枚举一致性: anim_draft_scene 工具描述与 LAYER_TYPES 对齐（模型必读的第四张面）', () => {
+  const source = readFileSync(join(process.cwd(), 'packages/tools/src/register.ts'), 'utf8')
+  const m = source.match(/type 可选：([a-z |]+)/)
+  assert.ok(m, '工具描述应包含「type 可选：…」列表')
+  const listed = m[1]!.split('|').map(s => s.trim()).filter(Boolean)
+  assert.deepEqual(listed, [...LAYER_TYPES], '描述里的类型列表应与 LAYER_TYPES 完全一致（顺序也对齐）')
+})
+
+check('validate: group children——引用存在/不自引用/不嵌套 group 是硬错，重复归属是软警告', () => {
+  const mk = (layers: unknown[]) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = layers as never
+    return validateSpec(spec)
+  }
+  const circle = { id: 'a', name: 'A', type: 'circle', props: { size: 50, fill: '#fff' }, tracks: [] }
+  // 合法引用：本幕存在的图层
+  assert.equal(mk([circle, { id: 'g', name: '组', type: 'group', props: { children: ['a'] }, tracks: [] }]).ok, true)
+  // 引用本幕不存在的图层 → 硬错（此前只能到渲染期以警告发现，O15）
+  const ghost = mk([circle, { id: 'g', name: '组', type: 'group', props: { children: ['ghost'] }, tracks: [] }])
+  assert.equal(ghost.ok, false)
+  if (!ghost.ok) assert.ok(ghost.errors.some(e => e.message.includes('ghost')), JSON.stringify(ghost.errors))
+  // 自引用 → 硬错
+  assert.equal(mk([{ id: 'g', name: '组', type: 'group', props: { children: ['g'] }, tracks: [] }]).ok, false)
+  // group 套 group（MVP 单层分组）→ 硬错
+  assert.equal(
+    mk([
+      { id: 'g1', name: '组1', type: 'group', props: { children: [] }, tracks: [] },
+      { id: 'g2', name: '组2', type: 'group', props: { children: ['g1'] }, tracks: [] },
+    ]).ok,
+    false,
+  )
+  // children 形态非法（字符串而不是数组）→ 硬错
+  assert.equal(mk([{ id: 'g', name: '组', type: 'group', props: { children: 'a' }, tracks: [] }]).ok, false)
+  // 同一图层被两个 group 引用 → 不阻断，但给警告
+  const dupe = mk([
+    circle,
+    { id: 'g1', name: '组1', type: 'group', props: { children: ['a'] }, tracks: [] },
+    { id: 'g2', name: '组2', type: 'group', props: { children: ['a'] }, tracks: [] },
+  ])
+  assert.equal(dupe.ok, true)
+  if (dupe.ok) assert.ok(dupe.warnings.some(w => w.includes('多个 group')), JSON.stringify(dupe.warnings))
+})
+
 check('validate+codegen: 13 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
   const types: Array<{ type: LayerType; props: Record<string, unknown> }> = [
     { type: 'text', props: { text: 'x' } },
@@ -444,6 +504,16 @@ function twoSceneSpec(): AnimationSpec {
   return spec
 }
 
+check('pickScenes: 按索引切片保序去重、原 spec 不动，越界索引可读报错（O1）', () => {
+  const spec = twoSceneSpec()
+  const picked = pickScenes(spec, [1, 0, 1])
+  assert.deepEqual(picked.scenes.map(s => s.id), ['intro', 'second'], '保持原播放顺序且去重')
+  assert.equal(spec.scenes.length, 2, '原 spec 不被修改')
+  assert.throws(() => pickScenes(spec, [2]), /越界索引/)
+  assert.throws(() => pickScenes(spec, [-1]), /越界索引/)
+  assert.equal(pickScenes(spec), spec, '省略/空 scenes 原样返回（引用相等，零拷贝）')
+})
+
 check('truncate: 幕后截断零拷贝；幕中截断收紧时长、过滤越界关键帧、原 spec 不动', () => {
   const spec = twoSceneSpec()
   assert.equal(specDurationMs(spec.scenes), 4000)
@@ -491,9 +561,78 @@ check('store: adopt 整体并入（含撤销历史）——会话恢复的语义
   assert.equal(target.get('gd').meta.title, '冒烟样片', '恢复后的撤销历史应该可用')
 })
 
+await checkA('MotionCanvasRenderer.render: scenes 抽查真正切片——生成物只含所选幕（O1 接线）', async () => {
+  const spec = twoSceneSpec()
+  let materialized: Array<{ path: string; content: string }> = []
+  const runtime = {
+    // 在 ffmpeg 合成之前停下：这里只验证「切片后的 spec 进了 codegen」这条接线
+    async materialize(files: Array<{ path: string; content: string }>) {
+      materialized = files
+      throw new Error('SENTINEL-STOP')
+    },
+    async renderProject(): Promise<never> {
+      throw new Error('unreachable')
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const renderer = new MotionCanvasRenderer({
+    runtime: runtime as never,
+    workDir: mkdtempSync(join(tmpdir(), 'anim-scenes-')),
+  })
+  await assert.rejects(
+    renderer.render({ spec, outputPath: join(tmpdir(), 'scenes-o.mp4'), scenes: [1] }, new AbortController().signal),
+    /SENTINEL-STOP/,
+  )
+  assert.deepEqual(
+    materialized.filter(f => f.path.startsWith('scenes/')).map(f => f.path),
+    ['scenes/s0-second.tsx'],
+    '只应生成所选幕的场景文件（切片后重编号为 s0）',
+  )
+  const project = materialized.find(f => f.path === 'project.tsx')!
+  assert.doesNotMatch(project.content, /intro/, '未选中的第一幕不应出现在 project 里')
+  // 越界索引在触达渲染器之前就被拒
+  await assert.rejects(
+    renderer.render({ spec, outputPath: join(tmpdir(), 'scenes-o.mp4'), scenes: [9] }, new AbortController().signal),
+    /越界索引/,
+  )
+})
+
+await checkA('MotionCanvasRenderer: preview/render 共用串行闸——并发调用不重叠（O2）', async () => {
+  let running = 0
+  let maxConcurrent = 0
+  const runtime = {
+    async materialize(): Promise<void> {},
+    async renderProject(options: { expectedFrames: number }) {
+      running += 1
+      maxConcurrent = Math.max(maxConcurrent, running)
+      await new Promise(r => setTimeout(r, 20))
+      running -= 1
+      return { frameDir: 'frame-dir', frameCount: options.expectedFrames }
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const renderer = new MotionCanvasRenderer({
+    runtime: runtime as never,
+    workDir: mkdtempSync(join(tmpdir(), 'anim-lock-')),
+  })
+  // preview 与 render 走同一个 #renderFrames 串行闸，preview 可在无 ffmpeg 环境并发验证
+  const shortSpec = twoSceneSpec()
+  shortSpec.scenes[0].durationMs = 1000
+  const [a, b] = await Promise.all([
+    renderer.preview({ spec: twoSceneSpec(), atMs: [100], scale: 4 }, new AbortController().signal),
+    renderer.preview({ spec: shortSpec, atMs: [100], scale: 4 }, new AbortController().signal),
+  ])
+  assert.equal(maxConcurrent, 1, '两个并发渲染请求不得重叠执行')
+  assert.equal(a.frames.length, 1)
+  assert.equal(b.frames.length, 1)
+})
+
 /** 渲染测试共用脚手架：假后端 + 事件收集器。 */
-function renderFixture(renderImpl: AnimRenderer['render']) {
-  const store = new SpecStore()
+function renderFixture(renderImpl: AnimRenderer['render']) {  const store = new SpecStore()
   store.create('gd', demoSpec())
   const emitted: AnimEvent[] = []
   const emit = (event: AnimEvent): void => {

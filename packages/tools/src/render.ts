@@ -93,8 +93,4 @@ export class AnimRendererRegistry {
     }
     return found
   }
-
-  list(): string[] {
-    return [...this.#renderers.keys()]
-  }
 }

@@ -13,7 +13,7 @@ import { copyFileSync, mkdirSync, statSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 
 import type { AnimationSpec, JsonValue, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
-import { readAt, specDurationMs, validateSpec } from '@dsh-anim/spec'
+import { readAt, safeName, specDurationMs, validateSpec } from '@dsh-anim/spec'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
@@ -143,8 +143,8 @@ export function opPlan(deps: AnimDeps, args: PlanArgs, emit: Emit): PlanResult {
     if (!item.intent) pacing.push(`「${item.name}」缺少教学意图，写清楚这幕要让学生明白什么`)
   }
   const totalMs = args.outline.reduce((s, x) => s + x.durationMs, 0)
-  const seconds = (totalMs / 1000).toFixed(1)
-  pacing.push(`全片 ${seconds}s，共 ${args.outline.length} 幕`)
+  // 「全片 Xs 共 N 幕」这类中性信息不再混进 pacing：totalMs/sceneCount 已在
+  // 回执与面板摘要里，混在一起会稀释真警告的视觉权重（优化清单 O18）
 
   emit({ type: 'anim/outline-updated', data: { specId: args.specId, outline: args.outline } })
   return { specId: args.specId, sceneCount: args.outline.length, totalMs, pacing }
@@ -608,14 +608,16 @@ export function opAssetImport(deps: AnimDeps, args: AssetImportArgs, emit: Emit)
     resolvedSrc = args.src
   } else {
     const abs = resolve(args.src)
+    let stats
     try {
-      statSync(abs)
+      stats = statSync(abs)
     } catch {
       throw new AnimOpError(`文件不存在：${abs}`)
     }
+    if (!stats.isFile()) throw new AnimOpError(`不是文件（应为图片/音频等文件本身）：${abs}`)
     const dir = join(deps.outputDir, 'assets')
     mkdirSync(dir, { recursive: true })
-    resolvedSrc = join(dir, `${args.assetId.replace(/[^A-Za-z0-9._-]/g, '_')}.${ext}`)
+    resolvedSrc = join(dir, `${safeName(args.assetId)}.${ext}`)
     copyFileSync(abs, resolvedSrc)
   }
 

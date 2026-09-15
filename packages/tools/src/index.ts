@@ -11,7 +11,9 @@ import { resolve } from 'node:path'
 import type { Context, Disposable } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { foldEvents, SpecStore } from '@dsh-anim/store'
+import { safeName } from '@dsh-anim/spec'
 
+import { probe } from './ctx-probe.ts'
 import type { AnimDeps } from './ops.ts'
 import { registerAnimTools, resolveEventSink } from './register.ts'
 import type { AnimRenderer } from './render.ts'
@@ -61,15 +63,6 @@ export function provideRenderer(ctx: Context, renderer: AnimRenderer, options?: 
 }
 
 /* ------------------------------------------------------------------ 会话恢复 */
-
-/** 读取 ctx 上的服务属性；cordis 代理对未注入服务的访问会抛错，这里统一吞掉。 */
-function probe(ctx: Context, key: string): unknown {
-  try {
-    return (ctx as unknown as Record<string, unknown>)[key]
-  } catch {
-    return undefined
-  }
-}
 
 /**
  * 挂载时从 ctx.session 的会话事件流 fold 出工作台状态（spec 内容 + 撤销历史）。
@@ -151,8 +144,7 @@ export function makeSessionHydrator(
     try {
       // 1. sidecar 优先：本插件的事件文件，行即事件
       if (options.sessionsDir) {
-        const safeId = session.id.replace(/[^a-zA-Z0-9._-]/g, '_')
-        const file = resolve(options.sessionsDir, `${safeId}.jsonl`)
+        const file = resolve(options.sessionsDir, `${safeName(session.id)}.jsonl`)
         if (existsSync(file)) {
           const events = readFileSync(file, 'utf8')
             .split('\n')

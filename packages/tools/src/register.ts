@@ -18,9 +18,11 @@ import type { Context, Disposable } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 import type { PatchOp } from '@dsh-anim/spec'
+import { safeName } from '@dsh-anim/spec'
 
 import type { AnimEvent } from './events.ts'
-import type { AnimDeps, AnimJobsService, AssetKind } from './ops.ts'
+import { probe } from './ctx-probe.ts'
+import type { AnimDeps, AnimJobsService, AssetKind, Emit } from './ops.ts'
 import {
   ASSET_KINDS,
   opAssetImport,
@@ -44,8 +46,13 @@ import {
  * 读回路径对未知事件类型 fail-closed——除非记录带 `SessionEvent.ignorable: true`
  * 信封，整个会话拒读（「likely written by a newer harness」）；而宿主
  * 0.1.6-alpha.1 的 append API 不提供 ignorable 入口，写入 anim/* 事件等于
- * 毒化该会话日志（真机事故：session-0ea61fc8 加载失败）。等宿主开放
+ * 毒化该会话日志（真机事故：session-0ea61fc8）。等宿主开放
  * ignorable 写入后再评估切回。
+ *
+ * **会话归因靠 append 的 agent 参数**，不是共享槽位：后台渲染的事件在 job 里
+ * 异步产生，若 sink 用「当前 agent」单槽位记录，另一会话的工具调用会覆盖它，
+ * 前一个会话的渲染进度从此落错 sidecar（0.3.x 优化清单 O3）。每次工具调用的
+ * emit 闭包都绑定当次 agent（见 registerAnimTools 的 emitFor），事件永远落对文件。
  *
  * 拿不到会话 id（冒烟环境）或 sidecar 写失败时按退路降级：
  * 1. cordis 事件总线——仅进程内可见；
@@ -53,14 +60,10 @@ import {
  *
  * 载荷在边界上做深清理（跳过 undefined 属性值——无损 JSON 校验的拒绝形态），
  * 对所有退路统一生效。其余代码只认这个接口，不认具体实现。
- *
- * 注意：cordis 的 Context 是代理，读取未 inject 的服务属性会直接抛错
- * （而不是返回 undefined），所以所有属性探测都必须裹进 try/catch。
  */
 export interface EventSink {
-  append(event: AnimEvent): void
-  /** 每次工具调用前由执行包装器注入当次 agent（见 registerAnimTools 的收口）。 */
-  setAgent(agent: unknown): void
+  /** `agent` 是当次工具调用 exec 里的 agent（用于定位会话 sidecar）。 */
+  append(event: AnimEvent, agent: unknown): void
 }
 
 /**
@@ -78,15 +81,6 @@ function stripUndefined<T>(value: T): T {
     return out as unknown as T
   }
   return value
-}
-
-/** 读取 ctx 上的属性；cordis 代理对未注入服务的访问会抛错，这里统一吞掉。 */
-function probe(ctx: Context, key: string): unknown {
-  try {
-    return (ctx as unknown as Record<string, unknown>)[key]
-  } catch {
-    return undefined
-  }
 }
 
 /**
@@ -107,29 +101,23 @@ export interface EventSinkOptions {
 }
 
 export function resolveEventSink(ctx: Context, options: EventSinkOptions = {}): EventSink {
-  // 工具调用是串行的（同一 agent 回合内），单个槽位即可让 append 拿到当次会话
-  let currentAgent: unknown
-  let sessionsDirReady = false
   return {
-    setAgent(agent) {
-      currentAgent = agent
-    },
-    append(event) {
+    append(event, agent) {
       const data = stripUndefined(event.data)
       // 1. 插件自有 sidecar（真机持久化正道）。绝不写宿主会话日志：
       //    dsh 读回路径对未知事件类型 fail-closed（`SessionEvent.ignorable`
       //    才放行），而 `session.append` API 不提供 ignorable 入口——写了
       //    anim/* 事件整个会话就拒读（真机事故：session-0ea61fc8）。
-      const sessionId = (currentAgent as { session?: { id?: unknown } } | undefined)?.session?.id
+      //    会话 id 来自 append 参数（emit 闭包绑定的当次 agent），不读共享
+      //    状态——并发会话的事件才能各落各的文件。
+      const sessionId = (agent as { session?: { id?: unknown } } | undefined)?.session?.id
       if (options.sessionsDir && typeof sessionId === 'string') {
         try {
-          if (!sessionsDirReady) {
-            mkdirSync(options.sessionsDir, { recursive: true })
-            sessionsDirReady = true
-          }
-          const safeId = sessionId.replace(/[^a-zA-Z0-9._-]/g, '_')
+          // recursive mkdir 对已存在目录是廉价的幂等操作，不值得为它维护
+          // 「目录已建」标记位（标记位在写失败后反而会挡住重建）
+          mkdirSync(options.sessionsDir, { recursive: true })
           const line = `${JSON.stringify({ type: event.type, time: Date.now(), data })}\n`
-          appendFileSync(join(options.sessionsDir, `${safeId}.jsonl`), line, 'utf8')
+          appendFileSync(join(options.sessionsDir, `${safeName(sessionId)}.jsonl`), line, 'utf8')
           return
         } catch {
           /* sidecar 写失败退到总线/日志，工具调用不能被持久化拖垮 */
@@ -280,22 +268,29 @@ function indexMediaFromResult(media: { add(path: string): void } | undefined, re
   }
 }
 
-/** 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。 */
+/**
+ * 注册全部 `anim_*` 工具，返回一次性注销函数（`ctx.effect` 会自动调用）。
+ */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
   const { deps, sink, sessionsDir, hydrate } = options
-  const emit = (event: AnimEvent): void => {
-    sink.append(event)
-    options.tracker?.observe(event)
+  /**
+   * 每次工具调用构造自己的 emit：闭包绑定当次 agent，后台渲染在 job 里
+   * 异步发事件时归因也不会被其他会话的工具调用覆盖（优化清单 O3）。
+   */
+  const emitFor = (exec: { agent?: unknown } | undefined): Emit => {
+    const agent = exec?.agent
+    return event => {
+      sink.append(event, agent)
+      options.tracker?.observe(event)
+    }
   }
   const disposers: Array<() => void> = []
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
-    // 单一收口：每个工具执行前注入当次 agent（事件 sink 与懒恢复都靠它定位会话）
+    // 单一收口：每个工具执行前做会话懒恢复（事件归因由 emitFor 按调用绑定）
     const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
     if (originalExecute) {
       const wrapped = async (args: never, exec: { agent?: unknown }): Promise<unknown> => {
-        const agent = (exec as { agent?: unknown } | undefined)?.agent
-        sink.setAgent(agent)
-        hydrate?.(agent)
+        hydrate?.(exec?.agent)
         const result = await originalExecute(args, exec as never)
         indexMediaFromResult(options.media, result)
         return result
@@ -350,7 +345,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'generic', title: `新建动画：${args.title}`, kind: 'other' }),
-      execute: args => Promise.resolve(opCreateSpec(deps, args, emit) as never),
+      execute: (args, exec) => Promise.resolve(opCreateSpec(deps, args, emitFor(exec)) as never),
     }),
   )
 
@@ -386,7 +381,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         presentationMeta: (args, value) => ({ ...(value as object), outline: args.outline }) as never,
       },
       presentCall: args => ({ card: 'generic', title: `规划分镜：${args.specId}`, kind: 'edit' }),
-      execute: args => {
+      execute: (args, exec) => {
         const outline = (args.outline as unknown[]).map((item, i) => {
           const o = coerceJsonParam(item, `outline[${i}]`) as Record<string, unknown>
           return {
@@ -399,7 +394,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             durationMs: Number(o.durationMs ?? 0),
           }
         })
-        return Promise.resolve(opPlan(deps, { specId: args.specId, outline }, emit) as never)
+        return Promise.resolve(opPlan(deps, { specId: args.specId, outline }, emitFor(exec)) as never)
       },
     }),
   )
@@ -443,7 +438,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         },
       },
       presentCall: args => ({ card: 'generic', title: `写入场景 → ${args.specId}`, kind: 'edit' }),
-      execute: args =>
+      execute: (args, exec) =>
         Promise.resolve(
           opDraftScene(
             deps,
@@ -452,7 +447,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
               scene: coerceJsonParam(args.scene, 'scene') as never,
               index: args.index,
             },
-            emit,
+            emitFor(exec),
           ) as never,
         ),
     }),
@@ -511,8 +506,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         },
       },
       presentCall: args => ({ card: 'generic', title: `修改 ${args.specId}（${args.ops.length} 条）`, kind: 'edit' }),
-      execute: args =>
-        Promise.resolve(opPatch(deps, { specId: args.specId, ops: coerceOps(args.ops), note: args.note }, emit) as never),
+      execute: (args, exec) =>
+        Promise.resolve(opPatch(deps, { specId: args.specId, ops: coerceOps(args.ops), note: args.note }, emitFor(exec)) as never),
     }),
   )
 
@@ -533,10 +528,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         },
       },
       presentCall: args => ({ card: 'generic', title: `撤销 ${args.specId}`, kind: 'edit' }),
-      async execute(args) {
+      async execute(args, exec) {
         const inverse = deps.store.undo(args.specId)
         if (!inverse) throw new Error(`spec ${args.specId} 没有可撤销的修改`)
-        return await opPatch(deps, { specId: args.specId, ops: inverse, note: '撤销上一步' }, emit) as never
+        return await opPatch(deps, { specId: args.specId, ops: inverse, note: '撤销上一步' }, emitFor(exec)) as never
       },
     }),
   )
@@ -562,10 +557,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'generic', title: `导入素材 ${args.assetId} → ${args.specId}`, kind: 'edit' }),
-      execute: args => {
+      execute: (args, exec) => {
         const kind = args.kind as AssetKind
         if (!ASSET_KINDS.includes(kind)) throw new Error(`资产类型应为 ${ASSET_KINDS.join(' / ')}`)
-        return Promise.resolve(opAssetImport(deps, { ...args, kind }, emit) as never)
+        return Promise.resolve(opAssetImport(deps, { ...args, kind }, emitFor(exec)) as never)
       },
     }),
   )
@@ -631,7 +626,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       },
       async execute(args, exec) {
         const owner = (exec as { agent?: unknown }).agent
-        return (await opRender(deps, args, exec.signal, emit, probeJobs(ctx), owner)) as never
+        return (await opRender(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
       },
     }),
   )

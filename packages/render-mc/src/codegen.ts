@@ -16,7 +16,7 @@
 import { extname } from 'node:path'
 
 import type { AnimationSpec, Asset, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
-import { sceneDurationMs, tweensOf } from '@dsh-anim/spec'
+import { safeName, sceneDurationMs, tweensOf } from '@dsh-anim/spec'
 
 export interface GeneratedFile {
   /** 相对项目 src 目录的路径。 */
@@ -41,8 +41,14 @@ const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
  */
 const LAYOUT_PROPS = ['x', 'y', 'scale', 'rotation', 'opacity', 'size', 'width', 'height'] as const
 
-/** 各图层类型可接受的静态属性（值 = MC 组件上的属性名）。 */
-const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
+/**
+ * 各图层类型可接受的静态属性（值 = MC 组件上的属性名）。
+ *
+ * 三张表（STATIC_PROPS / COMPONENT / ANIMATABLE_BY_TYPE）的键集合由
+ * `LayerType` 编译期钉死（Record<LayerType, …>），新增类型漏改会直接
+ * 类型报错；导出是给冒烟的「枚举一致性断言」用的（0.3.x 优化清单 O14）。
+ */
+export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight' },
   rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius' },
   // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
@@ -74,14 +80,15 @@ const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
  * 不能再用全局大集合——rect 有 fill、image 没有，全局集合会把「对 Img 补间
  * fill」这种运行时才会崩的代码放出去。按类型派生，不支持的动画目标走警告降级。
  */
-const ANIMATABLE_BY_TYPE: Record<LayerType, Set<string>> = Object.fromEntries(
+export const ANIMATABLE_BY_TYPE: Record<LayerType, Set<string>> = Object.fromEntries(
   (Object.keys(STATIC_PROPS) as LayerType[]).map(type => [
     type,
     new Set<string>([...LAYOUT_PROPS, ...Object.keys(STATIC_PROPS[type])]),
   ]),
 ) as Record<LayerType, Set<string>>
 
-const COMPONENT: Record<LayerType, string | null> = {
+/** 类型 → MC 组件名。Record<LayerType, …> 让「新增类型忘映射」编译期就炸。 */
+export const COMPONENT: Record<LayerType, string> = {
   text: 'Txt',
   rect: 'Rect',
   circle: 'Circle',
@@ -160,16 +167,11 @@ function litProp(value: JsonValue): string {
   return lit(value as KeyframeValue)
 }
 
-/** 资产 id 进 URL/文件名前净化：只留 [A-Za-z0-9._-]，防路径穿越。 */
-function sanitizeAssetId(id: string): string {
-  return id.replace(/[^A-Za-z0-9._-]/g, '_')
-}
-
 /**
  * 五角星（任意角数）的 SVG path 字符串，外接圆半径 = size/2，中心在原点。
  * MC 3.17 没有 Star 组件，用 Path 组件 + 生成 path 表达，模型不需要写 path。
  */
-export function starPath(size: number, sides: number): string {
+function starPath(size: number, sides: number): string {
   const n = Math.max(3, Math.round(sides))
   const R = size / 2
   const r = (R * Math.sin(Math.PI / (2 * n))) / Math.sin(Math.PI / n)
@@ -272,8 +274,8 @@ function normalizeLayerProps(
       out.src = asset.src // http URL 资产原样透传，浏览器直接加载
     } else {
       const ext = extname(asset.src)
-      out.src = `/assets/${sanitizeAssetId(assetId)}${ext}`
-      warnings.push(`image 图层引用资产 ${assetId}，已解析为 /assets/${sanitizeAssetId(assetId)}${ext}`)
+      out.src = `/assets/${safeName(assetId)}${ext}`
+      warnings.push(`image 图层引用资产 ${assetId}，已解析为 /assets/${safeName(assetId)}${ext}`)
     }
   }
   return out
@@ -428,11 +430,9 @@ function genSceneFile(
    * 返回该图层的变量名，轨道生成要用它。
    */
   const emitNode = (layer: Layer, parentExpr: string): string => {
+    // Record<LayerType, string> 让「新增类型忘映射」编译期就失败，
+    // 运行期不再需要「未实现」的防御分支
     const component = COMPONENT[layer.type]
-    if (component === null) {
-      warnings.push(`图层 ${layer.id}（${layer.name}）类型 ${layer.type} 暂未实现，已跳过`)
-      return ''
-    }
     components.add(component)
     const name = varName(layer)
 

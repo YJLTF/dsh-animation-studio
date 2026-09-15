@@ -57,13 +57,21 @@ export interface Track {
 
 /* ------------------------------------------------------------------ 图层 */
 
-export type LayerType =
-  | 'text' | 'rect' | 'circle' | 'ellipse' | 'image'
-  | 'line' | 'arrow'
-  | 'polygon' | 'star'
-  | 'svg'
-  | 'code' | 'math'
-  | 'group'
+/**
+ * 图层类型的唯一权威枚举：`LayerType` 联合从这里派生，validate 的放行集合、
+ * codegen 的映射表、工具描述都以它为基准对齐（新增类型只改这一处 +
+ * 各消费表，冒烟有枚举一致性断言盯着漂移）。
+ */
+export const LAYER_TYPES = [
+  'text', 'rect', 'circle', 'ellipse', 'image',
+  'line', 'arrow',
+  'polygon', 'star',
+  'svg',
+  'code', 'math',
+  'group',
+] as const
+
+export type LayerType = (typeof LAYER_TYPES)[number]
 
 /**
  * 图层静态属性。列出的是**已知**字段（有类型提示），

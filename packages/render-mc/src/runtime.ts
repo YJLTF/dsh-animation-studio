@@ -29,7 +29,11 @@ import type { RenderDiagnostics } from './contract.ts'
 const exec = promisify(execCallback)
 
 export interface DefaultRuntimeOptions {
-  /** vite dev server 端口。 */
+  /**
+   * vite dev server 端口。缺省 0 = 随机可用端口——渲染器已有串行闸，但固定
+   * 端口仍会被同机的其他进程占走，EADDRINUSE 的裸报错对模型不可读。
+   * 需要钉端口（如防火墙白名单）时显式传入。
+   */
   port?: number
   /** 输出目录，相对 workDir。 */
   outputDir?: string
@@ -222,7 +226,7 @@ async function execQuiet(cmd: string): Promise<string> {
 /* ------------------------------------------------------------- 默认运行时 */
 
 export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): MotionCanvasRuntime {
-  const port = options.port ?? 5179
+  const port = options.port ?? 0
   const display = options.display ?? ':99'
   const chromiumPath = findChromium(options.chromiumPath)
   const outputDir = options.outputDir ?? 'output'
@@ -288,6 +292,10 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       })
       await server.listen()
 
+      // port 0 = 由系统分派随机可用端口：编辑器页面要按实际端口访问
+      const address = server.httpServer?.address()
+      const listenPort = typeof address === 'object' && address !== null ? address.port : port
+
       let browser
       try {
         browser = await puppeteer.launch({
@@ -338,7 +346,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         }
 
         setTitle('动画渲染启动中：正在加载 Motion Canvas 编辑器…')
-        await page.goto(`http://localhost:${port}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
+        await page.goto(`http://localhost:${listenPort}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
         setTitle('编辑器加载中…')
         await page.waitForSelector('canvas', { timeout: 60_000 })
         await new Promise(r => setTimeout(r, 4000)) // 等编辑器完成场景加载

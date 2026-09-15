@@ -7,9 +7,10 @@
  */
 
 import type {
-  AnimationSpec, Asset, EaseSpec, JsonValue, Keyframe, Layer, LayerType,
+  AnimationSpec, Asset, EaseSpec, JsonValue, Keyframe, Layer,
   Scene, Track,
 } from './types.ts'
+import { LAYER_TYPES } from './types.ts'
 
 export interface SpecError {
   /** JSON Pointer 风格的路径，如 `/scenes/0/layers/2/tracks/1/keys/0/atMs`。 */
@@ -21,7 +22,8 @@ export type ValidateResult =
   | { ok: true; spec: AnimationSpec; warnings: string[] }
   | { ok: false; errors: SpecError[]; warnings: string[] }
 
-const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'ellipse', 'image', 'line', 'arrow', 'polygon', 'star', 'svg', 'code', 'math', 'group'])
+// 权威枚举在 types.ts（LAYER_TYPES 常量），这里只派生放行集合，不再手抄一份
+const LAYER_TYPE_SET: ReadonlySet<string> = new Set<string>(LAYER_TYPES)
 const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -137,8 +139,8 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
   }
   c.str(p, l, 'id')
   c.str(p, l, 'name')
-  if (typeof l.type !== 'string' || !LAYER_TYPES.has(l.type)) {
-    c.fail(`${p}/type`, `未知图层类型，可选：${[...LAYER_TYPES].join(' / ')}`)
+  if (typeof l.type !== 'string' || !LAYER_TYPE_SET.has(l.type)) {
+    c.fail(`${p}/type`, `未知图层类型，可选：${[...LAYER_TYPE_SET].join(' / ')}`)
   }
   if (!isRecord(l.props)) c.fail(`${p}/props`, 'props 应为对象')
   if (!Array.isArray(l.tracks)) c.fail(`${p}/tracks`, 'tracks 应为数组')
@@ -190,6 +192,13 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
       c.warn(`图层 ${String(l.id)}（math）未提供 LaTeX 公式（props.tex），渲染为空`)
     }
   }
+  // group 的 children 字段形态在这里查；引用关系（存在/不自引用/不嵌套/
+  // 不跨组争用）需要全幕图层 id，由 validateScene 统一查。
+  if (l.type === 'group' && props && props.children !== undefined) {
+    if (!Array.isArray(props.children) || !props.children.every(x => typeof x === 'string')) {
+      c.fail(`${p}/props/children`, 'group 的 children 应为图层 id 字符串数组，如 ["axis", "ball"]')
+    }
+  }
 }
 
 function validateAsset(c: Collector, path: string, a: unknown): void {
@@ -216,13 +225,41 @@ function validateScene(c: Collector, path: string, s: unknown, index: number): v
     c.fail(`${p}/layers`, 'layers 应为数组')
   } else {
     const ids = new Set<string>()
+    const groupIds = new Set<string>()
+    const groups: Array<{ index: number; id: string; children: string[] }> = []
     s.layers.forEach((l, i) => {
       validateLayer(c, `${p}/layers`, l, i)
-      if (isRecord(l) && typeof l.id === 'string') {
-        if (ids.has(l.id)) c.fail(`${p}/layers/${i}/id`, `场景内图层 id 重复：${l.id}`)
-        ids.add(l.id)
+      if (!isRecord(l) || typeof l.id !== 'string') return
+      if (ids.has(l.id)) c.fail(`${p}/layers/${i}/id`, `场景内图层 id 重复：${l.id}`)
+      ids.add(l.id)
+      if (l.type === 'group') {
+        groupIds.add(l.id)
+        const children = isRecord(l.props) ? l.props.children : undefined
+        // children 形态非法时 validateLayer 已报错，这里只收合法的引用清单
+        if (Array.isArray(children) && children.every(x => typeof x === 'string')) {
+          groups.push({ index: i, id: l.id, children: children as string[] })
+        }
       }
     })
+    // group 的 children 引用体检（0.3.x 优化清单 O15）：引用必须存在、不能
+    // 自引用、MVP 不嵌套 group、同一图层不被多个 group 争用。此前这些只有
+    // codegen 的生成期警告，错写 children 要到渲染时才发现。
+    const owners = new Map<string, string>()
+    for (const g of groups) {
+      for (const childId of g.children) {
+        if (childId === g.id) {
+          c.fail(`${p}/layers/${g.index}/props/children`, `group ${g.id} 不能引用自己`)
+        } else if (!ids.has(childId)) {
+          c.fail(`${p}/layers/${g.index}/props/children`, `group ${g.id} 引用了本幕不存在的图层 ${childId}（children 只能引用同一场景内的图层 id）`)
+        } else if (groupIds.has(childId)) {
+          c.fail(`${p}/layers/${g.index}/props/children`, `group ${g.id} 引用了另一个 group（${childId}），当前只支持单层分组`)
+        } else {
+          const owner = owners.get(childId)
+          if (owner === undefined) owners.set(childId, g.id)
+          else c.warn(`图层 ${childId} 被多个 group 引用（${owner}、${g.id}），渲染时只归入第一个`)
+        }
+      }
+    }
   }
   if (s.transition !== undefined) {
     const tr = s.transition

@@ -22,14 +22,14 @@ export interface Tween {
 }
 
 /** 轨道最后一个关键帧的时间。 */
-export function trackEndMs(track: Track): number {
+function trackEndMs(track: Track): number {
   let end = 0
   for (const k of track.keys) end = Math.max(end, k.atMs)
   return end
 }
 
 /** 场景内所有动画的自然结束时间（忽略声明时长）。 */
-export function sceneContentEndMs(scene: Scene): number {
+function sceneContentEndMs(scene: Scene): number {
   let end = 0
   for (const layer of scene.layers) {
     for (const track of layer.tracks) end = Math.max(end, trackEndMs(track))

@@ -1,7 +1,7 @@
 /**
  * dsh-animation-studio 的浏览器面（`exports['./client']` → `lib/client.js`）。
  *
- * 职责单一：把 9 个 anim_* 工具的会话卡片注册进 keyed 工具视图插槽
+ * 职责单一：把 10 个 anim_* 工具的会话卡片注册进 keyed 工具视图插槽
  * （`tool.call.toolview`，dsh-client-ui-tool 声明的开放 key 域——按线上工具名
  * 认领渲染权，自带工具一行不改）。注册方式与官方 read/search toolview 同构：
  *
