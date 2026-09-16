@@ -114,7 +114,11 @@ export class MotionCanvasRenderer implements AnimRenderer {
           height: Math.round(request.spec.meta.size.height * resolutionScale),
         }
       })
-    return { frames, renderer: this.name }
+    return {
+      frames,
+      renderer: this.name,
+      ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+    }
   }
 
   async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
@@ -138,6 +142,8 @@ export class MotionCanvasRenderer implements AnimRenderer {
       width: Math.round(request.spec.meta.size.width * resolutionScale),
       height: Math.round(request.spec.meta.size.height * resolutionScale),
       renderer: this.name,
+      expectedFrames: result.expected,
+      ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
     }
   }
 
@@ -148,13 +154,13 @@ export class MotionCanvasRenderer implements AnimRenderer {
     signal: AbortSignal,
     resolutionScale: number,
     onProgress?: (done: number, total: number) => void,
-  ): Promise<{ frameDir: string; frameCount: number; expected: number }> {
+  ): Promise<{ frameDir: string; frameCount: number; expected: number; warnings: string[] }> {
     return this.#serialized(async () => {
       if (signal.aborted) throw new Error('渲染已取消')
 
       const { files, warnings } = generateProject(spec, { resolutionScale })
       if (warnings.length > 0) {
-        // 生成期降级必须可见：静默丢属性比渲染失败更难查
+        // 宿主日志保留全量（排查用）；模型与面板看到的回执版本经去重合并
         for (const w of warnings) console.warn(`[render-mc] ${w}`)
       }
 
@@ -174,9 +180,24 @@ export class MotionCanvasRenderer implements AnimRenderer {
         signal,
         onProgress,
       })
-      return { ...result, expected }
+      return { ...result, expected, warnings: dedupeWarnings(warnings) }
     })
   }
+}
+
+/**
+ * 同类警告合并计数（0.4.0 规划 N4 / O21 观察项）。
+ *
+ * 同一错形（同图层同属性）在多幕重复出现时，codegen 会逐幕产出 identical
+ * 的警告串——真机一次 6 幕渲染刷出 100+ 行 strokeWidth 告警就是它。去重按
+ * 完整消息文本计数：相同文本只保留一条并附「×N」，不同图层/属性的消息
+ * 互不吞并。渲染回执与 finished 事件都吃这份合并结果（宿主 console 保留
+ * 全量，排查不受影响）。
+ */
+export function dedupeWarnings(warnings: string[]): string[] {
+  const counts = new Map<string, number>()
+  for (const w of warnings) counts.set(w, (counts.get(w) ?? 0) + 1)
+  return [...counts.entries()].map(([w, n]) => (n > 1 ? `${w}（同类警告 ×${n}，已合并）` : w))
 }
 
 /**

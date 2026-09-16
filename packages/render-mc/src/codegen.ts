@@ -16,7 +16,7 @@
 import { extname } from 'node:path'
 
 import type { AnimationSpec, Asset, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
-import { safeName, sceneDurationMs, tweensOf } from '@dsh-anim/spec'
+import { PROP_ALIASES, safeName, sceneDurationMs, tweensOf } from '@dsh-anim/spec'
 
 export interface GeneratedFile {
   /** 相对项目 src 目录的路径。 */
@@ -187,7 +187,11 @@ function starPath(size: number, sides: number): string {
 
 /**
  * 按类型把 props 归一化成最终要写进 JSX 的属性表，并产出警告。
- * 处理三类「模型常写错、静默画不出来」的形态：
+ * 处理四类「模型常写错、静默画不出来」的形态：
+ * - 属性别名（color→fill、strokeWidth→lineWidth，权威表 PROP_ALIASES）→
+ *   归一在最先：它必须发生在颜色/尺寸兜底判断之前，否则「无色兜底」会把
+ *   别名遮成主题色。规范名已给出时别名保留，留给下方白名单走「不支持」
+ *   告警（规范名优先）；本类型不支持规范名时同样保留原名，让告警说人话；
  * - circle 的 radius/r → size×2（MC Circle 没有 radius 信号）；
  * - circle 缺尺寸 → 默认 size=100（MC 默认 0×0 不可见）；
  * - 封闭形状（rect/circle/ellipse/polygon/star）既无 fill 也无 stroke → 主题文字色兜底；
@@ -206,6 +210,14 @@ function normalizeLayerProps(
   for (const [k, v] of Object.entries(props)) {
     if (v === undefined) continue
     out[k] = v as JsonValue
+  }
+  // 属性别名归一（表在 @dsh-anim/spec）：必须先于一切兜底判断
+  const staticAllowed = STATIC_PROPS[type]
+  for (const [alias, canonical] of Object.entries(PROP_ALIASES)) {
+    if (out[alias] !== undefined && out[canonical] === undefined && staticAllowed[canonical] !== undefined) {
+      out[canonical] = out[alias]
+      delete out[alias]
+    }
   }
   if (type === 'group') {
     // children 是组合引用，由 genSceneFile 消费，不是节点属性
@@ -442,18 +454,10 @@ function genSceneFile(
     for (const key of COMMON_PROPS) allowed[key] = key
     const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings, assets)
     for (const [rawProp, value] of Object.entries(normalized)) {
-      let prop = rawProp
-      // 模型几乎必然写过 color：语义就是填充色，按 fill 处理而不是丢弃
-      if (prop === 'color' && !allowed.color && allowed.fill) {
-        prop = 'fill'
-      }
-      // SVG 习惯名 strokeWidth 同义于 IR 的 lineWidth（真机批量踩过：所有线条
-      // 的描边宽度被静默丢弃）。lineWidth 已显式给出时不改写——规范名优先，
-      // 冗余的 strokeWidth 走下方「不支持」警告
-      if (prop === 'strokeWidth' && allowed.lineWidth && normalized.lineWidth === undefined) {
-        prop = 'lineWidth'
-      }
-      const mapped = allowed[prop]
+      // 别名归一已在 normalizeLayerProps 完成（先于兜底判断）；走到这里的
+      // 别名键都是「规范名已给出」或「本类型不支持规范名」的冗余形态，
+      // 白名单查不到自然落到下方「不支持」告警——规范名优先，不静默覆盖
+      const mapped = allowed[rawProp]
       if (!mapped) {
         warnings.push(`图层 ${layer.id} 的属性 ${rawProp} 不被 ${layer.type} 支持，已忽略`)
         continue
@@ -461,7 +465,8 @@ function genSceneFile(
       attrs.push(`${mapped}={${litProp(value)}}`)
     }
     // text/math 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
-    if ((layer.type === 'text' || layer.type === 'math') && normalized.fill === undefined && normalized.color === undefined) {
+    // （normalize 阶段 color 已归一为 fill 或被白名单拦下，这里只看 fill）
+    if ((layer.type === 'text' || layer.type === 'math') && normalized.fill === undefined) {
       attrs.push(`fill={${JSON.stringify(defaultTextFill)}}`)
     }
     // code 图层写了 language：挂上对应高亮器（带语言的 code 图层才触发 code-highlight 模块生成）
@@ -489,10 +494,11 @@ function genSceneFile(
     const animatable = ANIMATABLE_BY_TYPE[layer.type]
     for (const track of layer.tracks) {
       let prop = track.target.replace(/^props\./, '')
-      // 与静态属性侧同一约定：SVG 习惯名 strokeWidth 改写为 lineWidth 后再查
-      // 可动画集合，写 lineWidth 才能被 ANIMATABLE_BY_TYPE 放行
-      if (prop === 'strokeWidth' && !animatable.has('strokeWidth') && animatable.has('lineWidth')) {
-        prop = 'lineWidth'
+      // 轨道目标走同一张别名表（@dsh-anim/spec）：存量 spec 里已落库的
+      // props.strokeWidth 轨道由此一并复活（0.3.x O21 的延续，表驱动化）
+      const alias = PROP_ALIASES[prop]
+      if (alias !== undefined && !animatable.has(prop) && animatable.has(alias)) {
+        prop = alias
       }
       if (!animatable.has(prop)) {
         warnings.push(`图层 ${layer.id} 的轨道目标 ${track.target} 不可动画，已忽略`)

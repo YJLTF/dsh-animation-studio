@@ -550,7 +550,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       description:
         '登记一份素材（图片/svg/音频/字体）进 spec 的 assets，返回 assetId。'
         + '本地文件会被复制进插件资产目录，http URL 原样登记。之后在图层 props 里用 src="asset:<assetId>" 引用它'
-        + '（如 image 图层）。素材是共享资源：一次导入，多个图层可用。',
+        + '（如 image 图层）。素材是共享资源：一次导入，多个图层可用。'
+        + '注意：当前只有 image / svg 会被渲染消费；font / audio 仅登记暂不生效，先不要依赖它们出效果。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         assetId: { type: 'string', required: true, description: '资产标识（字母/数字/._-），如 gradient-icon' },
@@ -603,6 +604,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_render',
       description:
         '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景抽查。'
+        + '长片（≥1 分钟）渲染耗时以分钟计，回执的 expectedFrames 是目标帧数；微调后用 scenes 只渲部分场景抽查能省大量时间。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
         + '否则同步等待到出片为止。',
       parameters: {

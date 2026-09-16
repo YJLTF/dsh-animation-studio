@@ -18,6 +18,7 @@ import { isAbsolute, join } from 'node:path'
 import {
   ANIMATABLE_BY_TYPE,
   COMPONENT,
+  dedupeWarnings,
   generateProject,
   generateProjectMeta,
   MotionCanvasRenderer,
@@ -27,17 +28,18 @@ import {
 import {
   applyPatch,
   LAYER_TYPES,
+  PROP_ALIASES,
   sceneDurationMs,
   specDurationMs,
   truncateSpecAtMs,
   tweensOf,
   validateSpec,
 } from '../packages/spec/src/index.ts'
-import type { AnimationSpec, LayerType } from '../packages/spec/src/index.ts'
+import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index.ts'
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opRender, opAssetImport } from '../packages/tools/src/ops.ts'
+import { coerceScene, opDraftScene, opRender, opAssetImport, opPlan, reconcileOutline } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
@@ -1106,6 +1108,215 @@ await checkA('/dsh-anim 内核：渲染任务簿 + 状态 API + 媒体放行', a
   // 杂项：POST 405、未知路径 404
   assert.equal((await kernel({ method: 'POST', url: '/dsh-anim/api/state', headers: {} })).status, 405)
   assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/other', headers: {} })).status, 404)
+})
+
+/* ------------------------------------- 0.4.0 M0：别名收敛 / 大纲对账 / 警告与成本预期 */
+
+check('别名一致性: PROP_ALIASES 键值合法——值是已知规范名，键不同时是任何类型的规范名', () => {
+  const canonical = new Set<string>()
+  for (const table of Object.values(STATIC_PROPS)) {
+    for (const key of Object.keys(table)) canonical.add(key)
+  }
+  assert.ok(Object.keys(PROP_ALIASES).length > 0, '别名表不应为空（空表说明消费方接线断了也没人发现）')
+  for (const [alias, name] of Object.entries(PROP_ALIASES)) {
+    assert.ok(canonical.has(name), `别名 ${alias} 的规范名 ${name} 应存在于 STATIC_PROPS 各表中`)
+    assert.notEqual(alias, name, `别名 ${alias} 不应映射到自身`)
+    assert.equal(canonical.has(alias), false, `别名 ${alias} 不应同时是规范名（归一化会打架）`)
+  }
+})
+
+check('codegen: color 按 fill 别名生效；规范名 fill 已给出时 color 冗余走告警', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    { id: 'r1', name: 'R1', type: 'rect', props: { width: 100, height: 50, color: '#FF0000' }, tracks: [] },
+    { id: 'r2', name: 'R2', type: 'rect', props: { width: 100, height: 50, color: '#FF0000', fill: '#00FF00' }, tracks: [] },
+  ] as never
+  const r = generateProject(spec)
+  const s = r.files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // r1：唯一色值走别名，静默归一为 fill，不产生任何告警
+  assert.match(s, /fill=\{"#FF0000"\}/)
+  assert.doesNotMatch(s, /color=/)
+  assert.ok(!r.warnings.some(w => w.includes('#FF0000') || w.includes('r1')), JSON.stringify(r.warnings))
+  // r2：规范名优先，冗余 color 告警忽略（与 strokeWidth 同一语义，绝不静默覆盖）
+  assert.match(s, /fill=\{"#00FF00"\}/)
+  assert.ok(r.warnings.some(w => w.includes('color') && w.includes('r2')), JSON.stringify(r.warnings))
+})
+
+check('coerceScene: color→fill 与轨道目标 strokeWidth→lineWidth 表驱动归一；规范名已在则不动', () => {
+  const { scene, repairs } = coerceScene({
+    id: 'x',
+    name: 'x',
+    durationMs: 1000,
+    layers: [
+      { id: 'a', name: 'A', type: 'text', props: { text: 'hi', color: '#FFF' }, tracks: [] },
+      {
+        id: 'b', name: 'B', type: 'line', props: { points: [[0, 0], [1, 1]], stroke: '#fff' },
+        tracks: [{ id: 't', target: 'props.strokeWidth', keys: [{ atMs: 0, value: 2 }, { atMs: 400, value: 6 }] }],
+      },
+      { id: 'c', name: 'C', type: 'rect', props: { width: 10, height: 10, fill: '#123', color: '#456' }, tracks: [] },
+    ],
+  })
+  assert.equal(scene.layers[0].props.fill, '#FFF')
+  assert.equal(scene.layers[0].props.color, undefined)
+  assert.equal(scene.layers[1].tracks[0].target, 'props.lineWidth')
+  // 规范名已在：别名原样保留（不丢内容，渲染端会对它告警）
+  assert.equal(scene.layers[2].props.fill, '#123')
+  assert.equal(scene.layers[2].props.color, '#456')
+  assert.ok(repairs.some(r => r.includes('color→fill')), JSON.stringify(repairs))
+  assert.ok(repairs.some(r => r.includes('strokeWidth→lineWidth') && r.includes('轨道')), JSON.stringify(repairs))
+  // 归一后的图层过 codegen：a/b 的别名已落规范名零警告；c 的冗余 color 是
+  // 刻意保留的（规范名优先、不丢内容），codegen 对它告警正是预期行为
+  const spec = demoSpec()
+  spec.scenes = [structuredClone(spec.scenes[0])]
+  spec.scenes[0].layers = [scene.layers[0], scene.layers[1]]
+  const g = generateProject(spec)
+  assert.deepEqual(g.warnings, [], JSON.stringify(g.warnings))
+})
+
+check('store: outline 进状态——setOutline 写入、foldEvents 回放、adopt 随记录迁移（N3）', () => {
+  const outline = [{ id: 's1', name: '第一幕', intent: '引入', durationMs: 2000 }]
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  store.setOutline('gd', outline)
+  assert.deepEqual(store.record('gd').outline, outline)
+
+  const replay = foldEvents([
+    { type: 'anim/spec-created', data: { specId: 'gd', spec: demoSpec() } },
+    { type: 'anim/outline-updated', data: { specId: 'gd', outline } },
+  ])
+  assert.deepEqual(replay.record('gd').outline, outline)
+  // 乱序回放（outline 先于 spec-created）：跳过不崩
+  const early = foldEvents([{ type: 'anim/outline-updated', data: { specId: 'ghost', outline } }])
+  assert.equal(early.list().length, 0)
+
+  const target = new SpecStore()
+  target.adopt(store)
+  assert.deepEqual(target.record('gd').outline, outline, '会话恢复应连大纲一起迁移')
+})
+
+check('reconcileOutline: 超纲/离纲/单幕偏差/全片偏差/未写完五类提示；完全对得上则为零', () => {
+  const outline = [
+    { id: 'a', name: 'A', intent: 'x', durationMs: 2000 },
+    { id: 'b', name: 'B', intent: 'x', durationMs: 3000 },
+  ]
+  const scene = (id: string, durationMs: number): Scene => ({ id, name: id, durationMs, layers: [] })
+  // 完全一致（两幕都写、时长相同）→ 零提示
+  assert.deepEqual(reconcileOutline(outline, [scene('a', 2000), scene('b', 3000)]), [])
+  // 超纲 + 离纲
+  const over = reconcileOutline(outline, [scene('a', 2000), scene('b', 3000), scene('c', 1000)])
+  assert.ok(over.some(n => n.includes('超出大纲')), JSON.stringify(over))
+  assert.ok(over.some(n => n.includes('c 不在大纲中')), JSON.stringify(over))
+  // 未写完是提示不是错误
+  assert.ok(reconcileOutline(outline, [scene('a', 2000)]).some(n => n.includes('未写')), JSON.stringify(reconcileOutline(outline, [scene('a', 2000)])))
+  // 单幕时长偏差 >50%（4000 vs 2000 → 100%）
+  const deviated = reconcileOutline(outline, [scene('a', 4000), scene('b', 3000)])
+  assert.ok(deviated.some(n => n.includes('a') && n.includes('偏差 100%')), JSON.stringify(deviated))
+  // 全片偏差 >30%（8000 vs 5000 → 60%）
+  const total = reconcileOutline(outline, [scene('a', 2000), scene('b', 6000)])
+  assert.ok(total.some(n => n.includes('全片实际')), JSON.stringify(total))
+})
+
+await checkA('opDraftScene: 大纲在 store 时回执带 outlineNotes 对账', async () => {
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  // 大纲覆盖 demoSpec 自带的 intro 幕 + 即将写入的 s1：写完 s1 恰好对齐
+  store.setOutline('gd', [
+    { id: 'intro', name: '引入', intent: 'x', durationMs: 2000 },
+    { id: 's1', name: 'S1', intent: '引入', durationMs: 2000 },
+  ])
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: '.tmp' }
+  // 按大纲写：对账干净，字段缺省
+  const ok = opDraftScene(deps, {
+    specId: 'gd',
+    scene: { id: 's1', name: 'S1', durationMs: 2000, layers: [{ id: 't', name: 'T', type: 'text', props: { text: 'x' }, tracks: [] }] },
+  }, () => {})
+  assert.equal(ok.outlineNotes, undefined, JSON.stringify(ok.outlineNotes))
+  // 写离纲场景：超纲 + 点名提示
+  const stray = opDraftScene(deps, {
+    specId: 'gd',
+    scene: { id: 'stray', name: '离纲', durationMs: 1000, layers: [{ id: 't2', name: 'T2', type: 'text', props: { text: 'x' }, tracks: [] }] },
+  }, () => {})
+  assert.ok(stray.outlineNotes?.some(n => n.includes('超出大纲')), JSON.stringify(stray.outlineNotes))
+  assert.ok(stray.outlineNotes?.some(n => n.includes('stray 不在大纲中')), JSON.stringify(stray.outlineNotes))
+})
+
+check('dedupeWarnings: 同类警告合并计数（O21 真机百行刷屏的收敛），不同消息互不吞并', () => {
+  const merged = dedupeWarnings([
+    '图层 b 的属性 strokeWidth 不被 line 支持，已忽略',
+    '图层 b 的属性 strokeWidth 不被 line 支持，已忽略',
+    '另一条警告',
+  ])
+  assert.equal(merged.length, 2)
+  assert.match(merged[0]!, /×2/)
+  assert.doesNotMatch(merged[1]!, /×/)
+})
+
+await checkA('MotionCanvasRenderer.preview: 生成期警告随回执返回（此前只进宿主日志，模型看不见）', async () => {
+  const runtime = {
+    async materialize(): Promise<void> {},
+    async renderProject(options: { expectedFrames: number }) {
+      return { frameDir: join(tmpdir(), `anim-warn-frames-${Date.now()}`), frameCount: options.expectedFrames }
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const renderer = new MotionCanvasRenderer({ runtime: runtime as never, workDir: mkdtempSync(join(tmpdir(), 'anim-warn-')) })
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    { id: 'x', name: 'X', type: 'rect', props: { width: 10, height: 10, fill: '#fff', ghostProp: 1 }, tracks: [] },
+  ] as never
+  const r = await renderer.preview({ spec, atMs: [100], scale: 4 }, new AbortController().signal)
+  assert.ok(r.warnings?.some(w => w.includes('ghostProp')), JSON.stringify(r.warnings))
+})
+
+await checkA('opRender: 同步回执与完成事件携带 warnings / expectedFrames（N4/N5）', async () => {
+  const { deps, emitted, emit } = renderFixture(async () => ({
+    ...RENDER_RESULT,
+    expectedFrames: 60,
+    warnings: ['图层 x 的属性 foo 不被 rect 支持，已忽略'],
+  }))
+  const result = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)
+  assert.equal(result.kind, 'sync')
+  assert.equal((result as { expectedFrames?: number }).expectedFrames, 60)
+  assert.deepEqual((result as { warnings?: string[] }).warnings, ['图层 x 的属性 foo 不被 rect 支持，已忽略'])
+  const finished = emitted.find(e => e.type === 'anim/render-finished')!
+  assert.deepEqual((finished.data as { warnings?: string[] }).warnings, ['图层 x 的属性 foo 不被 rect 支持，已忽略'])
+})
+
+await checkA('opRender: 大纲与场景偏差时票据带 outlineNotes——渲染前说比渲完说便宜', async () => {
+  const { deps, emitted, emit } = renderFixture(async () => RENDER_RESULT)
+  // demoSpec 的 intro 实际 2000ms，大纲写 9000ms → 单幕偏差 78% + 全片偏差 78%
+  deps.store.setOutline('gd', [{ id: 'intro', name: '引入', intent: 'x', durationMs: 9000 }])
+  const jobs: AnimJobsService = {
+    start(spec) {
+      spec.run()
+      return 'anim-render-11'
+    },
+  }
+  const ticket = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit, jobs, {})
+  assert.equal(ticket.kind, 'background')
+  assert.ok(
+    (ticket as { outlineNotes?: string[] }).outlineNotes?.some(n => n.includes('偏差')),
+    JSON.stringify((ticket as { outlineNotes?: string[] }).outlineNotes),
+  )
+})
+
+await checkA('opPlan: 全片时长档位提示（N5）+ 大纲落 store（N3 的状态侧）', async () => {
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: '.tmp' }
+  const item = (id: string, durationMs: number) => ({ id, name: id, intent: 'x', durationMs })
+  // >60s：分钟级提示；>180s：超时预算 + scenes 抽查建议
+  const long = opPlan(deps, { specId: 'gd', outline: [item('a', 70_000)] }, () => {})
+  assert.ok(long.pacing.some(p => p.includes('分钟计')), JSON.stringify(long.pacing))
+  const huge = opPlan(deps, { specId: 'gd', outline: [item('a', 200_000)] }, () => {})
+  assert.ok(huge.pacing.some(p => p.includes('scenes 抽查')), JSON.stringify(huge.pacing))
+  // 常规时长不追加全片档位
+  const fine = opPlan(deps, { specId: 'gd', outline: [item('a', 8000)] }, () => {})
+  assert.ok(!fine.pacing.some(p => p.includes('全片')), JSON.stringify(fine.pacing))
+  // 大纲进状态：后续 draft/render 对账的数据源
+  assert.deepEqual(store.record('gd').outline?.map(o => o.id), ['a'])
 })
 
 console.log(`\n冒烟通过：${passed} 项`)

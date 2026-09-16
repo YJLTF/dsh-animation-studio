@@ -13,7 +13,8 @@ import { copyFileSync, mkdirSync, statSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 
 import type { AnimationSpec, JsonValue, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
-import { LAYER_TYPES, readAt, safeName, specDurationMs, validateSpec } from '@dsh-anim/spec'
+import { LAYER_TYPES, PROP_ALIASES, readAt, safeName, sceneDurationMs, specDurationMs, validateSpec } from '@dsh-anim/spec'
+import type { OutlineItem } from '@dsh-anim/store'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
@@ -145,7 +146,16 @@ export function opPlan(deps: AnimDeps, args: PlanArgs, emit: Emit): PlanResult {
   const totalMs = args.outline.reduce((s, x) => s + x.durationMs, 0)
   // 「全片 Xs 共 N 幕」这类中性信息不再混进 pacing：totalMs/sceneCount 已在
   // 回执与面板摘要里，混在一起会稀释真警告的视觉权重（优化清单 O18）
+  // 全片时长档位（0.4.0 规划 N5）：单幕体检管不住「幕幕合格加起来渲不动」
+  if (totalMs > 180_000) {
+    pacing.push(`全片 ${Math.round(totalMs / 1000)}s：默认渲染超时 30 分钟，这个体量渲染前先用 anim_render 的 scenes 抽查，并认真考虑压缩节奏或拆片`)
+  } else if (totalMs > 60_000) {
+    pacing.push(`全片 ${Math.round(totalMs / 1000)}s：长片渲染耗时以分钟计，确认这个体量是有意为之`)
+  }
 
+  // 大纲进状态（0.4.0 规划 N3）：后续 draft/render 才能对「大纲 ↔ 实际场景」
+  // 做对账；事件照发，回放由 foldEvents 消费同一条事件恢复出同一份大纲
+  deps.store.setOutline(args.specId, args.outline)
   emit({ type: 'anim/outline-updated', data: { specId: args.specId, outline: args.outline } })
   return { specId: args.specId, sceneCount: args.outline.length, totalMs, pacing }
 }
@@ -231,6 +241,11 @@ export type DraftSceneResult = {
   repairs: string[]
   /** 校验软警告（时长超声明、疑似左上角坐标系等）。模型必须读到并自行处理。 */
   warnings: string[]
+  /**
+   * 「大纲 ↔ 实际场景」对账提示（中性信息，非告警）：超出/偏离大纲的形态
+   * 需要模型看一眼自行判断是新想法还是笔误。大纲不存在时缺省。
+   */
+  outlineNotes?: string[]
 }
 
 /* ----------------------------------------------------- 草稿边界自动纠错 */
@@ -251,7 +266,9 @@ const LAYER_TYPE_SET: ReadonlySet<string> = new Set(LAYER_TYPES)
  * 2. 图层 `type` 大小写写飘（"Text"/"Circle"）→ 按不区分大小写匹配 LAYER_TYPES 纠正；
  * 3. 漏纯展示字段 `name`（图层/场景）→ 用 id 补上；漏 `tracks`（静态图层本就合法）
  *    → 补空数组；
- * 4. `props.strokeWidth`（SVG 习惯名）→ 改写为规范名 `props.lineWidth`。
+ * 4. 属性别名归一为规范名（权威表 `PROP_ALIASES`，0.4.0 N2 收敛）：props 键与
+ *    轨道目标两侧都改写——`strokeWidth → lineWidth`、`color → fill`。规范名
+ *    已显式给出时别名不动（规范名优先，不丢内容）。
  *
  * 只修「无歧义、不丢内容」的错；拿不准的一律不动，留给 validateSpec 报错
  * （文案自带可执行指引）。输入先深拷贝，绝不改调用方的参数对象。
@@ -281,7 +298,7 @@ export function coerceScene(input: unknown): CoercedScene {
   const typeFixed: string[] = []
   const nameFilled: string[] = []
   const tracksFilled: string[] = []
-  const widthRenamed: string[] = []
+  const aliasesFixed: string[] = []
   if (Array.isArray(scene.layers)) {
     for (const l of scene.layers) {
       if (l === null || typeof l !== 'object' || Array.isArray(l)) continue
@@ -302,21 +319,34 @@ export function coerceScene(input: unknown): CoercedScene {
         layer.tracks = []
         tracksFilled.push(label)
       }
-      // SVG 习惯名 strokeWidth 归一化为 IR 的 lineWidth（只缺一个时才改写；
-      // 两者都在则不动——规范名优先，渲染端会对冗余的 strokeWidth 告警）
+      // 属性别名归一（表驱动，含 color→fill / strokeWidth→lineWidth 等）：
+      // 规范名写库时就落对，anim_get 读到的就是规范形态
       const lp = layer.props
       if (lp !== null && typeof lp === 'object' && !Array.isArray(lp)) {
         const p = lp as Record<string, unknown>
-        if (p.strokeWidth !== undefined && p.lineWidth === undefined) {
-          p.lineWidth = p.strokeWidth
-          delete p.strokeWidth
-          widthRenamed.push(label)
+        for (const [alias, canonical] of Object.entries(PROP_ALIASES)) {
+          if (p[alias] !== undefined && p[canonical] === undefined) {
+            p[canonical] = p[alias]
+            delete p[alias]
+            aliasesFixed.push(`${label}: ${alias}→${canonical}`)
+          }
         }
       }
       if (Array.isArray(layer.tracks)) {
         for (const t of layer.tracks) {
           if (t === null || typeof t !== 'object' || !Array.isArray((t as Record<string, unknown>).keys)) continue
-          for (const k of (t as Record<string, unknown>).keys as unknown[]) {
+          const tr = t as Record<string, unknown>
+          // 轨道目标别名归一：props.strokeWidth → props.lineWidth（轨道目标
+          // 永远不会被支持为别名形态，无歧义改写）
+          if (typeof tr.target === 'string') {
+            const m = /^props\.([^.]+)$/.exec(tr.target)
+            const canonical = m ? PROP_ALIASES[m[1]!] : undefined
+            if (m && canonical !== undefined) {
+              tr.target = `props.${canonical}`
+              aliasesFixed.push(`${label}: 轨道目标 ${m[1]}→${canonical}`)
+            }
+          }
+          for (const k of tr.keys as unknown[]) {
             if (k !== null && typeof k === 'object' && !Array.isArray(k)) wrapEase(k as Record<string, unknown>, 'ease')
           }
         }
@@ -331,8 +361,53 @@ export function coerceScene(input: unknown): CoercedScene {
   if (typeFixed.length > 0) repairs.push(`图层 type 大小写已纠正：${typeFixed.join('、')}（类型名全小写）`)
   if (nameFilled.length > 0) repairs.push(`图层缺 name，已用各自 id 补上：${nameFilled.join('、')}`)
   if (tracksFilled.length > 0) repairs.push(`图层缺 tracks，已按静态图层补空数组：${tracksFilled.join('、')}`)
-  if (widthRenamed.length > 0) repairs.push(`描边宽度 strokeWidth 已改写为 lineWidth：${widthRenamed.join('、')}（IR 的描边宽度叫 lineWidth）`)
+  if (aliasesFixed.length > 0) repairs.push(`属性别名已归一化为规范名：${aliasesFixed.join('、')}（下次直接写规范名）`)
   return { scene: scene as unknown as Scene, repairs }
+}
+
+/* ----------------------------------------------------------- 大纲对账 */
+
+/**
+ * 「大纲 ↔ 实际场景」对账（0.4.0 规划 N3）。
+ *
+ * 返回**中性提示**而不是 warnings：大纲与场景本就不要求逐字对应，这些形态
+ * 需要模型看一眼自行判断是新想法（更新大纲）还是笔误（核对场景 id）。
+ * `anim_draft_scene`（写幕时）与 `anim_render`（渲染前）都吃这份提示——
+ * 渲染前的偏差意味着「整片重渲也得不到想要的片子」，此时说比渲完说便宜。
+ */
+export function reconcileOutline(outline: readonly OutlineItem[], scenes: readonly Scene[]): string[] {
+  const notes: string[] = []
+  if (outline.length === 0) return notes
+  const outlineIds = new Set(outline.map(o => o.id))
+  if (scenes.length > outline.length) {
+    notes.push(`已写入 ${scenes.length} 幕，超出大纲的 ${outline.length} 幕——多出的幕是新想法（用 anim_plan 更新大纲）还是误写（核对场景）？`)
+  }
+  const stray = scenes.filter(s => !outlineIds.has(s.id)).map(s => s.id)
+  if (stray.length > 0) {
+    notes.push(`场景 ${stray.join('、')} 不在大纲中（大纲：${outline.map(o => o.id).join('、')}）`)
+  }
+  for (const s of scenes) {
+    const suggested = outline.find(o => o.id === s.id)?.durationMs
+    if (typeof suggested === 'number' && suggested > 0) {
+      const dev = Math.abs(sceneDurationMs(s) - suggested) / suggested
+      if (dev > 0.5) {
+        notes.push(`场景「${s.id}」实际时长 ${sceneDurationMs(s)}ms，大纲建议 ${suggested}ms（偏差 ${Math.round(dev * 100)}%）`)
+      }
+    }
+  }
+  const actualMs = specDurationMs(scenes)
+  const outlineMs = outline.reduce((sum, o) => sum + (typeof o.durationMs === 'number' && o.durationMs > 0 ? o.durationMs : 0), 0)
+  if (outlineMs > 0 && actualMs > 0) {
+    const dev = Math.abs(actualMs - outlineMs) / outlineMs
+    if (dev > 0.3) {
+      notes.push(`全片实际 ${actualMs}ms，大纲合计 ${outlineMs}ms（偏差 ${Math.round(dev * 100)}%）——先对齐再渲染，避免整片重渲`)
+    }
+  }
+  if (scenes.length > 0) {
+    const missing = outline.filter(o => !scenes.some(s => s.id === o.id)).map(o => o.id)
+    if (missing.length > 0) notes.push(`大纲还有 ${missing.length} 幕未写：${missing.join('、')}`)
+  }
+  return notes
 }
 
 export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): DraftSceneResult {
@@ -363,6 +438,9 @@ export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): 
     type: 'anim/spec-patched',
     data: { specId: args.specId, ops, inverse, note: `写入场景「${scene.name}」`, durationMs },
   })
+  // 大纲存在才对账：大纲是模型的计划，写幕时偏差最便宜的时刻就在此刻
+  const outline = deps.store.record(args.specId).outline
+  const outlineNotes = outline !== undefined && outline.length > 0 ? reconcileOutline(outline, spec.scenes) : []
   return {
     specId: args.specId,
     sceneId: scene.id,
@@ -372,6 +450,7 @@ export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): 
     inverse,
     repairs,
     warnings: checked.warnings,
+    ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
   }
 }
 
@@ -381,7 +460,7 @@ export async function opPreview(
   deps: AnimDeps,
   args: { specId: string; atMs?: number[]; scale?: number; renderer?: string },
   signal: AbortSignal,
-): Promise<{ specId: string; renderer: string; frames: Array<{ atMs: number; path: string }> }> {
+): Promise<{ specId: string; renderer: string; frames: Array<{ atMs: number; path: string }>; warnings?: string[] }> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
   const result = await renderer.preview({ spec, atMs: args.atMs, scale: args.scale ?? 2 }, signal)
@@ -389,6 +468,7 @@ export async function opPreview(
     specId: args.specId,
     renderer: result.renderer,
     frames: result.frames.map(f => ({ atMs: f.atMs, path: f.path })),
+    ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
   }
 }
 
@@ -432,6 +512,12 @@ export interface RenderResultView {
   width: number
   height: number
   renderer: string
+  /** 本片目标帧数（fps × 时长），成本预期管理（0.4.0 规划 N5）。 */
+  expectedFrames?: number
+  /** 生成期降级警告（同类已合并），模型需要逐条判断是否要改 spec（N4）。 */
+  warnings?: string[]
+  /** 大纲对账提示（中性信息），大纲不存在或完全对得上时缺省（N3）。 */
+  outlineNotes?: string[]
 }
 
 /** 后台模式下工具的即时回执：真正的渲染结果经 job_output / 完成通知到达。 */
@@ -441,6 +527,8 @@ export interface RenderBackgroundTicket {
   specId: string
   outputPath: string
   next: string
+  /** 渲染启动前的对账提示：此刻说比渲完说便宜。 */
+  outlineNotes?: string[]
 }
 
 /** 进度事件按 5% 一档节流：事件直接落会话日志，每帧一发等于往回放流里灌水。 */
@@ -531,29 +619,32 @@ export async function opRender(
   // 找不到文件，全盘搜索无果后只能重渲一遍。
   const outputPath = resolve(args.outputPath ?? `${deps.outputDir}/${args.specId}.mp4`)
   if (signal.aborted) throw new AnimOpError('渲染已取消')
+  // 渲染前对账（0.4.0 规划 N3）：大纲与实际场景对不上时，此刻说比渲完说便宜
+  const outline = deps.store.record(args.specId).outline
+  const outlineNotes = outline !== undefined && outline.length > 0 ? reconcileOutline(outline, spec.scenes) : []
 
   if (jobs) {
     // 先带 owner（结果可归属、job_output/job_kill 的访问控制按 owner 走）；
     // owner 没有附加 job controller 时退到无主任务；再不行退同步渲染。
     for (const ownerCandidate of [owner, undefined]) {
       try {
-        return await startBackgroundRender(args, { spec, renderer, outputPath }, emit, jobs, ownerCandidate)
+        return await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes }, emit, jobs, ownerCandidate)
       } catch {
         /* 发布失败，尝试下一档 */
       }
     }
   }
-  return await renderSync(args, { spec, renderer, outputPath }, signal, emit)
+  return await renderSync(args, { spec, renderer, outputPath, outlineNotes }, signal, emit)
 }
 
 async function startBackgroundRender(
   args: RenderArgs,
-  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string },
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[] },
   emit: Emit,
   jobs: AnimJobsService,
   owner: unknown,
 ): Promise<RenderBackgroundTicket> {
-  const { spec, renderer, outputPath } = resolved
+  const { spec, renderer, outputPath, outlineNotes } = resolved
   const specId = args.specId
   const controller = new AbortController()
   const jobIdBox: { value: string | null } = { value: null }
@@ -582,6 +673,7 @@ async function startBackgroundRender(
               durationMs: result.durationMs,
               width: result.width,
               height: result.height,
+              ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
             },
           }))
           return { status: 'completed' as const, output: result }
@@ -622,16 +714,17 @@ async function startBackgroundRender(
     specId,
     outputPath,
     next: '渲染已在后台进行。用 job_output 收集进度与结果；需要终止时用 job_kill。',
+    ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
   }
 }
 
 async function renderSync(
   args: RenderArgs,
-  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string },
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[] },
   signal: AbortSignal,
   emit: Emit,
 ): Promise<RenderResultView> {
-  const { spec, renderer, outputPath } = resolved
+  const { spec, renderer, outputPath, outlineNotes } = resolved
   const specId = args.specId
   const jobIdBox: { value: string | null } = { value: 'sync' }
   const gate = createRenderEventGate(emit, jobIdBox)
@@ -652,9 +745,14 @@ async function renderSync(
         durationMs: result.durationMs,
         width: result.width,
         height: result.height,
+        ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
       },
     })
-    return { ...result, kind: 'sync' as const }
+    return {
+      ...result,
+      kind: 'sync' as const,
+      ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     emit({

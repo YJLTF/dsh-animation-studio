@@ -131,6 +131,8 @@ export interface RenderStatus {
   durationMs?: number
   width?: number
   height?: number
+  /** 生成期降级警告（同类已合并），完成卡片由此展示（0.4.0 N4）。 */
+  warnings?: string[]
 }
 
 /** 从工作台状态 API 里找一条渲染任务；路由不可达返回 null。 */

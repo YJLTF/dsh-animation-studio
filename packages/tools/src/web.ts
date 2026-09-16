@@ -51,6 +51,8 @@ export interface RenderStatusView {
   width?: number
   height?: number
   error?: string
+  /** 生成期降级警告（同类已合并），后台渲染的完成卡片由此展示（0.4.0 N4）。 */
+  warnings?: string[]
 }
 
 /**
@@ -95,6 +97,7 @@ export class RenderTracker {
       if (d.width !== undefined) job.width = d.width
       if (d.height !== undefined) job.height = d.height
       if (d.error !== undefined) job.error = d.error
+      if (d.warnings !== undefined) job.warnings = d.warnings
     }
   }
 

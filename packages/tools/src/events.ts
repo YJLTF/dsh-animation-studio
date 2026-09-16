@@ -80,6 +80,11 @@ export interface AnimRenderFinishedData {
   status?: 'killed' | 'failed'
   /** status 为 failed 时的人类可读原因。 */
   error?: string
+  /**
+   * 生成期降级警告（同类已合并计数，0.4.0 规划 N4）。此前这类警告只进宿主
+   * 日志、模型与面板都看不见；与回执同源，后台渲染的完成通知也带得上。
+   */
+  warnings?: string[]
 }
 
 /** 事件名 → 载荷。新增事件时同步更新 `plugins.d.ts` 里对 `SessionEventMap` 的合并声明。 */

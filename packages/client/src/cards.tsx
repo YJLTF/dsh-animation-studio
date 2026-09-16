@@ -154,14 +154,45 @@ function Warnings(props: { items: string[] }): ReactNode {
   return <div style={warnBox}>{props.items.map((item, i) => <div key={i}>{item}</div>)}</div>
 }
 
-/** 工具边界自动纠正清单：中性色——是「已替你修好」的信息，不是警告。 */
-function Repairs(props: { items: string[] }): ReactNode {
+/** 中性信息块：自动纠正 / 大纲对账 / 已自动处理的降级——是信息，不是告警。 */
+function Notes(props: { title: string; items: string[] }): ReactNode {
   if (props.items.length === 0) return null
   return (
     <div style={muted}>
-      <div>已自动纠正：</div>
+      <div>{props.title}</div>
       {props.items.map((item, i) => <div key={i}>{item}</div>)}
     </div>
+  )
+}
+
+/** 工具边界自动纠正清单：中性色——是「已替你修好」的信息，不是警告。 */
+function Repairs(props: { items: string[] }): ReactNode {
+  return <Notes title="已自动纠正：" items={props.items} />
+}
+
+/**
+ * 渲染期降级警告的两类拆分（0.4.0 N4）：「已忽略/不可动画/未登记」意味着
+ * 模型的意图没有进成片，保留黄色权重；「兜底/换算/解析」类是工具已代劳的
+ * 信息，降为中性，别稀释真告警的视觉分量。按消息关键词分类是刻意取舍——
+ * 结构化警告类别值得等 M1 动 codegen 时再做。
+ */
+function splitRenderWarnings(items: string[]): { attention: string[]; handled: string[] } {
+  const attention: string[] = []
+  const handled: string[] = []
+  for (const item of items) {
+    ;(/已忽略|不可动画|未登记|越界/.test(item) ? attention : handled).push(item)
+  }
+  return { attention, handled }
+}
+
+/** 渲染/预览回执的 warnings 区块：两类拆分后各归各位。 */
+function RenderWarnings(props: { items: string[] }): ReactNode {
+  const { attention, handled } = splitRenderWarnings(props.items)
+  return (
+    <>
+      <Notes title="已自动处理：" items={handled} />
+      <Warnings items={attention} />
+    </>
   )
 }
 
@@ -230,6 +261,7 @@ export function SceneCard(props: ToolViewProps): ReactNode {
         <span style={muted}>{formatMs(num(receipt, 'durationMs'))}</span>
       </div>
       <Repairs items={strings(receipt, 'repairs')} />
+      <Notes title="大纲对账：" items={strings(receipt, 'outlineNotes')} />
       <Warnings items={strings(receipt, 'warnings')} />
     </Card>
   )
@@ -382,6 +414,7 @@ export function PreviewCard(props: ToolViewProps): ReactNode {
           )
         })}
       </div>
+      <RenderWarnings items={strings(receipt, 'warnings')} />
     </Card>
   )
 }
@@ -477,6 +510,7 @@ function BackgroundTicket(props: { receipt: Receipt; openFile?: ToolViewProps['o
     return (
       <Card title={`渲染完成${specId ? `：${specId}` : ''}`}>
         <VideoPanel path={status.outputPath || outputPath} meta={status as unknown as Receipt} openFile={props.openFile} />
+        <RenderWarnings items={strings(status as unknown as Receipt, 'warnings')} />
       </Card>
     )
   }
@@ -535,6 +569,8 @@ export function RenderCard(props: ToolViewProps): ReactNode {
   return (
     <Card title={`渲染完成${str(receipt, 'specId') ? `：${str(receipt, 'specId')}` : ''}`}>
       <VideoPanel path={path} meta={receipt} openFile={props.openFile} />
+      <Notes title="大纲对账：" items={strings(receipt, 'outlineNotes')} />
+      <RenderWarnings items={strings(receipt, 'warnings')} />
     </Card>
   )
 }

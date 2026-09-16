@@ -33,6 +33,11 @@ export interface PreviewRequest {
 export interface PreviewResult {
   frames: PreviewFrame[]
   renderer: string
+  /**
+   * 生成期降级警告（同类已合并计数）。此前只进宿主日志、模型看不见——
+   * 「渲染不报错、看片才发现」的产出偏差由此堵住（0.4.0 规划 N4）。
+   */
+  warnings?: string[]
 }
 
 export interface RenderRequest {
@@ -50,6 +55,10 @@ export interface RenderResult {
   width: number
   height: number
   renderer: string
+  /** 本片目标帧数（fps × 时长），与进度事件的 total 同口径——成本预期管理。 */
+  expectedFrames?: number
+  /** 生成期降级警告（同类已合并计数），语义同 PreviewResult.warnings。 */
+  warnings?: string[]
 }
 
 export interface AnimRenderer {

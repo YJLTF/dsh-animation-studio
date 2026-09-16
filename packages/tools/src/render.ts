@@ -39,6 +39,12 @@ export interface PreviewResult {
   frames: PreviewFrame[]
   /** 实际使用的后端名，回执里带上是排查利器。 */
   renderer: string
+  /**
+   * 生成期降级警告（同类已合并计数）。此前只进宿主日志、模型看不见——
+   * 与 render-mc 侧 contract.ts 的 PreviewResult 成对改（结构对齐是两包
+   * 的显式契约）。
+   */
+  warnings?: string[]
 }
 
 export interface RenderRequest {
@@ -57,6 +63,10 @@ export interface RenderResult {
   width: number
   height: number
   renderer: string
+  /** 本片目标帧数（fps × 时长），与进度事件的 total 同口径。 */
+  expectedFrames?: number
+  /** 生成期降级警告（同类已合并计数），语义同 PreviewResult.warnings。 */
+  warnings?: string[]
 }
 
 export interface AnimRenderer {
