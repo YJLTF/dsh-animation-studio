@@ -7,9 +7,10 @@
  */
 
 import type {
-  AnimationSpec, Asset, EaseSpec, JsonValue, Keyframe, Layer, LayerType,
+  AnimationSpec, Asset, EaseSpec, JsonValue, Keyframe, Layer,
   Scene, Track,
 } from './types.ts'
+import { LAYER_TYPES } from './types.ts'
 
 export interface SpecError {
   /** JSON Pointer 风格的路径，如 `/scenes/0/layers/2/tracks/1/keys/0/atMs`。 */
@@ -21,7 +22,8 @@ export type ValidateResult =
   | { ok: true; spec: AnimationSpec; warnings: string[] }
   | { ok: false; errors: SpecError[]; warnings: string[] }
 
-const LAYER_TYPES: ReadonlySet<string> = new Set<LayerType>(['text', 'rect', 'circle', 'image', 'group'])
+// 权威枚举在 types.ts（LAYER_TYPES 常量），这里只派生放行集合，不再手抄一份
+const LAYER_TYPE_SET: ReadonlySet<string> = new Set<string>(LAYER_TYPES)
 const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -51,7 +53,8 @@ class Collector {
   str(path: string, obj: Record<string, unknown>, key: string): void {
     const v = obj[key]
     if (v === undefined || v === null) {
-      this.fail(`${path}/${key}`, '缺少必填字段')
+      // 报错带字段名：路径里有，但模型扫读报错时靠字段名定位更快
+      this.fail(`${path}/${key}`, `缺少必填字段「${key}」`)
       return
     }
     if (typeof v !== 'string') this.fail(`${path}/${key}`, `应为字符串，实际为 ${typeof v}`)
@@ -61,7 +64,7 @@ class Collector {
   num(path: string, obj: Record<string, unknown>, key: string, opts: { min?: number } = {}): void {
     const v = obj[key]
     if (v === undefined || v === null) {
-      this.fail(`${path}/${key}`, '缺少必填字段')
+      this.fail(`${path}/${key}`, `缺少必填字段「${key}」`)
       return
     }
     if (!isFiniteNumber(v)) {
@@ -77,7 +80,10 @@ class Collector {
 function validateEase(c: Collector, path: string, ease: unknown): void {
   if (ease === undefined) return
   if (!isRecord(ease) || typeof ease.kind !== 'string') {
-    c.fail(path, 'ease 应为 { kind: ... } 对象')
+    // 真机高频错形：直接写 ease: "easeOut" 字符串。报错给出正确形态的示例，
+    // 模型照抄即可修复，不用再猜「{ kind: ... }」里省略号是什么
+    const got = JSON.stringify(ease) ?? '非对象'
+    c.fail(path, `ease 应为 { kind: "..." } 对象（如 {"kind":"easeInOut"}），收到 ${got}${typeof ease === 'string' ? '，不能直接写字符串' : ''}`)
     return
   }
   if (!EASE_KINDS.has(ease.kind)) {
@@ -99,7 +105,7 @@ function validateKeyframe(c: Collector, path: string, k: unknown, index: number)
     return
   }
   c.num(p, k, 'atMs', { min: 0 })
-  if (!('value' in k)) c.fail(`${p}/value`, '缺少必填字段')
+  if (!('value' in k)) c.fail(`${p}/value`, `缺少必填字段「value」（该时刻的目标值）`)
   else if (!isPrimitive(k.value)) c.fail(`${p}/value`, '关键帧值应为数字/字符串/布尔')
   validateEase(c, `${p}/ease`, k.ease)
 }
@@ -137,12 +143,74 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
   }
   c.str(p, l, 'id')
   c.str(p, l, 'name')
-  if (typeof l.type !== 'string' || !LAYER_TYPES.has(l.type)) {
-    c.fail(`${p}/type`, `未知图层类型，可选：${[...LAYER_TYPES].join(' / ')}`)
+  // 「缺 type」和「type 值写错」是两种错法，分开说：缺字段要补字段，
+  // 写错值要换值；都不给可选列表模型就得再跑一趟工具描述
+  if (l.type === undefined || l.type === null) {
+    c.fail(`${p}/type`, `缺少 type 字段（图层类型），可选：${[...LAYER_TYPE_SET].join(' / ')}`)
+  } else if (typeof l.type !== 'string' || !LAYER_TYPE_SET.has(l.type)) {
+    c.fail(`${p}/type`, `未知图层类型 ${JSON.stringify(l.type)}，可选：${[...LAYER_TYPE_SET].join(' / ')}`)
   }
-  if (!isRecord(l.props)) c.fail(`${p}/props`, 'props 应为对象')
-  if (!Array.isArray(l.tracks)) c.fail(`${p}/tracks`, 'tracks 应为数组')
+  if (l.props === undefined || l.props === null) {
+    c.fail(`${p}/props`, '缺少 props 字段（图层的静态属性对象，文本/坐标/样式都写在里面，如 { text: "标题", x: 0, y: 0 }）')
+  } else if (!isRecord(l.props)) {
+    c.fail(`${p}/props`, 'props 应为对象')
+  }
+  if (!Array.isArray(l.tracks)) c.fail(`${p}/tracks`, 'tracks 应为数组（无动画的静态图层给空数组 []）')
   else l.tracks.forEach((t, i) => validateTrack(c, `${p}/tracks`, t, i))
+
+  // 类型相关的软性体检：不阻断校验，但把「注定画不出来」的形态说清楚。
+  // 真机教训：circle 缺尺寸 = MC 默认 0×0 不可见；line/arrow 缺 points 或
+  // 描边 = 不可见。渲染端还有一层兜底（见 codegen），这里的警告进工具回执。
+  const props = isRecord(l.props) ? l.props : undefined
+  if (l.type === 'circle' && props) {
+    const hasSize = props.size !== undefined || props.width !== undefined || props.height !== undefined || props.radius !== undefined
+    if (!hasSize) c.warn(`图层 ${String(l.id)}（circle）未指定尺寸（size/width/height/radius），渲染时按默认处理，可能过小或不可见`)
+    if (props.fill === undefined && props.stroke === undefined) {
+      c.warn(`图层 ${String(l.id)}（circle）既无 fill 也无 stroke，渲染端将按主题文字色兜底填充，否则不可见`)
+    }
+  }
+  if ((l.type === 'line' || l.type === 'arrow') && props) {
+    const pts = props.points
+    if (!Array.isArray(pts) || pts.length < 2 || !pts.every(p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite))) {
+      c.warn(`图层 ${String(l.id)}（${l.type}）的 points 需要至少两个 [x, y] 点，否则线条不可见`)
+    }
+    if (props.stroke === undefined) {
+      c.warn(`图层 ${String(l.id)}（${l.type}）未指定 stroke，渲染端将按主题文字色兜底，否则线条不可见`)
+    }
+  }
+  if ((l.type === 'polygon' || l.type === 'star') && props) {
+    if (props.size === undefined && props.width === undefined && props.height === undefined) {
+      c.warn(`图层 ${String(l.id)}（${l.type}）未指定尺寸（size/width/height），渲染时按默认处理，可能过小或不可见`)
+    }
+    if (props.sides !== undefined && (!Number.isFinite(props.sides) || Number(props.sides) < 3)) {
+      c.fail(`${p}/props/sides`, `${l.type} 的 sides 应为 >= 3 的整数（角数/边数）`)
+    }
+  }
+  if (l.type === 'svg' && props) {
+    if (typeof props.svg !== 'string' || props.svg.trim() === '') {
+      c.warn(`图层 ${String(l.id)}（svg）未提供 svg 内容（props.svg 内嵌 SVG 字符串），渲染为空`)
+    }
+  }
+  if (l.type === 'code' && props) {
+    if (typeof props.code !== 'string' || props.code.trim() === '') {
+      c.warn(`图层 ${String(l.id)}（code）未提供代码内容（props.code），渲染为空`)
+    }
+    if (props.language !== undefined && typeof props.language !== 'string') {
+      c.fail(`${p}/props/language`, 'code 图层的 language 应为字符串（如 typescript / python / json）')
+    }
+  }
+  if (l.type === 'math' && props) {
+    if (typeof props.tex !== 'string' || props.tex.trim() === '') {
+      c.warn(`图层 ${String(l.id)}（math）未提供 LaTeX 公式（props.tex），渲染为空`)
+    }
+  }
+  // group 的 children 字段形态在这里查；引用关系（存在/不自引用/不嵌套/
+  // 不跨组争用）需要全幕图层 id，由 validateScene 统一查。
+  if (l.type === 'group' && props && props.children !== undefined) {
+    if (!Array.isArray(props.children) || !props.children.every(x => typeof x === 'string')) {
+      c.fail(`${p}/props/children`, 'group 的 children 应为图层 id 字符串数组，如 ["axis", "ball"]')
+    }
+  }
 }
 
 function validateAsset(c: Collector, path: string, a: unknown): void {
@@ -169,13 +237,41 @@ function validateScene(c: Collector, path: string, s: unknown, index: number): v
     c.fail(`${p}/layers`, 'layers 应为数组')
   } else {
     const ids = new Set<string>()
+    const groupIds = new Set<string>()
+    const groups: Array<{ index: number; id: string; children: string[] }> = []
     s.layers.forEach((l, i) => {
       validateLayer(c, `${p}/layers`, l, i)
-      if (isRecord(l) && typeof l.id === 'string') {
-        if (ids.has(l.id)) c.fail(`${p}/layers/${i}/id`, `场景内图层 id 重复：${l.id}`)
-        ids.add(l.id)
+      if (!isRecord(l) || typeof l.id !== 'string') return
+      if (ids.has(l.id)) c.fail(`${p}/layers/${i}/id`, `场景内图层 id 重复：${l.id}`)
+      ids.add(l.id)
+      if (l.type === 'group') {
+        groupIds.add(l.id)
+        const children = isRecord(l.props) ? l.props.children : undefined
+        // children 形态非法时 validateLayer 已报错，这里只收合法的引用清单
+        if (Array.isArray(children) && children.every(x => typeof x === 'string')) {
+          groups.push({ index: i, id: l.id, children: children as string[] })
+        }
       }
     })
+    // group 的 children 引用体检（0.3.x 优化清单 O15）：引用必须存在、不能
+    // 自引用、MVP 不嵌套 group、同一图层不被多个 group 争用。此前这些只有
+    // codegen 的生成期警告，错写 children 要到渲染时才发现。
+    const owners = new Map<string, string>()
+    for (const g of groups) {
+      for (const childId of g.children) {
+        if (childId === g.id) {
+          c.fail(`${p}/layers/${g.index}/props/children`, `group ${g.id} 不能引用自己`)
+        } else if (!ids.has(childId)) {
+          c.fail(`${p}/layers/${g.index}/props/children`, `group ${g.id} 引用了本幕不存在的图层 ${childId}（children 只能引用同一场景内的图层 id）`)
+        } else if (groupIds.has(childId)) {
+          c.fail(`${p}/layers/${g.index}/props/children`, `group ${g.id} 引用了另一个 group（${childId}），当前只支持单层分组`)
+        } else {
+          const owner = owners.get(childId)
+          if (owner === undefined) owners.set(childId, g.id)
+          else c.warn(`图层 ${childId} 被多个 group 引用（${owner}、${g.id}），渲染时只归入第一个`)
+        }
+      }
+    }
   }
   if (s.transition !== undefined) {
     const tr = s.transition

@@ -13,8 +13,10 @@
  *    直接把 makeScene2D 内联进 scenes 数组，渲染器会在 reloadScenes 里崩掉。
  */
 
-import type { AnimationSpec, EaseSpec, KeyframeValue, Layer, LayerType, Scene } from '@dsh-anim/spec'
-import { sceneDurationMs, tweensOf } from '@dsh-anim/spec'
+import { extname } from 'node:path'
+
+import type { AnimationSpec, Asset, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
+import { safeName, sceneDurationMs, tweensOf } from '@dsh-anim/spec'
 
 export interface GeneratedFile {
   /** 相对项目 src 目录的路径。 */
@@ -32,33 +34,252 @@ export interface GenerateResult {
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
-/** 各图层类型可接受的静态属性（值 = MC 组件上的属性名）。 */
-const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
-  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight' },
+/**
+ * 所有 Layout 系节点（Rect/Circle/Txt/Img/Line…）都有的尺寸/变换信号。
+ * 单独列出来，是为了让「size/width/height 对所有图层可动画」成立——
+ * MC 的 Layout 基类就有这三个 signal，不写进各类型的静态表也能动。
+ */
+const LAYOUT_PROPS = ['x', 'y', 'scale', 'rotation', 'opacity', 'size', 'width', 'height'] as const
+
+/**
+ * 各图层类型可接受的静态属性（值 = MC 组件上的属性名）。
+ *
+ * 三张表（STATIC_PROPS / COMPONENT / ANIMATABLE_BY_TYPE）的键集合由
+ * `LayerType` 编译期钉死（Record<LayerType, …>），新增类型漏改会直接
+ * 类型报错；导出是给冒烟的「枚举一致性断言」用的（0.3.x 优化清单 O14）。
+ */
+export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
+  // textAlign 是 MC Layout 基类的原生 signal（Txt 继承），直通即可生效
+  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign' },
   rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius' },
-  circle: { size: 'size', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
+  // 由 normalizeLayerProps 换算成 size；见 0.3.0 规划 §1.4（圆形画不出来的修复）。
+  circle: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
   image: { src: 'src', width: 'width', height: 'height' },
+  // 成员经 children 引用，由 genSceneFile 组合成 Node 容器；静态属性只有变换。
   group: {},
+  // Line 的 start/end（0~1 画线进度）与 endArrow/arrowSize 都是 Curve 内建 signal
+  line: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
+  arrow: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
+  // MC 没有独立的 Ellipse 节点：椭圆 = Circle + width/height（官方用法）
+  ellipse: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  // MC Polygon 是正多边形（sides 边数 + radius 角圆角）；star 用 Path + codegen 内置星形 path
+  polygon: { sides: 'sides', size: 'size', radius: 'radius', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  star: { data: 'data', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
+  // MC SVG 组件只接受内嵌 svg 字符串（不是文件路径）；文件资产走 image 图层
+  svg: { svg: 'svg', width: 'width', height: 'height' },
+  // Code 组件：code 是 CodeSignal（字符串可补间，{{片段}} 可着色）；
+  // language 不进静态表，由 emitNode 转成 highlighter 引用（见 code-highlight 模块）
+  code: { code: 'code', fontSize: 'fontSize', fontFamily: 'fontFamily', fill: 'fill' },
+  // Latex 组件（SVGNode）：tex 是 SVG 源，fill/fontSize 由 MC 的 Shape 信号提供
+  math: { tex: 'tex', fontSize: 'fontSize', fill: 'fill' },
 }
 
-/** 可作为动画目标的属性（MC 上必须存在同名 signal）。 */
-const ANIMATABLE = new Set<string>([
-  ...COMMON_PROPS, 'fill', 'stroke', 'lineWidth', 'radius', 'width', 'height', 'size', 'fontSize', 'text',
-])
+/**
+ * 各类型可动画的目标集合：LAYOUT 信号 + 该类型静态属性表里的键。
+ *
+ * 不能再用全局大集合——rect 有 fill、image 没有，全局集合会把「对 Img 补间
+ * fill」这种运行时才会崩的代码放出去。按类型派生，不支持的动画目标走警告降级。
+ */
+export const ANIMATABLE_BY_TYPE: Record<LayerType, Set<string>> = Object.fromEntries(
+  (Object.keys(STATIC_PROPS) as LayerType[]).map(type => [
+    type,
+    new Set<string>([...LAYOUT_PROPS, ...Object.keys(STATIC_PROPS[type])]),
+  ]),
+) as Record<LayerType, Set<string>>
 
-const COMPONENT: Record<LayerType, string | null> = {
+/** 类型 → MC 组件名。Record<LayerType, …> 让「新增类型忘映射」编译期就炸。 */
+export const COMPONENT: Record<LayerType, string> = {
   text: 'Txt',
   rect: 'Rect',
   circle: 'Circle',
   image: 'Img',
-  group: null, // MVP 未实现分组
+  group: 'Node', // 容器：成员用 .add() 挂进来，变换属性作用于整组
+  line: 'Line',
+  arrow: 'Line', // Line + endArrow（Curve 内建箭头，arrowSize 默认 24）
+  ellipse: 'Circle',
+  polygon: 'Polygon',
+  star: 'Path', // codegen 内置星形 path（MC 3.17 没有 Star 组件）
+  svg: 'SVG',
+  code: 'Code',
+  math: 'Latex',
 }
+
+/**
+ * code 图层的 language → code-highlight.ts 里导出的高亮器名。
+ * @lezer/javascript 只导出单一 parser，TS/JSX 用 dialect 配置派生；
+ * 未知语言返回 undefined（纯文本渲染，不染色）。
+ */
+const LANGUAGE_HIGHLIGHTER: Record<string, string> = {
+  typescript: 'tsHighlighter',
+  ts: 'tsHighlighter',
+  tsx: 'tsxHighlighter',
+  javascript: 'jsHighlighter',
+  js: 'jsHighlighter',
+  jsx: 'jsxHighlighter',
+  python: 'pythonHighlighter',
+  py: 'pythonHighlighter',
+  json: 'jsonHighlighter',
+  html: 'htmlHighlighter',
+  css: 'cssHighlighter',
+}
+
+/**
+ * code-highlight.ts 的完整源码：每个语言一个 LezerHighlighter 单例。
+ * 只在 spec 里出现带 language 的 code 图层时才生成（见 generateProject）。
+ */
+const CODE_HIGHLIGHT_FILE = `/**
+ * code 图层的语法高亮器。由 @dsh-anim/render-mc 生成，请勿手工编辑。
+ *
+ * @lezer/javascript 只导出单一 parser，TypeScript/JSX 通过 dialect 派生；
+ * 其余语言各用独立解析器。LezerHighlighter 与 Code 组件同为实验性 API，
+ * 但就是 3.17 的官方路径，渲染不受影响。
+ */
+
+import {LezerHighlighter} from '@motion-canvas/2d/lib/code';
+import {parser as jsParser} from '@lezer/javascript';
+import {parser as pythonParser} from '@lezer/python';
+import {parser as jsonParser} from '@lezer/json';
+import {parser as htmlParser} from '@lezer/html';
+import {parser as cssParser} from '@lezer/css';
+
+export const jsHighlighter = new LezerHighlighter(jsParser);
+export const tsHighlighter = new LezerHighlighter(jsParser.configure({dialect: 'ts'}));
+export const jsxHighlighter = new LezerHighlighter(jsParser.configure({dialect: 'jsx'}));
+export const tsxHighlighter = new LezerHighlighter(jsParser.configure({dialect: 'ts + jsx'}));
+export const pythonHighlighter = new LezerHighlighter(pythonParser);
+export const jsonHighlighter = new LezerHighlighter(jsonParser);
+export const htmlHighlighter = new LezerHighlighter(htmlParser);
+export const cssHighlighter = new LezerHighlighter(cssParser);
+`
 
 /* -------------------------------------------------------------- 工具函数 */
 
 function lit(value: KeyframeValue): string {
   if (typeof value === 'number' && Number.isFinite(value)) return num(value)
+  if (typeof value === 'boolean') return String(value)
   return JSON.stringify(String(value))
+}
+
+/** 属性值字面量：数组（points）走 JSON，原样进 JSX。 */
+function litProp(value: JsonValue): string {
+  if (Array.isArray(value)) return JSON.stringify(value)
+  if (value === null) return 'null'
+  return lit(value as KeyframeValue)
+}
+
+/**
+ * 五角星（任意角数）的 SVG path 字符串，外接圆半径 = size/2，中心在原点。
+ * MC 3.17 没有 Star 组件，用 Path 组件 + 生成 path 表达，模型不需要写 path。
+ */
+function starPath(size: number, sides: number): string {
+  const n = Math.max(3, Math.round(sides))
+  const R = size / 2
+  const r = (R * Math.sin(Math.PI / (2 * n))) / Math.sin(Math.PI / n)
+  const pts: string[] = []
+  for (let i = 0; i < 2 * n; i++) {
+    const rad = i % 2 === 0 ? R : r
+    const a = -Math.PI / 2 + (i * Math.PI) / n
+    pts.push(`${num(Math.cos(a) * rad)},${num(Math.sin(a) * rad)}`)
+  }
+  return `M ${pts.join(' L ')} Z`
+}
+
+/**
+ * 按类型把 props 归一化成最终要写进 JSX 的属性表，并产出警告。
+ * 处理三类「模型常写错、静默画不出来」的形态：
+ * - circle 的 radius/r → size×2（MC Circle 没有 radius 信号）；
+ * - circle 缺尺寸 → 默认 size=100（MC 默认 0×0 不可见）；
+ * - 封闭形状（rect/circle/ellipse/polygon/star）既无 fill 也无 stroke → 主题文字色兜底；
+ * - line/arrow 缺 stroke → 主题文字色兜底；arrow 默认开 endArrow；
+ * - star 的 sides/size → 生成 Path data；polygon 缺省 sides=6、size 兜底；
+ * - image.src 的 `asset:<id>` 引用 → 解析成渲染项目内可加载的 URL。
+ */
+function normalizeLayerProps(
+  type: LayerType,
+  props: LayerProps,
+  defaultTextFill: string,
+  warnings: string[],
+  assets: Record<string, Asset>,
+): Record<string, JsonValue> {
+  const out: Record<string, JsonValue> = {}
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined) continue
+    out[k] = v as JsonValue
+  }
+  if (type === 'group') {
+    // children 是组合引用，由 genSceneFile 消费，不是节点属性
+    delete out.children
+    return out
+  }
+  if (type === 'code') {
+    // language 不写进 JSX（Code 组件没有该 prop），由 emitNode 转成 highlighter 引用
+    delete out.language
+  }
+  if ((type === 'rect' || type === 'circle' || type === 'ellipse' || type === 'polygon' || type === 'star') && out.fill === undefined && out.stroke === undefined) {
+    out.fill = defaultTextFill
+    warnings.push(`图层（${type}）既无 fill 也无 stroke，已按主题文字色填充兜底`)
+  }
+  if (type === 'circle') {
+    const r = out.radius ?? out.r
+    if (typeof r === 'number' && Number.isFinite(r) && r > 0) {
+      delete out.radius
+      delete out.r
+      if (out.size === undefined && out.width === undefined && out.height === undefined) {
+        out.size = r * 2
+        warnings.push(`circle 图层写了 radius=${r}，已换算为 size=${r * 2}`)
+      } else {
+        warnings.push(`circle 图层写了 radius=${r}，但已指定尺寸，radius 被忽略`)
+      }
+    }
+    if (out.size === undefined && out.width === undefined && out.height === undefined) {
+      out.size = 100
+      warnings.push('circle 图层未指定尺寸（size/width/height/radius），已按 size=100 兜底')
+    }
+  }
+  if (type === 'line' || type === 'arrow') {
+    if (out.stroke === undefined) {
+      out.stroke = defaultTextFill
+      warnings.push(`${type} 图层未指定 stroke，已按主题文字色描边兜底`)
+    }
+    if (type === 'arrow' && out.endArrow === undefined && out.startArrow === undefined) {
+      out.endArrow = true
+    }
+  }
+  if (type === 'polygon') {
+    out.sides = out.sides ?? 6
+    if (out.size === undefined && out.width === undefined && out.height === undefined) {
+      out.size = 100
+      warnings.push('polygon 图层未指定尺寸（size/width/height），已按 size=100 兜底')
+    }
+  }
+  if (type === 'star') {
+    const sides = Number(out.sides ?? 5)
+    let size = Number(out.size ?? out.width ?? 0)
+    delete out.sides
+    delete out.size
+    delete out.width
+    delete out.height
+    if (!Number.isFinite(size) || size <= 0) {
+      size = 100
+      warnings.push('star 图层尺寸异常（size 应 > 0），已按 size=100 生成星形')
+    }
+    out.data = starPath(size, sides)
+  }
+  if (type === 'image' && typeof out.src === 'string' && out.src.startsWith('asset:')) {
+    const assetId = out.src.slice('asset:'.length)
+    const asset = assets[assetId]
+    if (!asset) {
+      warnings.push(`image 图层引用了未登记的资产 ${assetId}（用 anim_asset_import 登记后再引用）`)
+    } else if (/^https?:\/\//.test(asset.src)) {
+      out.src = asset.src // http URL 资产原样透传，浏览器直接加载
+    } else {
+      const ext = extname(asset.src)
+      out.src = `/assets/${safeName(assetId)}${ext}`
+      warnings.push(`image 图层引用资产 ${assetId}，已解析为 /assets/${safeName(assetId)}${ext}`)
+    }
+  }
+  return out
 }
 
 function num(v: number): string {
@@ -155,7 +376,15 @@ function easeExpr(
 
 /* ------------------------------------------------------------ 场景生成 */
 
-function genSceneFile(scene: Scene, index: number, background: string, defaultTextFill: string, warnings: string[]): GeneratedFile {
+function genSceneFile(
+  scene: Scene,
+  index: number,
+  background: string,
+  defaultTextFill: string,
+  assets: Record<string, Asset>,
+  warnings: string[],
+  usedHighlighters: Set<string>,
+): GeneratedFile {
   const components = new Set<string>()
   const coreImports = new Set<string>()
   const easingImports = new Set<string>()
@@ -164,64 +393,144 @@ function genSceneFile(scene: Scene, index: number, background: string, defaultTe
   const initial: string[] = []
   const tasks: string[] = []
 
-  for (const [i, layer] of scene.layers.entries()) {
-    const component = COMPONENT[layer.type]
-    if (component === null) {
-      warnings.push(`图层 ${layer.id}（${layer.name}）类型 ${layer.type} 暂未实现，已跳过`)
-      continue
+  // Pass 1：分组关系。group 的 children 引用同一场景内的图层 id；
+  // MVP 单层分组（组内不套组），冲突引用以警告降级而不是失败。
+  const parentOf = new Map<string, string>() // 成员 id → 组 id
+  const membersOf = new Map<string, string[]>() // 组 id → 成员 id 列表
+  for (const layer of scene.layers) {
+    if (layer.type !== 'group') continue
+    const kids = Array.isArray(layer.props.children) ? layer.props.children : []
+    for (const childId of kids) {
+      if (childId === layer.id) {
+        warnings.push(`group ${layer.id} 不能包含自己，已忽略`)
+        continue
+      }
+      const child = scene.layers.find(l => l.id === childId)
+      if (!child) {
+        warnings.push(`group ${layer.id} 引用了不存在的图层 ${childId}，已忽略`)
+        continue
+      }
+      if (child.type === 'group') {
+        warnings.push(`group ${layer.id} 包含另一个 group（${childId}），MVP 不支持组内套组，已忽略`)
+        continue
+      }
+      if (parentOf.has(childId)) {
+        warnings.push(`图层 ${childId} 被多个 group 引用，只归入第一个（${parentOf.get(childId)}）`)
+        continue
+      }
+      parentOf.set(childId, layer.id)
+      membersOf.set(layer.id, [...(membersOf.get(layer.id) ?? []), childId])
     }
-    components.add(component)
-    const varName = `n${i}_${sanitize(layer.id)}`
+  }
 
-    const attrs = [`ref={${varName}}`]
+  // 变量名 = 图层在数组里的位置 + 净化后的 id（与文件内唯一性解耦）
+  const varName = (layer: Layer): string => `n${scene.layers.indexOf(layer)}_${sanitize(layer.id)}`
+
+  /**
+   * 生成单个图层的节点创建：createRef + 挂到 parentExpr（view 或组节点）。
+   * 返回该图层的变量名，轨道生成要用它。
+   */
+  const emitNode = (layer: Layer, parentExpr: string): string => {
+    // Record<LayerType, string> 让「新增类型忘映射」编译期就失败，
+    // 运行期不再需要「未实现」的防御分支
+    const component = COMPONENT[layer.type]
+    components.add(component)
+    const name = varName(layer)
+
+    const attrs = [`ref={${name}}`]
     const allowed: Record<string, string> = { ...STATIC_PROPS[layer.type] }
     for (const key of COMMON_PROPS) allowed[key] = key
-    for (const [rawProp, value] of Object.entries(layer.props)) {
-      if (value === undefined) continue
+    const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings, assets)
+    for (const [rawProp, value] of Object.entries(normalized)) {
       let prop = rawProp
       // 模型几乎必然写过 color：语义就是填充色，按 fill 处理而不是丢弃
       if (prop === 'color' && !allowed.color && allowed.fill) {
         prop = 'fill'
+      }
+      // SVG 习惯名 strokeWidth 同义于 IR 的 lineWidth（真机批量踩过：所有线条
+      // 的描边宽度被静默丢弃）。lineWidth 已显式给出时不改写——规范名优先，
+      // 冗余的 strokeWidth 走下方「不支持」警告
+      if (prop === 'strokeWidth' && allowed.lineWidth && normalized.lineWidth === undefined) {
+        prop = 'lineWidth'
       }
       const mapped = allowed[prop]
       if (!mapped) {
         warnings.push(`图层 ${layer.id} 的属性 ${rawProp} 不被 ${layer.type} 支持，已忽略`)
         continue
       }
-      attrs.push(`${mapped}={${lit(value as KeyframeValue)}}`)
+      attrs.push(`${mapped}={${litProp(value)}}`)
     }
-    // text 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
-    if (layer.type === 'text' && layer.props.fill === undefined && layer.props.color === undefined) {
+    // text/math 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
+    if ((layer.type === 'text' || layer.type === 'math') && normalized.fill === undefined && normalized.color === undefined) {
       attrs.push(`fill={${JSON.stringify(defaultTextFill)}}`)
     }
-    setup.push(`const ${varName} = createRef<${component}>();`)
-    setup.push(`view.add(<${component} ${attrs.join(' ')} />);`)
+    // code 图层写了 language：挂上对应高亮器（带语言的 code 图层才触发 code-highlight 模块生成）
+    if (layer.type === 'code') {
+      const lang = typeof layer.props.language === 'string' ? layer.props.language.toLowerCase() : undefined
+      const highlighter = lang ? LANGUAGE_HIGHLIGHTER[lang] : undefined
+      if (lang && !highlighter) {
+        warnings.push(`code 图层 ${layer.id} 的语言 ${layer.props.language} 暂不支持高亮，按纯文本渲染`)
+      } else if (highlighter) {
+        usedHighlighters.add(highlighter)
+        attrs.push(`highlighter={${highlighter}}`)
+      }
+    }
+    setup.push(`const ${name} = createRef<${component}>();`)
+    setup.push(`${parentExpr}.add(<${component} ${attrs.join(' ')} />);`)
     coreImports.add('createRef')
+    return name
+  }
 
+  /** 生成一个图层的轨道：初值 + 补间。 */
+  const emitTracks = (layer: Layer): void => {
+    const name = varName(layer)
     // 轨道：先落初值，再产出补间
     const initials = new Map<string, string>()
+    const animatable = ANIMATABLE_BY_TYPE[layer.type]
     for (const track of layer.tracks) {
-      const prop = track.target.replace(/^props\./, '')
-      if (!ANIMATABLE.has(prop)) {
+      let prop = track.target.replace(/^props\./, '')
+      // 与静态属性侧同一约定：SVG 习惯名 strokeWidth 改写为 lineWidth 后再查
+      // 可动画集合，写 lineWidth 才能被 ANIMATABLE_BY_TYPE 放行
+      if (prop === 'strokeWidth' && !animatable.has('strokeWidth') && animatable.has('lineWidth')) {
+        prop = 'lineWidth'
+      }
+      if (!animatable.has(prop)) {
         warnings.push(`图层 ${layer.id} 的轨道目标 ${track.target} 不可动画，已忽略`)
         continue
       }
       const keys = [...track.keys].sort((a, b) => a.atMs - b.atMs)
       if (keys.length === 0) continue
-      initials.set(prop, `${varName}().${prop}(${lit(keys[0].value)});`)
+      initials.set(prop, `${name}().${prop}(${lit(keys[0].value)});`)
 
       for (const t of tweensOf(track)) {
         const ease = easeExpr(t.ease, imports)
         const easeArg = ease ? `, ${ease}` : ''
         if (t.durationMs <= 0) {
           // 离散跳变：delay 也接受普通 callback
-          tasks.push(`delay(${sec(t.startMs)}, () => ${varName}().${prop}(${lit(t.to)})),`)
+          tasks.push(`delay(${sec(t.startMs)}, () => ${name}().${prop}(${lit(t.to)})),`)
         } else {
-          tasks.push(`delay(${sec(t.startMs)}, ${varName}().${prop}(${lit(t.to)}, ${sec(t.durationMs)}${easeArg})),`)
+          tasks.push(`delay(${sec(t.startMs)}, ${name}().${prop}(${lit(t.to)}, ${sec(t.durationMs)}${easeArg})),`)
         }
       }
     }
     initial.push(...initials.values())
+  }
+
+  // 主循环：group 的成员随所属组一起生成（保证父节点先于子节点存在）
+  for (const layer of scene.layers) {
+    if (parentOf.has(layer.id)) continue // 成员由所属 group 内联生成
+    if (layer.type === 'group') {
+      const name = emitNode(layer, 'view')
+      for (const memberId of membersOf.get(layer.id) ?? []) {
+        const member = scene.layers.find(l => l.id === memberId)!
+        emitNode(member, `${name}()`)
+        emitTracks(member)
+      }
+      emitTracks(layer)
+      continue
+    }
+    emitNode(layer, 'view')
+    emitTracks(layer)
   }
 
   // 进入转场
@@ -268,6 +577,9 @@ function genSceneFile(scene: Scene, index: number, background: string, defaultTe
   L.push(`import {makeScene2D${scope ? `, ${scope}` : ''}} from '@motion-canvas/2d';`)
   if (easingImports.size > 0) {
     L.push(`import {${[...easingImports].sort().join(', ')}} from '../anim-easing';`)
+  }
+  if (usedHighlighters.size > 0) {
+    L.push(`import {${[...usedHighlighters].sort().join(', ')}} from '../code-highlight';`)
   }
   L.push('')
   L.push('export default makeScene2D(function* (view) {')
@@ -354,9 +666,15 @@ export function generateProject(
 
   const files: GeneratedFile[] = [{ path: 'anim-easing.ts', content: EASING_FILE }]
 
+  // code 图层用了 language 才生成高亮模块：没有任何 code 图层时，
+  // 生成物不依赖 @lezer/* 语言包，项目保持最小。
+  const usedHighlighters = new Set<string>()
   spec.scenes.forEach((scene, i) => {
-    files.push(genSceneFile(scene, i, background, defaultTextFill, warnings))
+    files.push(genSceneFile(scene, i, background, defaultTextFill, spec.assets, warnings, usedHighlighters))
   })
+  if (usedHighlighters.size > 0) {
+    files.push({ path: 'code-highlight.ts', content: CODE_HIGHLIGHT_FILE })
+  }
 
   const imports = spec.scenes.map((s, i) => `import s${i} from './scenes/s${i}-${sanitize(s.id)}?scene';`)
   const L: string[] = []

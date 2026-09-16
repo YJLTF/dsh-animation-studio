@@ -127,6 +127,7 @@ try {
 
 const names = registered.map(d => d.name).sort()
 assert.deepEqual(names, [
+  'anim_asset_import',
   'anim_create_spec',
   'anim_diagnose',
   'anim_draft_scene',
@@ -145,6 +146,24 @@ console.log(`  ✔ 插件挂载成功，${names.length} 个 anim_* 工具已注�
 const agentSession = makeAgentSession('sess-main')
 const exec = { signal: new AbortController().signal, agent: { session: agentSession } }
 const byName = Object.fromEntries(registered.map(d => [d.name, d]))
+
+// ---- 图层类型枚举第四面：anim_draft_scene 描述（模型必读）必须列出全部类型 ----
+// lib bundle 已把 spec 内联，这里从源码解析权威枚举，对齐冒烟里的三表断言
+const typesSource = await readFile(new URL('../packages/spec/src/types.ts', import.meta.url), 'utf8')
+const layerTypesMatch = typesSource.match(/export const LAYER_TYPES = \[([^\]]*)\]/s)
+assert.ok(layerTypesMatch, 'types.ts 应导出 LAYER_TYPES 常量')
+const layerTypes = [...layerTypesMatch[1].matchAll(/'([a-z]+)'/g)].map(m => m[1])
+assert.ok(layerTypes.length >= 13, `LAYER_TYPES 应覆盖至少 13 种类型，实际 ${layerTypes.length}`)
+// 类型清单在 anim_draft_scene 的 scene 参数描述里（模型每次写幕都会读）。
+// defineTool 会把 parameters 规范化成 JSON Schema 形状：properties.scene.description
+const schemaParams = byName['anim_draft_scene'].parameters ?? {}
+const sceneParam = schemaParams.properties?.scene ?? schemaParams.scene
+const draftDesc = typeof sceneParam?.description === 'string' ? sceneParam.description : ''
+assert.ok(draftDesc !== '', 'anim_draft_scene 应带 scene 参数描述')
+for (const t of layerTypes) {
+  assert.ok(draftDesc.includes(t), `anim_draft_scene 的 scene 参数描述应列出图层类型 ${t}`)
+}
+console.log(`  ✔ anim_draft_scene 参数描述与 LAYER_TYPES 对齐（${layerTypes.length} 种类型）`)
 
 const created = await byName['anim_create_spec'].execute(
   { specId: 'smoke', title: '挂载冒烟' },
@@ -321,6 +340,7 @@ const fakeClientCtx = {
 }
 clientExports.apply(fakeClientCtx)
 assert.deepEqual(registeredViews.sort(), [
+  'anim_asset_import',
   'anim_create_spec',
   'anim_diagnose',
   'anim_draft_scene',

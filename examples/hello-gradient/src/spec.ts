@@ -1,7 +1,7 @@
 import type { AnimationSpec } from '@dsh-anim/spec'
 
 /**
- * 样例：一部 8 秒的《梯度下降》教学动画。
+ * 样例：一部约 11 秒的《梯度下降》教学动画（3 幕概念 + 1 幕公式/代码）。
  *
  * 这个文件是「脚本生成」阶段的产物形态——agent 产出的就是这样的 IR，
  * 而不是 Motion Canvas 代码。改这里 → 重新 generate → 重新 build 即可。
@@ -90,15 +90,15 @@ export const spec: AnimationSpec = {
         {
           id: 'axis',
           name: '横轴',
-          type: 'rect',
-          props: { width: 620, height: 4, fill: '#4C9AFF', radius: 2, x: 0, y: 170 },
+          type: 'line',
+          props: { points: [[-310, 170], [310, 170]], stroke: '#4C9AFF', lineWidth: 4 },
           tracks: [
             {
               id: 'axis-grow',
-              target: 'props.width',
+              target: 'props.end',
               keys: [
                 { atMs: 0, value: 0 },
-                { atMs: 600, value: 620, ease: { kind: 'easeOut' } },
+                { atMs: 600, value: 1, ease: { kind: 'easeOut' } },
               ],
             },
             {
@@ -112,10 +112,35 @@ export const spec: AnimationSpec = {
           ],
         },
         {
+          id: 'dir-arrow',
+          name: '下降方向箭头',
+          type: 'arrow',
+          props: { points: [[0, -60], [0, -150]], stroke: '#FFB020', lineWidth: 4 },
+          tracks: [
+            {
+              id: 'arrow-draw',
+              target: 'props.end',
+              keys: [
+                { atMs: 700, value: 0 },
+                { atMs: 1300, value: 1, ease: { kind: 'easeOut' } },
+              ],
+            },
+            {
+              id: 'arrow-fade',
+              target: 'props.opacity',
+              keys: [
+                { atMs: 700, value: 0 },
+                { atMs: 1100, value: 1 },
+              ],
+            },
+          ],
+        },
+        {
           id: 'ball',
           name: '小球',
           type: 'circle',
-          props: { size: 64, fill: '#FFB020', x: -240, y: -150 },
+          // 0.3.0 修复的形态：radius 会被换算成 size（radius×2），此前直接丢属性 → 0×0 不可见
+          props: { radius: 32, fill: '#FFB020', x: -240, y: -150 },
           tracks: [
             {
               id: 'ball-x',
@@ -191,6 +216,44 @@ export const spec: AnimationSpec = {
           ],
         },
         {
+          id: 'sum-star',
+          name: '强调星',
+          type: 'star',
+          props: { size: 44, fill: '#FFB020', x: 270, y: -30 },
+          tracks: [
+            {
+              id: 'star-pop',
+              target: 'props.scale',
+              keys: [
+                { atMs: 1100, value: 0 },
+                { atMs: 1600, value: 1, ease: { kind: 'spring', stiffness: 220, damping: 12 } },
+              ],
+            },
+          ],
+        },
+        {
+          id: 'sum-check',
+          name: '对勾',
+          type: 'svg',
+          props: {
+            svg: '<svg viewBox="0 0 24 24" fill="none"><path d="M4 12.5 L9.5 18 L20 6" stroke="#7DD87D" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            width: 36,
+            height: 36,
+            x: -290,
+            y: -30,
+          },
+          tracks: [
+            {
+              id: 'check-fade',
+              target: 'props.opacity',
+              keys: [
+                { atMs: 1400, value: 0 },
+                { atMs: 1800, value: 1 },
+              ],
+            },
+          ],
+        },
+        {
           id: 'sum-tip',
           name: '补充',
           type: 'text',
@@ -204,6 +267,58 @@ export const spec: AnimationSpec = {
                 { atMs: 1500, value: 1, ease: { kind: 'easeOut' } },
                 { atMs: 2200, value: 1 },
                 { atMs: 2500, value: 0 },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+
+    {
+      id: 'formula',
+      name: '公式与代码：更新规则',
+      durationMs: 3200,
+      transition: { kind: 'fade', durationMs: 350 },
+      layers: [
+        {
+          id: 'f-math',
+          name: '更新公式',
+          type: 'math',
+          props: { tex: '\\theta := \\theta - \\alpha \\nabla J(\\theta)', fontSize: 52, x: 0, y: -160 },
+          tracks: [
+            {
+              id: 'math-fade',
+              target: 'props.opacity',
+              keys: [
+                { atMs: 0, value: 0 },
+                { atMs: 700, value: 1, ease: { kind: 'easeOut' } },
+                { atMs: 2800, value: 1 },
+                { atMs: 3200, value: 0 },
+              ],
+            },
+          ],
+        },
+        {
+          id: 'f-code',
+          name: '更新规则代码',
+          type: 'code',
+          props: {
+            code: 'for i in range(steps):\n    grad = gradient(theta)\n    theta -= alpha * grad',
+            language: 'python',
+            fontSize: 26,
+            fill: '#F2F5F7',
+            x: 0,
+            y: 120,
+          },
+          tracks: [
+            {
+              id: 'code-fade',
+              target: 'props.opacity',
+              keys: [
+                { atMs: 700, value: 0 },
+                { atMs: 1300, value: 1, ease: { kind: 'easeOut' } },
+                { atMs: 2800, value: 1 },
+                { atMs: 3200, value: 0 },
               ],
             },
           ],

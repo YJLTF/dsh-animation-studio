@@ -9,26 +9,35 @@
  * 用法：pnpm smoke
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
-import { generateProject, generateProjectMeta } from '../packages/render-mc/src/index.ts'
+import {
+  ANIMATABLE_BY_TYPE,
+  COMPONENT,
+  generateProject,
+  generateProjectMeta,
+  MotionCanvasRenderer,
+  pickScenes,
+  STATIC_PROPS,
+} from '../packages/render-mc/src/index.ts'
 import {
   applyPatch,
+  LAYER_TYPES,
   sceneDurationMs,
   specDurationMs,
   truncateSpecAtMs,
   tweensOf,
   validateSpec,
 } from '../packages/spec/src/index.ts'
-import type { AnimationSpec } from '../packages/spec/src/index.ts'
+import type { AnimationSpec, LayerType } from '../packages/spec/src/index.ts'
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { opRender } from '../packages/tools/src/ops.ts'
+import { coerceScene, opDraftScene, opRender, opAssetImport } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
@@ -112,6 +121,117 @@ check('validate: 左上角原点坐标触发警告，出现负坐标则视为知
   if (r2.ok) assert.deepEqual(r2.warnings, [])
 })
 
+check('validate: 报错文案可执行化——缺字段与写错值分开说，ease 报错带正确形态示例', () => {
+  const mk = (layer: unknown) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [layer as never]
+    return validateSpec(spec)
+  }
+  // 缺 type：说清是「缺字段」并附可选列表（此前与写错值混为一句「未知图层类型」）
+  const noType = mk({ id: 'a', name: 'A', props: { text: 'x' }, tracks: [] })
+  assert.equal(noType.ok, false)
+  if (!noType.ok) {
+    assert.ok(
+      noType.errors.some(e => e.path === '/scenes/0/layers/0/type' && e.message.includes('缺少 type 字段')),
+      JSON.stringify(noType.errors),
+    )
+  }
+  // 写错 type：报错回显收到的值
+  const badType = mk({ id: 'a', name: 'A', type: 'textbox', props: {}, tracks: [] })
+  assert.equal(badType.ok, false)
+  if (!badType.ok) {
+    assert.ok(badType.errors.some(e => e.message.includes('"textbox"')), JSON.stringify(badType.errors))
+  }
+  // 缺 props：给出字段形态示例
+  const noProps = mk({ id: 'a', name: 'A', type: 'text', tracks: [] })
+  assert.equal(noProps.ok, false)
+  if (!noProps.ok) {
+    assert.ok(noProps.errors.some(e => e.message.includes('缺少 props 字段')), JSON.stringify(noProps.errors))
+  }
+  // ease 写成字符串：报错直接给可照抄的示例
+  const strEase = demoSpec()
+  strEase.scenes[0].layers[0].tracks[0].keys[1].ease = 'easeOut' as never
+  const r = validateSpec(strEase)
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.ok(r.errors.some(e => e.message.includes('{"kind":"easeInOut"}')), JSON.stringify(r.errors))
+  }
+  // 未知缓动名：报错回显名字 + 可选列表
+  const unknownEase = demoSpec()
+  unknownEase.scenes[0].layers[0].tracks[0].keys[1].ease = { kind: 'bounce' }
+  const r2 = validateSpec(unknownEase)
+  assert.equal(r2.ok, false)
+  if (!r2.ok) {
+    assert.ok(r2.errors.some(e => e.message.includes('未知缓动类型 "bounce"')), JSON.stringify(r2.errors))
+  }
+})
+
+check('coerceScene: 真机首写三类机械错误自动纠正，repairs 回报，入参不被修改', () => {
+  const input = {
+    id: 'deep-dive',
+    durationMs: 2000,
+    layers: [
+      {
+        id: 'title',
+        type: 'Text', // 大小写写飘
+        props: { text: '你好', x: 0, y: 0 },
+        tracks: [
+          {
+            id: 't1',
+            target: 'props.opacity',
+            keys: [{ atMs: 0, value: 0 }, { atMs: 600, value: 1, ease: 'easeOut' }], // ease 字符串
+          },
+        ],
+      },
+      { id: 'note', name: '备注', type: 'rect', props: { width: 100, height: 50 } }, // 漏 tracks
+    ],
+  }
+  const { scene, repairs } = coerceScene(input)
+  // 场景/图层 name 用 id 补上
+  assert.equal(scene.name, 'deep-dive')
+  assert.equal(scene.layers[0].name, 'title')
+  // type 大小写纠正
+  assert.equal(scene.layers[0].type, 'text')
+  // ease 字符串包装成对象；无 ease 的关键帧不受影响
+  assert.deepEqual(scene.layers[0].tracks[0].keys[1].ease, { kind: 'easeOut' })
+  assert.equal(scene.layers[0].tracks[0].keys[0].ease, undefined)
+  // 漏 tracks 补空数组
+  assert.deepEqual(scene.layers[1].tracks, [])
+  // 五类修复各报一条（场景 name + ease + type 大小写 + 图层 name + 图层 tracks），且说清改了什么
+  assert.equal(repairs.length, 5, JSON.stringify(repairs))
+  assert.ok(repairs.some(r => r.includes('ease')), JSON.stringify(repairs))
+  assert.ok(repairs.some(r => r.includes('"Text"→"text"')), JSON.stringify(repairs))
+  // 深拷贝：入参原样
+  const rawL1 = input.layers[0] as { type: string; name?: string }
+  const rawL2 = input.layers[1] as { tracks?: unknown[] }
+  assert.equal(rawL1.type, 'Text')
+  assert.equal(rawL1.name, undefined)
+  assert.equal(Array.isArray(rawL2.tracks), false)
+  // 纠正后的场景接在合法 spec 后能过校验
+  const spec = demoSpec()
+  spec.scenes.push(structuredClone(scene))
+  const v = validateSpec(spec)
+  assert.ok(v.ok, JSON.stringify(v.ok ? v.warnings : v.errors))
+})
+
+check('coerceScene: props.strokeWidth 归一化为 lineWidth；规范名已在则不动（不丢内容）', () => {
+  const { scene, repairs } = coerceScene({
+    id: 'x',
+    name: 'x',
+    durationMs: 1000,
+    layers: [
+      { id: 'a', name: 'A', type: 'line', props: { points: [[0, 0], [10, 0]], stroke: '#fff', strokeWidth: 6 }, tracks: [] },
+      { id: 'b', name: 'B', type: 'rect', props: { width: 10, height: 10, strokeWidth: 2, lineWidth: 4 }, tracks: [] },
+    ],
+  })
+  assert.equal(scene.layers[0].props.lineWidth, 6)
+  assert.equal(scene.layers[0].props.strokeWidth, undefined)
+  // 两者都在：规范名优先、冗余名不动（渲染端会对它告警），绝不静默丢值
+  assert.equal(scene.layers[1].props.lineWidth, 4)
+  assert.equal(scene.layers[1].props.strokeWidth, 2)
+  assert.ok(repairs.some(r => r.includes('strokeWidth') && r.includes('a')), JSON.stringify(repairs))
+})
+
 check('patch: replace 生效且 inverse 完整还原、入参不被修改', () => {
   const original = demoSpec()
   const r = applyPatch(original, [{ op: 'replace', path: '/meta/title', value: '新标题' }])
@@ -152,6 +272,378 @@ check('codegen: 图层 id 的连字符换成合法标识符；project.meta 带�
   const meta = JSON.parse(generateProjectMeta(spec))
   assert.equal(meta.rendering.fps, 30)
   assert.deepEqual(meta.shared.size, { x: 1280, y: 720 })
+})
+
+/* ------------------------------------- 0.3.0：圆形修复 + 新元素类型 */
+
+check('codegen: 圆形四形态回归——radius 换算、width/height 透传、缺省兜底、无色兜底', () => {
+  const sceneFor = (props: Record<string, unknown>): { content: string; warnings: string[] } => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [{ id: 'ball', name: '球', type: 'circle', props, tracks: [] }]
+    const r = generateProject(spec)
+    return { content: r.files.find(f => f.path === 'scenes/s0-intro.tsx')!.content, warnings: r.warnings }
+  }
+  // radius → size×2（模型按「圆半径」写是高频形态，0.3.0 之前直接静默丢属性 → 0×0 不可见）
+  const r1 = sceneFor({ radius: 40, fill: '#FFB020' })
+  assert.match(r1.content, /size=\{80\}/)
+  assert.ok(r1.warnings.some(w => w.includes('radius=40')), JSON.stringify(r1.warnings))
+  // width/height 原生透传（MC Circle 官方用法，width≠height 即椭圆）
+  const r2 = sceneFor({ width: 120, height: 60, fill: '#FFB020' })
+  assert.match(r2.content, /width=\{120\} height=\{60\}/)
+  // 缺尺寸 → size=100 兜底，杜绝 0×0
+  const r3 = sceneFor({ fill: '#FFB020' })
+  assert.match(r3.content, /size=\{100\}/)
+  assert.ok(r3.warnings.some(w => w.includes('size=100')), JSON.stringify(r3.warnings))
+  // 既无 fill 也无 stroke → 主题文字色兜底
+  const r4 = sceneFor({ size: 60 })
+  assert.match(r4.content, /fill=\{"#F2F5F7"\}/)
+})
+
+check('codegen: SVG 习惯名 strokeWidth 按 lineWidth 别名生效（静态+轨道），textAlign 直通', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    {
+      id: 'ln', name: '线', type: 'line',
+      props: { points: [[0, 0], [100, 0]], stroke: '#fff', strokeWidth: 6 },
+      tracks: [
+        { id: 'tk', target: 'props.strokeWidth', keys: [{ atMs: 0, value: 2 }, { atMs: 500, value: 6 }] },
+      ],
+    },
+    { id: 't', name: '文本', type: 'text', props: { text: 'x', textAlign: 'center' }, tracks: [] },
+  ] as never
+  const r = generateProject(spec)
+  const scene = r.files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // 静态属性：strokeWidth=6 落到 lineWidth，不产生「不支持」告警
+  assert.match(scene, /lineWidth=\{6\}/)
+  assert.ok(!r.warnings.some(w => w.includes('strokeWidth')), JSON.stringify(r.warnings))
+  // 轨道：props.strokeWidth 目标改写为 lineWidth 后放行（初值 + 补间都落在规范名上）
+  assert.match(scene, /\.lineWidth\(2\)/)
+  assert.doesNotMatch(scene, /strokeWidth/)
+  // textAlign 直通（MC Layout 原生 signal），无告警
+  assert.match(scene, /textAlign=\{"center"\}/)
+  assert.ok(!r.warnings.some(w => w.includes('textAlign')), JSON.stringify(r.warnings))
+})
+
+check('codegen: lineWidth 显式给出时规范名优先，冗余 strokeWidth 走告警忽略', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    {
+      id: 'ln', name: '线', type: 'line',
+      props: { points: [[0, 0], [100, 0]], stroke: '#fff', strokeWidth: 4, lineWidth: 8 },
+      tracks: [],
+    },
+  ] as never
+  const r = generateProject(spec)
+  const scene = r.files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  assert.match(scene, /lineWidth=\{8\}/)
+  assert.ok(r.warnings.some(w => w.includes('strokeWidth')), JSON.stringify(r.warnings))
+})
+
+check('validate: circle 缺尺寸 / line 缺 points 或 stroke 有软警告，不阻断', () => {
+  const mk = (layer: unknown) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [layer as never]
+    return validateSpec(spec)
+  }
+  const circle = mk({ id: 'c', name: '圆', type: 'circle', props: { fill: '#fff' }, tracks: [] })
+  assert.ok(circle.ok)
+  if (circle.ok) assert.ok(circle.warnings.some(w => w.includes('circle')), JSON.stringify(circle.warnings))
+  const line = mk({ id: 'l', name: '线', type: 'line', props: { stroke: '#fff' }, tracks: [] })
+  assert.ok(line.ok)
+  if (line.ok) assert.ok(line.warnings.some(w => w.includes('points')), JSON.stringify(line.warnings))
+})
+
+check('codegen: 新元素类型——group 组合、line/arrow 折线箭头、ellipse', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    { id: 'axis', name: '轴', type: 'line', props: { points: [[-240, 0], [240, 0]], stroke: '#4C9AFF', lineWidth: 4 }, tracks: [{ id: 'draw', target: 'props.end', keys: [{ atMs: 0, value: 0 }, { atMs: 600, value: 1 }] }] },
+    { id: 'arr', name: '箭头', type: 'arrow', props: { points: [[0, -60], [0, -160]], stroke: '#FFB020', lineWidth: 4 }, tracks: [] },
+    { id: 'ell', name: '椭圆', type: 'ellipse', props: { width: 200, height: 100, fill: '#4C9AFF' }, tracks: [] },
+    { id: 'g', name: '组', type: 'group', props: { x: 100, children: ['axis', 'arr'] }, tracks: [{ id: 'fade', target: 'props.opacity', keys: [{ atMs: 0, value: 0 }, { atMs: 500, value: 1 }] }] },
+  ]
+  const { files, warnings } = generateProject(spec)
+  const s = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // group：Node 容器 + 成员挂到组节点而不是 view；组轨道作用于 Node
+  assert.match(s, /import \{makeScene2D, Circle, Line, Node\} from '@motion-canvas\/2d'/)
+  assert.match(s, /const n3_g = createRef<Node>\(\);/)
+  assert.match(s, /view\.add\(<Node ref=\{n3_g\}/)
+  assert.match(s, /n3_g\(\)\.add\(<Line ref=\{n0_axis\} /)
+  assert.match(s, /n3_g\(\)\.opacity\(0\);/)
+  // line：points 数组进 JSX；end 轨道驱动画线
+  assert.match(s, /points=\{\[\[-240,0\],\[240,0\]\]\}/)
+  assert.match(s, /n0_axis\(\)\.end\(1, 0\.6\)/)
+  // arrow：自动 endArrow
+  assert.match(s, /endArrow=\{true\}/)
+  // ellipse：Circle + width/height
+  assert.match(s, /const n2_ell = createRef<Circle>\(\);/)
+  assert.match(s, /width=\{200\} height=\{100\}/)
+  assert.deepEqual(warnings, [], JSON.stringify(warnings))
+})
+
+check('codegen: M1 新元素——polygon/star/svg 与 image 资产引用', () => {
+  const spec = demoSpec()
+  spec.assets = {
+    icon: { kind: 'image', src: '/tmp/icon.png' },
+    web: { kind: 'image', src: 'https://example.com/a.png' },
+  }
+  spec.scenes[0].layers = [
+    { id: 'p', name: '多边形', type: 'polygon', props: { sides: 3, size: 120, fill: '#4C9AFF' }, tracks: [] },
+    { id: 's', name: '星', type: 'star', props: { size: 100, fill: '#FFB020' }, tracks: [] },
+    { id: 'sv', name: 'svg', type: 'svg', props: { svg: '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="red"/></svg>' }, tracks: [] },
+    { id: 'im', name: '图', type: 'image', props: { src: 'asset:icon', width: 60 }, tracks: [] },
+    { id: 'im2', name: '图2', type: 'image', props: { src: 'asset:web', width: 60 }, tracks: [] },
+  ]
+  const { files, warnings } = generateProject(spec)
+  const s = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // polygon：Polygon 组件 + sides 透传
+  assert.match(s, /import \{makeScene2D, Img, Path, Polygon, SVG\} from '@motion-canvas\/2d'/)
+  assert.match(s, /const n0_p = createRef<Polygon>\(\);/)
+  assert.match(s, /sides=\{3\} size=\{120\}/)
+  // star：Path 组件 + 内置星形 path（首字母 M，闭合 Z）
+  assert.match(s, /const n1_s = createRef<Path>\(\);/)
+  assert.match(s, /data=\{"M [^"]+Z"\}/)
+  // svg：内嵌字符串（JSX 里引号被 JSON 转义）
+  assert.match(s, /const n2_sv = createRef<SVG>\(\);/)
+  assert.match(s, /svg=\{"<svg viewBox=\\"/)
+  // image 资产引用：本地文件 → 项目根 URL；http URL → 原样
+  assert.match(s, /src=\{?\"\/assets\/icon\.png\"\}?/)
+  assert.match(s, /src=\{?\"https:\/\/example\.com\/a\.png\"\}?/)
+  assert.ok(warnings.some(w => w.includes('/assets/icon.png')), JSON.stringify(warnings))
+})
+
+check('codegen: image 引用未登记资产 → 警告且 src 保持原样', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [{ id: 'im', name: '图', type: 'image', props: { src: 'asset:ghost' }, tracks: [] }]
+  const { warnings } = generateProject(spec)
+  assert.ok(warnings.some(w => w.includes('未登记') && w.includes('ghost')), JSON.stringify(warnings))
+})
+
+check('codegen: M3 元素——code 高亮器与 math 公式', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [
+    { id: 'c', name: '代码', type: 'code', props: { code: 'const x: number = 1;', language: 'typescript', fontSize: 28, fill: '#fff' }, tracks: [] },
+    { id: 'c2', name: '代码2', type: 'code', props: { code: 'print("hi")', language: 'PyThOn' }, tracks: [] },
+    { id: 'c3', name: '代码3', type: 'code', props: { code: 'plain text' }, tracks: [] },
+    { id: 'm', name: '公式', type: 'math', props: { tex: 'E = mc^2' }, tracks: [] },
+  ]
+  const { files, warnings } = generateProject(spec)
+  const s = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // Code/Latex 组件映射
+  assert.match(s, /import \{makeScene2D, Code, Latex\} from '@motion-canvas\/2d'/)
+  assert.match(s, /const n0_c = createRef<Code>\(\);/)
+  assert.match(s, /const n3_m = createRef<Latex>\(\);/)
+  // language → highlighter 引用（大小写不敏感），场景 import 相应高亮器
+  assert.match(s, /highlighter=\{tsHighlighter\}/)
+  assert.match(s, /highlighter=\{pythonHighlighter\}/)
+  assert.match(s, /import \{pythonHighlighter, tsHighlighter\} from '\.\.\/code-highlight'/)
+  assert.ok(files.some(f => f.path === 'code-highlight.ts'), '带语言的 code 图层应生成 code-highlight.ts')
+  // 无 language 的 code 图层不染色、不告警
+  assert.doesNotMatch(s, /n2_c3\(\)[\s\S]*highlighter/, '无 language 的 code 图层不应挂 highlighter')
+  // math：tex 透传 + fill 兜底主题文字色
+  assert.match(s, /tex=\{"E = mc\^2"\}/)
+  assert.match(s, /fill=\{"#F2F5F7"\}/)
+  assert.ok(!warnings.some(w => w.includes('不支持高亮')), JSON.stringify(warnings))
+})
+
+check('validate: code 缺 code 内容 / math 缺 tex 有软警告，language 非字符串是硬错误', () => {
+  const mk = (layer: unknown) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [layer as never]
+    return validateSpec(spec)
+  }
+  const code = mk({ id: 'c', name: '代码', type: 'code', props: {}, tracks: [] })
+  assert.ok(code.ok)
+  if (code.ok) assert.ok(code.warnings.some(w => w.includes('props.code')), JSON.stringify(code.warnings))
+  const math = mk({ id: 'm', name: '公式', type: 'math', props: { tex: '' }, tracks: [] })
+  assert.ok(math.ok)
+  if (math.ok) assert.ok(math.warnings.some(w => w.includes('props.tex')), JSON.stringify(math.warnings))
+  assert.equal(mk({ id: 'c2', name: '代码2', type: 'code', props: { code: 'x', language: 42 }, tracks: [] }).ok, false)
+})
+
+check('枚举一致性: LAYER_TYPES 与 codegen 三张表零漂移（0.3.x O14 防线）', () => {
+  const expected = [...LAYER_TYPES].sort()
+  assert.equal(new Set(expected).size, expected.length, 'LAYER_TYPES 本身不应有重复项')
+  assert.deepEqual(Object.keys(STATIC_PROPS).sort(), expected, 'STATIC_PROPS 键应与 LAYER_TYPES 一致')
+  assert.deepEqual(Object.keys(COMPONENT).sort(), expected, 'COMPONENT 键应与 LAYER_TYPES 一致')
+  assert.deepEqual(Object.keys(ANIMATABLE_BY_TYPE).sort(), expected, 'ANIMATABLE_BY_TYPE 键应与 LAYER_TYPES 一致')
+})
+
+check('枚举一致性: anim_draft_scene 工具描述与 LAYER_TYPES 对齐（模型必读的第四张面）', () => {
+  const source = readFileSync(join(process.cwd(), 'packages/tools/src/register.ts'), 'utf8')
+  const m = source.match(/type 可选：([a-z |]+)/)
+  assert.ok(m, '工具描述应包含「type 可选：…」列表')
+  const listed = m[1]!.split('|').map(s => s.trim()).filter(Boolean)
+  assert.deepEqual(listed, [...LAYER_TYPES], '描述里的类型列表应与 LAYER_TYPES 完全一致（顺序也对齐）')
+})
+
+check('render-mc: vite 配置文件名用 .mts，从源头掐掉 CJS 弃用告警（真机日志回归）', () => {
+  const source = readFileSync(join(process.cwd(), 'packages/render-mc/src/runtime.ts'), 'utf8')
+  assert.match(source, /vite\.config\.mts/, 'workDir 的 vite 配置应写为 .mts（强制 ESM 加载）')
+  assert.doesNotMatch(source, /vite\.config\.ts/, '不应再写 .ts 配置（无 type:module 的目录会走 CJS require）')
+})
+
+check('anim_draft_scene 描述里的完整最小示例本身合法：可解析、过校验、codegen 零警告', () => {
+  // 示例是模型照抄的模板，改坏了等于发毒图稿——这条断言盯着它
+  const source = readFileSync(join(process.cwd(), 'packages/tools/src/register.ts'), 'utf8')
+  const m = source.match(/'(\{"id":"intro".*?)。'/)
+  assert.ok(m, '描述应包含以 {"id":"intro" 开头的完整最小示例')
+  const exampleScene = JSON.parse(m[1]!) as { id: string; layers: unknown[] }
+  const spec = demoSpec()
+  spec.scenes = [exampleScene as never]
+  const v = validateSpec(spec)
+  assert.ok(v.ok, JSON.stringify(v.ok ? v.warnings : v.errors))
+  const g = generateProject(spec)
+  assert.deepEqual(g.warnings, [], '示例照抄后不应产生任何 codegen 警告')
+})
+
+check('validate: group children——引用存在/不自引用/不嵌套 group 是硬错，重复归属是软警告', () => {
+  const mk = (layers: unknown[]) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = layers as never
+    return validateSpec(spec)
+  }
+  const circle = { id: 'a', name: 'A', type: 'circle', props: { size: 50, fill: '#fff' }, tracks: [] }
+  // 合法引用：本幕存在的图层
+  assert.equal(mk([circle, { id: 'g', name: '组', type: 'group', props: { children: ['a'] }, tracks: [] }]).ok, true)
+  // 引用本幕不存在的图层 → 硬错（此前只能到渲染期以警告发现，O15）
+  const ghost = mk([circle, { id: 'g', name: '组', type: 'group', props: { children: ['ghost'] }, tracks: [] }])
+  assert.equal(ghost.ok, false)
+  if (!ghost.ok) assert.ok(ghost.errors.some(e => e.message.includes('ghost')), JSON.stringify(ghost.errors))
+  // 自引用 → 硬错
+  assert.equal(mk([{ id: 'g', name: '组', type: 'group', props: { children: ['g'] }, tracks: [] }]).ok, false)
+  // group 套 group（MVP 单层分组）→ 硬错
+  assert.equal(
+    mk([
+      { id: 'g1', name: '组1', type: 'group', props: { children: [] }, tracks: [] },
+      { id: 'g2', name: '组2', type: 'group', props: { children: ['g1'] }, tracks: [] },
+    ]).ok,
+    false,
+  )
+  // children 形态非法（字符串而不是数组）→ 硬错
+  assert.equal(mk([{ id: 'g', name: '组', type: 'group', props: { children: 'a' }, tracks: [] }]).ok, false)
+  // 同一图层被两个 group 引用 → 不阻断，但给警告
+  const dupe = mk([
+    circle,
+    { id: 'g1', name: '组1', type: 'group', props: { children: ['a'] }, tracks: [] },
+    { id: 'g2', name: '组2', type: 'group', props: { children: ['a'] }, tracks: [] },
+  ])
+  assert.equal(dupe.ok, true)
+  if (dupe.ok) assert.ok(dupe.warnings.some(w => w.includes('多个 group')), JSON.stringify(dupe.warnings))
+})
+
+check('validate+codegen: 13 种图层类型三处一致（validate 放行、codegen 有映射且不崩）', () => {
+  const types: Array<{ type: LayerType; props: Record<string, unknown> }> = [
+    { type: 'text', props: { text: 'x' } },
+    { type: 'rect', props: { width: 100, height: 50, fill: '#fff' } },
+    { type: 'circle', props: { size: 80, fill: '#fff' } },
+    { type: 'image', props: { src: 'x.png' } },
+    { type: 'group', props: { children: [] } },
+    { type: 'line', props: { points: [[0, 0], [10, 10]], stroke: '#fff' } },
+    { type: 'arrow', props: { points: [[0, 0], [10, 10]], stroke: '#fff' } },
+    { type: 'ellipse', props: { width: 100, height: 60, fill: '#fff' } },
+    { type: 'polygon', props: { size: 80, fill: '#fff' } },
+    { type: 'star', props: { size: 80, fill: '#fff' } },
+    { type: 'svg', props: { svg: '<svg/>' } },
+    { type: 'code', props: { code: 'x', language: 'python' } },
+    { type: 'math', props: { tex: 'x^2' } },
+  ]
+  for (const t of types) {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [{ id: 'l0', name: 'x', type: t.type, props: t.props, tracks: [] }]
+    assert.equal(validateSpec(spec).ok, true, `${t.type} 应通过校验`)
+    const { files } = generateProject(spec)
+    assert.ok(files.some(f => f.path === 'scenes/s0-intro.tsx'), `${t.type} 应产出场景文件`)
+  }
+})
+
+await checkA('opAssetImport: 本地文件复制进资产目录并 patch 进 spec，事件带 ops/inverse；坏输入被拒', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'anim-asset-'))
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  const emitted: AnimEvent[] = []
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: tmp }
+  const src = join(tmp, 'icon.png')
+  writeFileSync(src, 'png-bytes')
+
+  const r = opAssetImport(deps, { specId: 'gd', assetId: 'icon', kind: 'image', src }, e => emitted.push(e))
+  assert.equal(r.assetId, 'icon')
+  assert.ok(isAbsolute(r.src), `回执 src 应为绝对路径，收到 ${r.src}`)
+  assert.ok(existsSync(r.src), '资产文件应被复制进插件资产目录')
+  assert.equal(store.get('gd').assets.icon.kind, 'image')
+  assert.equal(store.get('gd').assets.icon.src, r.src)
+  assert.equal(emitted[0].type, 'anim/spec-patched')
+  assert.ok(Array.isArray((emitted[0].data as { ops: unknown }).ops), '事件应带 ops 载荷')
+
+  // 坏输入：文件不存在 / 扩展名与类型不匹配 / 重复 assetId / 非法 assetId
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'x', kind: 'image', src: join(tmp, 'nope.png') }, () => {}), /文件不存在/)
+  const txt = join(tmp, 'notes.txt')
+  writeFileSync(txt, 'hi')
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'x', kind: 'image', src: txt }, () => {}), /不支持扩展名/)
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'icon', kind: 'image', src }, () => {}), /已存在/)
+  assert.throws(() => opAssetImport(deps, { specId: 'gd', assetId: 'bad id!', kind: 'image', src }, () => {}), /assetId/)
+})
+
+await checkA('opDraftScene: 真机首写错误形态自动纠正入库（repairs 进回执），修不了的错报错自带指引', async () => {
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: mkdtempSync(join(tmpdir(), 'anim-draft-')) }
+  const emitted: AnimEvent[] = []
+  // 真机实测的失败形态：ease 写字符串 + 图层漏 name + type 大小写 + 场景漏 name
+  const r = opDraftScene(deps, {
+    specId: 'gd',
+    scene: {
+      id: 's1',
+      durationMs: 1500,
+      layers: [
+        {
+          id: 'ball',
+          type: 'Circle',
+          props: { size: 80, fill: '#FFB020' },
+          tracks: [
+            { id: 'b1', target: 'props.x', keys: [{ atMs: 0, value: -400 }, { atMs: 900, value: 0, ease: 'easeInOut' }] },
+          ],
+        },
+      ],
+    } as never,
+  }, e => emitted.push(e))
+  assert.equal(r.sceneId, 's1')
+  assert.equal(r.index, 1)
+  assert.ok(r.repairs.length >= 3, JSON.stringify(r.repairs))
+  // 库里落的是纠正后的场景
+  const saved = store.get('gd').scenes[1]
+  assert.equal(saved?.name, 's1')
+  assert.equal(saved?.layers[0]?.type, 'circle')
+  assert.deepEqual(saved?.layers[0]?.tracks[0]?.keys[1]?.ease, { kind: 'easeInOut' })
+  assert.equal(emitted[0].type, 'anim/spec-patched')
+  // 修不了的错（漏 props 会丢内容，不代劳）依然硬报错，报错带最小行动指引
+  assert.throws(
+    () =>
+      opDraftScene(
+        deps,
+        { specId: 'gd', scene: { id: 's2', name: 'x', durationMs: 1000, layers: [{ id: 'z', name: 'z', type: 'text', tracks: [] }] } as never },
+        () => {},
+      ),
+    /图层必填五字段/,
+  )
+})
+
+/* ---------------------------------------------- 0.3.0 M2：anim-studio preset */
+
+check('preset: anim-studio 预设文件齐全且含 persona 方法论锚点', () => {
+  const dir = join(process.cwd(), 'config/agent-presets/anim-studio')
+  const meta = readFileSync(join(dir, 'preset.yml'), 'utf8')
+  const agent = readFileSync(join(dir, 'agent.cordis.yml'), 'utf8')
+  assert.match(meta, /^name: .+/m, 'preset.yml 应有显示名')
+  assert.match(meta, /^description: .+/m, 'preset.yml 应有描述')
+  // agent.cordis.yml 是会话层插件行列表：persona 挂官方 dsh-persona
+  assert.match(agent, /^- id: persona$/m)
+  assert.match(agent, /name: '@deepseek-ai\/dsh-persona'/)
+  // persona 文本覆盖完整工作流的关键锚点：自检→建文档→大纲→逐幕→预览→微调→出片
+  for (const anchor of ['anim_diagnose', 'anim_create_spec', 'anim_plan', 'anim_draft_scene', 'anim_preview', 'anim_patch', 'anim_render']) {
+    assert.ok(agent.includes(anchor), `persona 方法论应提到 ${anchor}`)
+  }
+  assert.ok(agent.includes('中心原点'), 'persona 应钉死中心原点坐标系契约')
+  assert.ok(agent.includes('props.end'), 'persona 应提到画线轨道 props.end')
 })
 
 /* ------------------------------------------------------------------ host */
@@ -227,6 +719,16 @@ function twoSceneSpec(): AnimationSpec {
   return spec
 }
 
+check('pickScenes: 按索引切片保序去重、原 spec 不动，越界索引可读报错（O1）', () => {
+  const spec = twoSceneSpec()
+  const picked = pickScenes(spec, [1, 0, 1])
+  assert.deepEqual(picked.scenes.map(s => s.id), ['intro', 'second'], '保持原播放顺序且去重')
+  assert.equal(spec.scenes.length, 2, '原 spec 不被修改')
+  assert.throws(() => pickScenes(spec, [2]), /越界索引/)
+  assert.throws(() => pickScenes(spec, [-1]), /越界索引/)
+  assert.equal(pickScenes(spec), spec, '省略/空 scenes 原样返回（引用相等，零拷贝）')
+})
+
 check('truncate: 幕后截断零拷贝；幕中截断收紧时长、过滤越界关键帧、原 spec 不动', () => {
   const spec = twoSceneSpec()
   assert.equal(specDurationMs(spec.scenes), 4000)
@@ -274,9 +776,78 @@ check('store: adopt 整体并入（含撤销历史）——会话恢复的语义
   assert.equal(target.get('gd').meta.title, '冒烟样片', '恢复后的撤销历史应该可用')
 })
 
+await checkA('MotionCanvasRenderer.render: scenes 抽查真正切片——生成物只含所选幕（O1 接线）', async () => {
+  const spec = twoSceneSpec()
+  let materialized: Array<{ path: string; content: string }> = []
+  const runtime = {
+    // 在 ffmpeg 合成之前停下：这里只验证「切片后的 spec 进了 codegen」这条接线
+    async materialize(files: Array<{ path: string; content: string }>) {
+      materialized = files
+      throw new Error('SENTINEL-STOP')
+    },
+    async renderProject(): Promise<never> {
+      throw new Error('unreachable')
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const renderer = new MotionCanvasRenderer({
+    runtime: runtime as never,
+    workDir: mkdtempSync(join(tmpdir(), 'anim-scenes-')),
+  })
+  await assert.rejects(
+    renderer.render({ spec, outputPath: join(tmpdir(), 'scenes-o.mp4'), scenes: [1] }, new AbortController().signal),
+    /SENTINEL-STOP/,
+  )
+  assert.deepEqual(
+    materialized.filter(f => f.path.startsWith('scenes/')).map(f => f.path),
+    ['scenes/s0-second.tsx'],
+    '只应生成所选幕的场景文件（切片后重编号为 s0）',
+  )
+  const project = materialized.find(f => f.path === 'project.tsx')!
+  assert.doesNotMatch(project.content, /intro/, '未选中的第一幕不应出现在 project 里')
+  // 越界索引在触达渲染器之前就被拒
+  await assert.rejects(
+    renderer.render({ spec, outputPath: join(tmpdir(), 'scenes-o.mp4'), scenes: [9] }, new AbortController().signal),
+    /越界索引/,
+  )
+})
+
+await checkA('MotionCanvasRenderer: preview/render 共用串行闸——并发调用不重叠（O2）', async () => {
+  let running = 0
+  let maxConcurrent = 0
+  const runtime = {
+    async materialize(): Promise<void> {},
+    async renderProject(options: { expectedFrames: number }) {
+      running += 1
+      maxConcurrent = Math.max(maxConcurrent, running)
+      await new Promise(r => setTimeout(r, 20))
+      running -= 1
+      return { frameDir: 'frame-dir', frameCount: options.expectedFrames }
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const renderer = new MotionCanvasRenderer({
+    runtime: runtime as never,
+    workDir: mkdtempSync(join(tmpdir(), 'anim-lock-')),
+  })
+  // preview 与 render 走同一个 #renderFrames 串行闸，preview 可在无 ffmpeg 环境并发验证
+  const shortSpec = twoSceneSpec()
+  shortSpec.scenes[0].durationMs = 1000
+  const [a, b] = await Promise.all([
+    renderer.preview({ spec: twoSceneSpec(), atMs: [100], scale: 4 }, new AbortController().signal),
+    renderer.preview({ spec: shortSpec, atMs: [100], scale: 4 }, new AbortController().signal),
+  ])
+  assert.equal(maxConcurrent, 1, '两个并发渲染请求不得重叠执行')
+  assert.equal(a.frames.length, 1)
+  assert.equal(b.frames.length, 1)
+})
+
 /** 渲染测试共用脚手架：假后端 + 事件收集器。 */
-function renderFixture(renderImpl: AnimRenderer['render']) {
-  const store = new SpecStore()
+function renderFixture(renderImpl: AnimRenderer['render']) {  const store = new SpecStore()
   store.create('gd', demoSpec())
   const emitted: AnimEvent[] = []
   const emit = (event: AnimEvent): void => {

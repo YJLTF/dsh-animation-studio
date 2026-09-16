@@ -18,12 +18,12 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { dirname, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
-import type { AnimationSpec } from '@dsh-anim/spec'
-import { sceneDurationMs, specDurationMs, truncateSpecAtMs } from '@dsh-anim/spec'
+import type { AnimationSpec, Asset } from '@dsh-anim/spec'
+import { safeName, sceneDurationMs, specDurationMs, truncateSpecAtMs } from '@dsh-anim/spec'
 
 import type { AnimRenderer, PreviewRequest, PreviewResult, RenderDiagnostics, RenderRequest, RenderResult } from './contract.ts'
 import { generateProject, resolveResolutionScale } from './codegen.ts'
@@ -66,11 +66,25 @@ export class MotionCanvasRenderer implements AnimRenderer {
   #runtime: MotionCanvasRuntime
   #workDir: string
   #defaultOutputPath: string | undefined
+  /** 渲染串行闸的队尾：workDir 与 vite 端口都是进程级独占资源。 */
+  #queue: Promise<unknown> = Promise.resolve()
 
   constructor(options: MotionCanvasRendererOptions) {
     this.#runtime = options.runtime
     this.#workDir = options.workDir
     this.#defaultOutputPath = options.defaultOutputPath
+  }
+
+  /**
+   * 渲染串行闸。同一个渲染器的 workDir（project/scenes 文件、output 帧目录）
+   * 与 vite 端口都只容得下一次渲染：并行第二渲会覆写文件、清掉正在产帧的
+   * 目录或撞端口（0.3.x 优化清单 O2）。preview 与 render 都从这里过——
+   * 排队期间 signal 取消的请求在轮到自己时立刻以「渲染已取消」退出。
+   */
+  #serialized<T>(step: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(step, step)
+    this.#queue = run.catch(() => undefined)
+    return run
   }
 
   async diagnose(): Promise<RenderDiagnostics> {
@@ -105,13 +119,16 @@ export class MotionCanvasRenderer implements AnimRenderer {
 
   async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
     const resolutionScale = resolveResolutionScale(request.scale)
-    const result = await this.#renderFrames(request.spec, signal, resolutionScale, request.onProgress)
+    // scenes 抽查：切片后的 spec 同时决定渲染内容与时长/帧数的报告口径。
+    // 此参数曾只进契约不进实现（模型传了 scenes 却渲出整片），见优化清单 O1。
+    const spec = pickScenes(request.spec, request.scenes)
+    const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
     const rawOutputPath = request.outputPath || this.#defaultOutputPath
     if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
     // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
     const outputPath = resolve(rawOutputPath)
 
-    const durationMs = specDurationMs(request.spec.scenes)
+    const durationMs = specDurationMs(spec.scenes)
     await encodeFrames(result.frameDir, result.expected, request.spec.meta.fps, outputPath)
     return {
       outputPath,
@@ -132,27 +149,33 @@ export class MotionCanvasRenderer implements AnimRenderer {
     resolutionScale: number,
     onProgress?: (done: number, total: number) => void,
   ): Promise<{ frameDir: string; frameCount: number; expected: number }> {
-    if (signal.aborted) throw new Error('渲染已取消')
+    return this.#serialized(async () => {
+      if (signal.aborted) throw new Error('渲染已取消')
 
-    const { files, warnings } = generateProject(spec, { resolutionScale })
-    if (warnings.length > 0) {
-      // 生成期降级必须可见：静默丢属性比渲染失败更难查
-      for (const w of warnings) console.warn(`[render-mc] ${w}`)
-    }
+      const { files, warnings } = generateProject(spec, { resolutionScale })
+      if (warnings.length > 0) {
+        // 生成期降级必须可见：静默丢属性比渲染失败更难查
+        for (const w of warnings) console.warn(`[render-mc] ${w}`)
+      }
 
-    mkdirSync(this.#workDir, { recursive: true })
-    await this.#runtime.materialize(files, this.#workDir)
+      mkdirSync(this.#workDir, { recursive: true })
+      // 资产物化：本地资产文件复制进渲染项目的 public/assets/（vite 的 public
+      // 目录 → 根 URL 可加载）。codegen 已把 image.src 的 asset:<id> 解析成
+      // /assets/<id>.<ext>，这里保证文件真的在。
+      copyAssetsToPublic(spec.assets, this.#workDir)
+      await this.#runtime.materialize(files, this.#workDir)
 
-    const totalMs = specDurationMs(spec.scenes)
-    const expected = Math.round((totalMs / 1000) * spec.meta.fps)
-    const result = await this.#runtime.renderProject({
-      workDir: this.#workDir,
-      fps: spec.meta.fps,
-      expectedFrames: expected,
-      signal,
-      onProgress,
+      const totalMs = specDurationMs(spec.scenes)
+      const expected = Math.round((totalMs / 1000) * spec.meta.fps)
+      const result = await this.#runtime.renderProject({
+        workDir: this.#workDir,
+        fps: spec.meta.fps,
+        expectedFrames: expected,
+        signal,
+        onProgress,
+      })
+      return { ...result, expected }
     })
-    return { ...result, expected }
   }
 }
 
@@ -213,6 +236,30 @@ export function resetDir(dir: string): void {
   mkdirSync(dir, { recursive: true })
 }
 
+/**
+ * 把 spec.assets 里的**本地文件**复制进渲染项目的 `public/assets/`。
+ * http(s) URL 资产不复制（浏览器直接加载）。资产缺失不抛错——
+ * codegen 已给出引用警告，渲染继续（缺图比整片渲染失败容易诊断）。
+ * 文件名用 safeName 净化，与 codegen 生成的 `/assets/<id><ext>` URL 严格一致。
+ */
+export function copyAssetsToPublic(assets: Record<string, Asset>, workDir: string): string[] {
+  const copied: string[] = []
+  const publicDir = join(workDir, 'public', 'assets')
+  mkdirSync(publicDir, { recursive: true })
+  for (const [id, asset] of Object.entries(assets)) {
+    if (/^https?:\/\//.test(asset.src)) continue
+    const ext = extname(asset.src)
+    const target = join(publicDir, `${safeName(id)}${ext}`)
+    try {
+      copyFileSync(resolve(asset.src), target)
+      copied.push(target)
+    } catch {
+      /* 资产文件缺失不拖垮渲染 */
+    }
+  }
+  return copied
+}
+
 /** 没有指定抽帧点时的默认采样：每幕的起点 + 每幕的中点（内容最丰富的时刻）。 */
 export function autoSamplePoints(spec: AnimationSpec): number[] {
   const points: number[] = []
@@ -223,4 +270,20 @@ export function autoSamplePoints(spec: AnimationSpec): number[] {
     cursor += d
   }
   return points
+}
+
+/**
+ * 按 0 基索引挑场景（保持原播放顺序、去重），`anim_render` 的 scenes 抽查。
+ * 越界索引直接报可读错误——静默渲整片比失败更误导（优化清单 O1）。
+ */
+export function pickScenes(spec: AnimationSpec, scenes?: number[]): AnimationSpec {
+  if (!scenes || scenes.length === 0) return spec
+  const total = spec.scenes.length
+  const indices = [...new Set(scenes)]
+  for (const i of indices) {
+    if (!Number.isInteger(i) || i < 0 || i >= total) {
+      throw new Error(`scenes 含越界索引 ${i}（本片共 ${total} 幕，有效范围 0 ~ ${total - 1}）`)
+    }
+  }
+  return { ...spec, scenes: indices.sort((a, b) => a - b).map(i => spec.scenes[i]!) }
 }

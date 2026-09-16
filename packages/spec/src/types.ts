@@ -57,7 +57,21 @@ export interface Track {
 
 /* ------------------------------------------------------------------ 图层 */
 
-export type LayerType = 'text' | 'rect' | 'circle' | 'image' | 'group'
+/**
+ * 图层类型的唯一权威枚举：`LayerType` 联合从这里派生，validate 的放行集合、
+ * codegen 的映射表、工具描述都以它为基准对齐（新增类型只改这一处 +
+ * 各消费表，冒烟有枚举一致性断言盯着漂移）。
+ */
+export const LAYER_TYPES = [
+  'text', 'rect', 'circle', 'ellipse', 'image',
+  'line', 'arrow',
+  'polygon', 'star',
+  'svg',
+  'code', 'math',
+  'group',
+] as const
+
+export type LayerType = (typeof LAYER_TYPES)[number]
 
 /**
  * 图层静态属性。列出的是**已知**字段（有类型提示），
@@ -97,7 +111,36 @@ export interface LayerProps {
   lineHeight?: number
   // 图片
   src?: string
+  // 线条 / 箭头（line / arrow）
+  /** 折线顶点，如 [[-200,0],[200,0]]。坐标以图层自身原点为准（中心原点契约）。 */
+  points?: Array<[number, number]>
+  /** 画线进度 0~1：只显示从起点到该比例的一段（配合轨道动画做「画线」效果）。 */
+  start?: number
+  end?: number
+  startArrow?: boolean
+  endArrow?: boolean
+  /** 箭头大小（像素），默认 24。 */
+  arrowSize?: number
+  // 正多边形（polygon）与星形（star）
+  /** polygon 的边数 / star 的角数（默认 6 / 5）。 */
+  sides?: number
+  // 内嵌 SVG（svg 图层）
+  /** 内嵌 SVG 字符串（svg 图层用，如 '<svg viewBox="0 0 100 100">…</svg>'）。 */
+  svg?: string
+  // 代码（code 图层）
+  /** 代码内容（code 图层）。字符串里用 `{{片段}}` 可给片段着色（Code 组件原生语法）。 */
+  code?: string
+  /**
+   * 代码语言（code 图层，用于语法高亮）。
+   * 支持：typescript/ts、tsx、javascript/js、jsx、python/py、json、html、css。
+   * 缺省或未知语言不染色（纯文本，仍可正常渲染）。
+   */
+  language?: string
+  // 数学公式（math 图层）
+  /** LaTeX 公式源码（math 图层），如 'E = mc^2'、'x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}'。 */
+  tex?: string
   // 分组
+  /** group 图层的成员图层 id 列表（同一场景内）。变换属性作用于整组。 */
   children?: LayerId[]
   [key: string]: JsonValue | undefined
 }
@@ -149,7 +192,11 @@ export interface ThemeToken {
 
 export interface Asset {
   kind: 'image' | 'audio' | 'font' | 'svg'
-  /** 相对项目根目录的路径，或 http(s) URL。 */
+  /**
+   * 资产文件的绝对/相对路径，或 http(s) URL。
+   * 图层 props 里用 `asset:<AssetId>` 引用（如 image.src = "asset:ball"），
+   * 渲染端物化时把本地文件复制进项目并换成可加载的 URL。
+   */
   src: string
   alt?: string
 }

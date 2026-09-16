@@ -29,7 +29,11 @@ import type { RenderDiagnostics } from './contract.ts'
 const exec = promisify(execCallback)
 
 export interface DefaultRuntimeOptions {
-  /** vite dev server 端口。 */
+  /**
+   * vite dev server 端口。缺省 0 = 随机可用端口——渲染器已有串行闸，但固定
+   * 端口仍会被同机的其他进程占走，EADDRINUSE 的裸报错对模型不可读。
+   * 需要钉端口（如防火墙白名单）时显式传入。
+   */
   port?: number
   /** 输出目录，相对 workDir。 */
   outputDir?: string
@@ -222,7 +226,7 @@ async function execQuiet(cmd: string): Promise<string> {
 /* ------------------------------------------------------------- 默认运行时 */
 
 export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): MotionCanvasRuntime {
-  const port = options.port ?? 5179
+  const port = options.port ?? 0
   const display = options.display ?? ':99'
   const chromiumPath = findChromium(options.chromiumPath)
   const outputDir = options.outputDir ?? 'output'
@@ -261,7 +265,10 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       // 塞进虚拟模块/导出器配置里按相对路径处理，而虚拟模块的相对导入与
       // exporter 的落盘目录都按 process.cwd() 解析——dsh 的 cwd 是启动目录
       // 而不是 workDir，相对路径在这里要么 500 要么把帧写到天南海北
-      const configPath = join(workDir, 'vite.config.ts')
+      // 配置用 .mts 后缀强制 Vite 走 ESM 链路加载：workDir 没有 "type": "module"
+      // 的 package.json，.ts 配置会被打包成 CJS require('vite')，每次渲染都刷
+      // 一条 CJS 弃用告警（真机日志回归发现）
+      const configPath = join(workDir, 'vite.config.mts')
       mkdirSync(workDir, { recursive: true })
       const uiModulesDir = containingModulesDir('@motion-canvas/ui')
       writeFileSync(
@@ -278,7 +285,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         // 场景源码都物化在 workDir 下，vite 的 root 必须钉在这里，
         // 否则 project: './project.tsx' 会相对进程 cwd 解析而落空
         root: workDir,
-        configFile: join(workDir, 'vite.config.ts'),
+        configFile: configPath,
         // 依赖预打包缓存必须钉在 workDir 自己身上：workDir/node_modules 是指向
         // 插件真实 node_modules 的 junction，默认 cacheDir 会落到共享缓存里，
         // 与其他项目/其他 spec 的优化产物串台，跑出双 core 实例的经典错乱
@@ -287,6 +294,10 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         logLevel: 'warn',
       })
       await server.listen()
+
+      // port 0 = 由系统分派随机可用端口：编辑器页面要按实际端口访问
+      const address = server.httpServer?.address()
+      const listenPort = typeof address === 'object' && address !== null ? address.port : port
 
       let browser
       try {
@@ -338,7 +349,7 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         }
 
         setTitle('动画渲染启动中：正在加载 Motion Canvas 编辑器…')
-        await page.goto(`http://localhost:${port}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
+        await page.goto(`http://localhost:${listenPort}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
         setTitle('编辑器加载中…')
         await page.waitForSelector('canvas', { timeout: 60_000 })
         await new Promise(r => setTimeout(r, 4000)) // 等编辑器完成场景加载

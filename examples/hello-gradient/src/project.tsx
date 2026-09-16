@@ -7,6 +7,7 @@
 import s0 from './scenes/s0-title?scene';
 import s1 from './scenes/s1-visual?scene';
 import s2 from './scenes/s2-summary?scene';
+import s3 from './scenes/s3-formula?scene';
 import {makeProject} from '@motion-canvas/core';
 
 export default makeProject({
@@ -15,5 +16,6 @@ export default makeProject({
     s0,
     s1,
     s2,
+    s3,
   ],
 });
