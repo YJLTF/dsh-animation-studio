@@ -397,7 +397,9 @@ export function reconcileOutline(outline: readonly OutlineItem[], scenes: readon
   }
   const actualMs = specDurationMs(scenes)
   const outlineMs = outline.reduce((sum, o) => sum + (typeof o.durationMs === 'number' && o.durationMs > 0 ? o.durationMs : 0), 0)
-  if (outlineMs > 0 && actualMs > 0) {
+  // 全片偏差只在幕数写齐后才有意义：草稿写到一半偏差必然大（真机验证发现
+  // 逐幕 draft 时这条提示每幕都响，属噪音）——「未写完」那条已经覆盖该语义
+  if (outlineMs > 0 && actualMs > 0 && scenes.length >= outline.length) {
     const dev = Math.abs(actualMs - outlineMs) / outlineMs
     if (dev > 0.3) {
       notes.push(`全片实际 ${actualMs}ms，大纲合计 ${outlineMs}ms（偏差 ${Math.round(dev * 100)}%）——先对齐再渲染，避免整片重渲`)

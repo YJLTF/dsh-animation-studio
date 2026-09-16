@@ -133,9 +133,12 @@ export class SpecStore {
   /** 撤销最后一次修改。 */
   undo(specId: string): PatchOp[] | undefined {
     const record = this.record(specId)
-    const last = record.history.pop()
+    const last = record.history[record.history.length - 1]
     if (!last) return undefined
+    // 先应用、成功后再出栈：inverse 万一应用失败（历史与当前态漂移，如坏
+    // 事件恢复），记录还在、spec 不动——「撤销失败还把历史丢了」比不撤销更糟
     const { value } = applyPatch(record.spec, last.inverse)
+    record.history.pop()
     record.spec = value
     record.version += 1
     return last.inverse

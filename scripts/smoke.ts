@@ -666,6 +666,21 @@ check('store: 非法补丁整批回滚；patch 的 inverse 可撤销', () => {
   void r
 })
 
+check('store: undo 失败不丢历史记录——先应用后出栈（真机排查发现的隐患）', () => {
+  const store = new SpecStore()
+  store.create('gd', demoSpec())
+  store.patch('gd', [{ op: 'replace', path: '/meta/title', value: 'v2' }])
+  // 模拟历史与当前态漂移（坏事件恢复的形态）：inverse 指向必炸的路径
+  store.record('gd').history[0].inverse = [{ op: 'remove', path: '/scenes/9' }]
+  assert.throws(() => store.undo('gd'))
+  assert.equal(store.record('gd').history.length, 1, 'undo 失败不得丢历史记录')
+  assert.equal(store.get('gd').meta.title, 'v2', 'undo 失败不得改动 spec')
+  // 修复漂移后撤销照常可用
+  store.record('gd').history[0].inverse = [{ op: 'replace', path: '/meta/title', value: '冒烟样片' }]
+  store.undo('gd')
+  assert.equal(store.get('gd').meta.title, '冒烟样片')
+})
+
 check('foldEvents: 从事件流还原 store，坏事件跳过不崩', () => {
   const store = new SpecStore()
   store.create('gd', demoSpec())
@@ -1206,8 +1221,11 @@ check('reconcileOutline: 超纲/离纲/单幕偏差/全片偏差/未写完五类
   const over = reconcileOutline(outline, [scene('a', 2000), scene('b', 3000), scene('c', 1000)])
   assert.ok(over.some(n => n.includes('超出大纲')), JSON.stringify(over))
   assert.ok(over.some(n => n.includes('c 不在大纲中')), JSON.stringify(over))
-  // 未写完是提示不是错误
-  assert.ok(reconcileOutline(outline, [scene('a', 2000)]).some(n => n.includes('未写')), JSON.stringify(reconcileOutline(outline, [scene('a', 2000)])))
+  // 未写完是提示不是错误；且草稿期幕未写齐时不发全片偏差（真机打磨：逐幕
+  // draft 时全片必然「偏差大」，这条只在写齐后讲才有意义）
+  const partial = reconcileOutline(outline, [scene('a', 2000)])
+  assert.ok(partial.some(n => n.includes('未写')), JSON.stringify(partial))
+  assert.ok(!partial.some(n => n.includes('全片实际')), `草稿期不应提示全片偏差：${JSON.stringify(partial)}`)
   // 单幕时长偏差 >50%（4000 vs 2000 → 100%）
   const deviated = reconcileOutline(outline, [scene('a', 4000), scene('b', 3000)])
   assert.ok(deviated.some(n => n.includes('a') && n.includes('偏差 100%')), JSON.stringify(deviated))

@@ -349,14 +349,48 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
         }
 
         setTitle('动画渲染启动中：正在加载 Motion Canvas 编辑器…')
+        const loadStarted = Date.now()
         await page.goto(`http://localhost:${listenPort}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
+        const gotoMs = Date.now() - loadStarted
         setTitle('编辑器加载中…')
         await page.waitForSelector('canvas', { timeout: 60_000 })
-        await new Promise(r => setTimeout(r, 4000)) // 等编辑器完成场景加载
+        const canvasMs = Date.now() - loadStarted - gotoMs
+
+        // O10 测量（0.4.0 规划 §3.1）：canvas 出现后轮询 Render 按钮实际多久
+        // 可点，量出固定 4 秒等待的真实余量。轮询上限 30 秒兜底——按钮比
+        // 4 秒晚到时多等而不是盲点失败；计时落盘 workDir/editor-timing.json
+        const buttonStarted = Date.now()
+        let buttonReady = false
+        while (Date.now() - buttonStarted < 30_000) {
+          buttonReady = await page.$$eval(
+            'button',
+            // 回调跑在浏览器页面里；TS lib 无 DOM，disabled 经 unknown 转型读取
+            buttons => buttons.some(b => (b.textContent ?? '').trim() === 'Render' && !(b as unknown as { disabled?: boolean }).disabled),
+          )
+          if (buttonReady) break
+          await new Promise(r => setTimeout(r, 100))
+        }
+        const buttonReadyMs = Date.now() - buttonStarted
+        // 保持既有 4 秒等待总量不变（编辑器内部状态稳定余量），§3.1 再按数据收
+        const remainderMs = Math.max(0, 4000 - buttonReadyMs)
+        await new Promise(r => setTimeout(r, remainderMs))
+        try {
+          writeFileSync(
+            join(workDir, 'editor-timing.json'),
+            JSON.stringify({
+              at: new Date().toISOString(),
+              gotoMs,
+              canvasMs,
+              buttonReadyMs,
+              remainderMs,
+              editorLoadTotalMs: gotoMs + canvasMs + buttonReadyMs + remainderMs,
+            }, null, 2),
+          )
+        } catch { /* 测量失败绝不影响渲染 */ }
 
         // 按文本找按钮：MC 的 class 名带构建哈希，不能依赖。
         // 用 $$eval 而不是 evaluateHandle —— 后者返回的 ElementHandle<Node> 没法直接 click。
-        const clicked = await page.$$eval('button', buttons => {
+        const clicked = buttonReady && await page.$$eval('button', buttons => {
           const target = buttons.find(b => (b.textContent ?? '').trim() === 'Render')
           if (!target) return false
           target.click()
