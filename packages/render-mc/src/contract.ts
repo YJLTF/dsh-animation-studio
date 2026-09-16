@@ -76,6 +76,11 @@ export interface RenderResult {
   warnings?: string[]
   /** 增量渲染命中情况（§3.4）；未走增量（cache:false / 空片）时缺省。 */
   incremental?: IncrementalInfo
+  /**
+   * 混入成片的音轨（§4.1）：audio 图层的 assetId 列表。空/缺省 = 无声成片。
+   * 音轨在编码/拼接之后从现行 spec 重新混入，不参与段缓存。
+   */
+  audioTracks?: string[]
 }
 
 export interface AnimRenderer {

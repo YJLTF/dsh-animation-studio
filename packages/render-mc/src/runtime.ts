@@ -494,6 +494,26 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       // 先于编辑器内部状态就绪」的极端时序；真机若复现 0 帧失败再回调此值。
       const settleMs = 300
       await new Promise(r => setTimeout(r, settleMs))
+
+      // 自定义字体就绪（0.4.0 规划 §4.2）：canvas 的 fillText 用文档字体集，
+      // @font-face 未就绪时先渲的字形退回兜底字体（豆腐块/宋体）。canvas 用法
+      // 不会触发 @font-face 懒加载，必须 FontFace.load() 显式触发后等 ready。
+      // 无自定义字体时约 1ms；整体 5 秒封顶——字体加载慢不该拖死渲染。
+      const fontsStarted = Date.now()
+      await Promise.race([
+        page.evaluate(async () => {
+          const doc = globalThis as unknown as {
+            document: { fonts?: { ready: Promise<unknown>; forEach: (cb: (face: { load: () => Promise<unknown> }) => void) => void } }
+          }
+          const fonts = doc.document.fonts
+          if (!fonts) return
+          fonts.forEach(face => { void face.load().catch(() => {}) })
+          await fonts.ready
+        }),
+        new Promise(r => setTimeout(r, 5000)),
+      ])
+      const fontsMs = Date.now() - fontsStarted
+
       try {
         writeFileSync(
           join(args.workDir, 'editor-timing.json'),
@@ -503,7 +523,8 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
             canvasMs,
             buttonReadyMs,
             settleMs,
-            editorLoadTotalMs: gotoMs + canvasMs + buttonReadyMs + settleMs,
+            fontsMs,
+            editorLoadTotalMs: gotoMs + canvasMs + buttonReadyMs + settleMs + fontsMs,
           }, null, 2),
         )
       } catch { /* 测量失败绝不影响渲染 */ }

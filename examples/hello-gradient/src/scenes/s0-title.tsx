@@ -3,7 +3,7 @@
  * 由 @dsh-anim/render-mc 从 AnimationSpec 生成，请勿手工编辑。
  */
 import {all, createRef, delay, easeInCubic, easeOutCubic} from '@motion-canvas/core';
-import {makeScene2D, Txt} from '@motion-canvas/2d';
+import {makeScene2D, Rect, Txt} from '@motion-canvas/2d';
 
 export default makeScene2D(function* (view) {
   view.fill('#101418');
@@ -12,6 +12,10 @@ export default makeScene2D(function* (view) {
   view.add(<Txt ref={n0_title_main} text={"梯度下降"} fontSize={104} fill={"#F2F5F7"} fontWeight={700} x={0} y={-60} />);
   const n1_title_sub = createRef<Txt>();
   view.add(<Txt ref={n1_title_sub} text={"沿着最陡的方向，一步步走到最低点"} fontSize={40} fill={"#8B97A3"} x={0} y={60} />);
+  const nsub0bg = createRef<Rect>();
+  view.add(<Rect ref={nsub0bg} x={0} y={286} width={728} height={76} radius={19} fill={"#8B97A3"} opacity={0} />);
+  const nsub0tx = createRef<Txt>();
+  view.add(<Txt ref={nsub0tx} x={0} y={286} text={"梯度下降：沿着最陡的方向走到最低点"} fontSize={40} fill={"#F2F5F7"} opacity={0} />);
 
   // 动画初值：让每条轨道的起点在第一时间生效
   n0_title_main().opacity(0);
@@ -26,5 +30,9 @@ export default makeScene2D(function* (view) {
     delay(0.3, n1_title_sub().opacity(1, 0.8, easeOutCubic)),
     delay(1.1, n1_title_sub().opacity(1, 1)),
     delay(2.1, n1_title_sub().opacity(0, 0.3, easeInCubic)),
+    delay(0.3, nsub0bg().opacity(0.6, 0.15)),
+    delay(0.3, nsub0tx().opacity(1, 0.15)),
+    delay(2.35, nsub0bg().opacity(0, 0.15)),
+    delay(2.35, nsub0tx().opacity(0, 0.15)),
   );
 });

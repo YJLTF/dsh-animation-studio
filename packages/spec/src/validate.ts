@@ -24,7 +24,10 @@ export type ValidateResult =
 
 // 权威枚举在 types.ts（LAYER_TYPES 常量），这里只派生放行集合，不再手抄一份
 const LAYER_TYPE_SET: ReadonlySet<string> = new Set<string>(LAYER_TYPES)
-const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring'])
+const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring', 'bounce', 'elastic', 'back'])
+// 转场 kind：入场全集；退场（Scene.exit）不支持 zoomIn（那是进入画面的形态）
+const TRANSITION_KINDS: ReadonlySet<string> = new Set(['none', 'fade', 'slideLeft', 'slideUp', 'slideRight', 'slideDown', 'zoomIn'])
+const EXIT_KINDS: ReadonlySet<string> = new Set(['none', 'fade', 'slideLeft', 'slideUp', 'slideRight', 'slideDown'])
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -162,6 +165,26 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
   // 真机教训：circle 缺尺寸 = MC 默认 0×0 不可见；line/arrow 缺 points 或
   // 描边 = 不可见。渲染端还有一层兜底（见 codegen），这里的警告进工具回执。
   const props = isRecord(l.props) ? l.props : undefined
+  if (l.type === 'audio' && props) {
+    if (typeof props.src !== 'string' || (props.src as string).trim() === '') {
+      c.warn(`图层 ${String(l.id)}（audio）未提供 src（用 "asset:<assetId>" 引用 anim_asset_import 导入的音频资产），将无声`)
+    }
+    if (props.volume !== undefined && (!isFiniteNumber(props.volume) || props.volume < 0 || props.volume > 1)) {
+      c.fail(`${p}/props/volume`, `audio 的 volume 应为 0~1 的数字，实际为 ${JSON.stringify(props.volume)}`)
+    }
+    if (props.stop !== undefined && props.stop !== 'sceneEnd' && props.stop !== 'specEnd') {
+      c.fail(`${p}/props/stop`, `audio 的 stop 应为 "sceneEnd" 或 "specEnd"，实际为 ${JSON.stringify(props.stop)}`)
+    }
+    if (props.loop !== undefined && typeof props.loop !== 'boolean') {
+      c.fail(`${p}/props/loop`, 'audio 的 loop 应为布尔值')
+    }
+    if (props.atMs !== undefined && (!isFiniteNumber(props.atMs) || props.atMs < 0)) {
+      c.fail(`${p}/props/atMs`, 'audio 的 atMs（相对本幕开头的偏移）应为 >= 0 的数字')
+    }
+    if (Array.isArray(l.tracks) && l.tracks.length > 0) {
+      c.warn(`图层 ${String(l.id)}（audio）的轨道不参与画面与时长，已忽略——音量调节请改 props.volume`)
+    }
+  }
   if (l.type === 'circle' && props) {
     const hasSize = props.size !== undefined || props.width !== undefined || props.height !== undefined || props.radius !== undefined
     if (!hasSize) c.warn(`图层 ${String(l.id)}（circle）未指定尺寸（size/width/height/radius），渲染时按默认处理，可能过小或不可见`)
@@ -273,12 +296,28 @@ function validateScene(c: Collector, path: string, s: unknown, index: number): v
       }
     }
   }
+  // 转场 kind 此前不校验（写错静默无转场）；扩族后集合仍是闭合的，写错
+  // 必须报出来——「渲染不报错、看片才发现没有转场」比显式失败更误导
   if (s.transition !== undefined) {
     const tr = s.transition
     if (!isRecord(tr)) c.fail(`${p}/transition`, 'transition 应为对象')
     else {
+      if (tr.kind !== undefined && !TRANSITION_KINDS.has(tr.kind as string)) {
+        c.fail(`${p}/transition/kind`, `未知转场类型 ${JSON.stringify(tr.kind)}，可选：${[...TRANSITION_KINDS].join(' / ')}`)
+      }
       c.num(`${p}/transition`, tr, 'durationMs', { min: 0 })
       validateEase(c, `${p}/transition/ease`, tr.ease)
+    }
+  }
+  if (s.exit !== undefined) {
+    const ex = s.exit
+    if (!isRecord(ex)) c.fail(`${p}/exit`, 'exit（幕尾退场）应为对象')
+    else {
+      if (ex.kind !== undefined && !EXIT_KINDS.has(ex.kind as string)) {
+        c.fail(`${p}/exit/kind`, `未知退场类型 ${JSON.stringify(ex.kind)}，可选：${[...EXIT_KINDS].join(' / ')}（zoomIn 仅用于入场）`)
+      }
+      c.num(`${p}/exit`, ex, 'durationMs', { min: 0 })
+      validateEase(c, `${p}/exit/ease`, ex.ease)
     }
   }
 }
@@ -333,6 +372,31 @@ export function validateSpec(input: unknown, options: { allowEmptyScenes?: boole
   // assets
   if (!isRecord(input.assets)) c.fail('/assets', 'assets 应为对象')
   else for (const [k, v] of Object.entries(input.assets)) validateAsset(c, `/assets/${k}`, v)
+
+  // narration（旁白字幕条，§4.3）：atMs 是全片绝对毫秒。时长越界只给软警告
+  //（在渲染端展开时判，这里管结构），结构错了才阻断
+  if (input.narration !== undefined) {
+    const nar = input.narration
+    if (!isRecord(nar) || !Array.isArray(nar.cues)) {
+      c.fail('/narration/cues', 'narration 应为 { cues: [...] }，cues 应为数组')
+    } else {
+      nar.cues.forEach((cue, i) => {
+        if (!isRecord(cue)) {
+          c.fail(`/narration/cues/${i}`, 'cue 应为对象 { atMs, text, durationMs? }')
+          return
+        }
+        if (!isFiniteNumber(cue.atMs) || cue.atMs < 0) {
+          c.fail(`/narration/cues/${i}/atMs`, `atMs 应为 >= 0 的数字（全片绝对毫秒），实际为 ${JSON.stringify(cue.atMs)}`)
+        }
+        if (typeof cue.text !== 'string' || cue.text.trim() === '') {
+          c.fail(`/narration/cues/${i}/text`, 'text 应为非空字符串')
+        }
+        if (cue.durationMs !== undefined && (!isFiniteNumber(cue.durationMs) || cue.durationMs <= 0)) {
+          c.fail(`/narration/cues/${i}/durationMs`, `durationMs 应为正数，实际为 ${JSON.stringify(cue.durationMs)}`)
+        }
+      })
+    }
+  }
 
   // scenes
   if (!Array.isArray(input.scenes) || (input.scenes.length === 0 && !options.allowEmptyScenes)) {

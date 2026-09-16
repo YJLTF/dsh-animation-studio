@@ -27,7 +27,8 @@ import type { AnimationSpec, Asset, Scene } from '@dsh-anim/spec'
 import { safeName, sceneDurationMs, specDurationMs, truncateSpecAtMs } from '@dsh-anim/spec'
 
 import type { AnimRenderer, PreviewRequest, PreviewResult, RenderDiagnostics, RenderRequest, RenderResult } from './contract.ts'
-import { generateProject, resolveResolutionScale } from './codegen.ts'
+import { CODEGEN_VERSION, collectAudioTracks, expandNarration, generateProject, resolveResolutionScale } from './codegen.ts'
+import type { AudioTrackCue } from './codegen.ts'
 
 const exec = promisify(execFile)
 
@@ -110,7 +111,10 @@ export class MotionCanvasRenderer implements AnimRenderer {
     const at = request.atMs?.length ? request.atMs : autoSamplePoints(request.spec)
     const cutMs = Math.max(...at)
     const totalMs = specDurationMs(request.spec.scenes)
-    const spec = cutMs > 0 && cutMs < totalMs ? truncateSpecAtMs(request.spec, cutMs) : request.spec
+    // 截短在展开之前：截短收紧幕时长，展开按收紧后的窗口裁字幕
+    const truncated = cutMs > 0 && cutMs < totalMs ? truncateSpecAtMs(request.spec, cutMs) : request.spec
+    // 旁白 cues → 各幕 subtitles（§4.3）：字幕随场景数据走，截短后的本地时段才正确
+    const spec = expandNarration(truncated).spec
     const result = await this.#renderFrames(spec, signal, resolutionScale)
     const frames = at
       .map(atMs => {
@@ -136,7 +140,9 @@ export class MotionCanvasRenderer implements AnimRenderer {
     const resolutionScale = resolveResolutionScale(request.scale)
     // scenes 抽查：切片后的 spec 同时决定渲染内容与时长/帧数的报告口径。
     // 此参数曾只进契约不进实现（模型传了 scenes 却渲出整片），见优化清单 O1。
-    const spec = pickScenes(request.spec, request.scenes)
+    // 旁白字幕在切片之后展开（§4.3）：展开产物挂在各幕 scene.subtitles 上
+    // （场景内本地毫秒），solo 切片与场景指纹因此天然携带字幕。
+    const spec = expandNarration(pickScenes(request.spec, request.scenes)).spec
     const rawOutputPath = request.outputPath || this.#defaultOutputPath
     if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
     // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
@@ -153,11 +159,13 @@ export class MotionCanvasRenderer implements AnimRenderer {
     // 场景级增量渲染（0.4.0 规划 §3.4）：逐幕指纹比对段缓存，未变幕直接
     // 复用，只渲缺失段再 concat。cache:false 强制全量；增量流程任何一步
     // 失败（切段/拼接/校验）都自动回退全量渲染——绝不静默交残片的红线
-    // 在增量路径同样成立。
+    // 在增量路径同样成立。音轨不进段缓存：mux 永远在拼接之后按现行 spec
+    // 重新执行（改音量不用清缓存）。
     let fallbackNote: string | undefined
     if (request.cache !== false && spec.scenes.length > 0 && expected > 0) {
       try {
         const incremental = await this.#renderIncremental({ spec, outputPath, fps, expected, resolutionScale, signal, onProgress: request.onProgress })
+        const audio = await this.#finishAudio(spec, outputPath, expected, fps)
         return {
           outputPath,
           frameCount: expected,
@@ -169,6 +177,8 @@ export class MotionCanvasRenderer implements AnimRenderer {
             scenesTotal: spec.scenes.length,
             scenesReused: spec.scenes.length - incremental.rendered,
           },
+          ...(audio.tracks.length > 0 ? { audioTracks: audio.tracks } : {}),
+          ...(audio.warnings.length > 0 ? { warnings: dedupeWarnings(audio.warnings) } : {}),
         }
       } catch (err) {
         if (signal.aborted) throw err
@@ -180,6 +190,8 @@ export class MotionCanvasRenderer implements AnimRenderer {
 
     const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
     await encodeFrames(result.frameDir, result.expected, fps, outputPath)
+    const audio = await this.#finishAudio(spec, outputPath, expected, fps)
+    const warnings = [fallbackNote, ...result.warnings, ...audio.warnings].filter((w): w is string => w !== undefined)
     return {
       outputPath,
       frameCount: result.frameCount,
@@ -187,13 +199,31 @@ export class MotionCanvasRenderer implements AnimRenderer {
       ...dimensions,
       renderer: this.name,
       expectedFrames: result.expected,
-      ...(fallbackNote === undefined
-        ? {}
-        : {
-            warnings: [fallbackNote, ...result.warnings],
-            incremental: { scenesTotal: spec.scenes.length, scenesReused: 0, fallback: true },
-          }),
-      ...(result.warnings.length > 0 && fallbackNote === undefined ? { warnings: result.warnings } : {}),
+      ...(fallbackNote === undefined ? {} : { incremental: { scenesTotal: spec.scenes.length, scenesReused: 0, fallback: true } }),
+      ...(warnings.length > 0 ? { warnings: dedupeWarnings(warnings) } : {}),
+      ...(audio.tracks.length > 0 ? { audioTracks: audio.tracks } : {}),
+    }
+  }
+
+  /**
+   * 音轨收尾（§4.1）：按现行 spec 收集音轨清单并 mux 进成片。混音失败只
+   * 降级警告（成片保留无声视频版本），绝不让已完成的画面渲染整单报废。
+   */
+  async #finishAudio(
+    spec: AnimationSpec,
+    outputPath: string,
+    expectedFrames: number,
+    fps: number,
+  ): Promise<{ tracks: string[]; warnings: string[] }> {
+    const { cues, warnings } = collectAudioTracks(spec)
+    if (cues.length === 0) return { tracks: [], warnings }
+    try {
+      await muxAudioTracks(outputPath, cues, expectedFrames / fps)
+      return { tracks: cues.map(c => c.assetId), warnings }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.warn(`[render-mc] 音轨合成失败，成片保留无声版本：${message}`)
+      return { tracks: [], warnings: [...warnings, `音轨合成失败，成片为无声版本：${message}`] }
     }
   }
 
@@ -292,15 +322,17 @@ export class MotionCanvasRenderer implements AnimRenderer {
       const sceneFramesOf = (i: number): number =>
         Math.round((sceneDurationMs(spec.scenes[i]!) / 1000) * fps)
 
-      // 指纹 = 场景 JSON 稳定序列化 + 渲染参数联合 hash：换 fps/分辨率/缩放
-      // 不会命中旧段（防串档）；段名带序号，幕的增删导致重编号时自然错位、
-      // 不会错拿旧段。
+      // 指纹 = 场景 JSON 稳定序列化 + 渲染参数 + codegen 产物版本联合 hash：
+      // 换 fps/分辨率/缩放不会命中旧段（防串档）；codegen 输出语义变更（
+      // CODEGEN_VERSION +1）让全体旧段自然失效；段名带序号，幕的增删导致
+      // 重编号时自然错位、不会错拿旧段。
       const hashes = spec.scenes.map(scene =>
         sceneFingerprint(scene, {
           fps,
           resolutionScale,
           width: spec.meta.size.width,
           height: spec.meta.size.height,
+          codegenVersion: CODEGEN_VERSION,
         }),
       )
       const segPaths = hashes.map((h, i) => join(segDir, `seg-${String(i).padStart(2, '0')}-r2-${h}.mp4`))
@@ -441,6 +473,65 @@ export async function concatSegments(segments: string[], outputPath: string): Pr
   }
 }
 
+/** ffmpeg 参数用的数字字面量：去尾零（1000 → "1000"、0.5 → "0.5"）。 */
+function num(v: number): string {
+  return String(Number(v.toFixed(6)))
+}
+
+/**
+ * 音轨混入（§4.1）：把音轨清单混进已编码/已拼接的视频。
+ *
+ * 每条轨：`-stream_loop -1`（仅 loop）→ `adelay` 对齐全片绝对起点 →
+ * `volume` → `atrim` 把（可能无限循环的）输入钳到 cue 时长 → 多轨 `amix`
+ * 直接求和（normalize=0，多轨叠加不自动降音量）。视频流 `-c copy` 零重编码，
+ * 音频编码 aac；输出时长用 `-t` 显式钳到视频时长——不依赖 -shortest（它在
+ * -c:v copy 下按 mux 层截断，行为不稳）。
+ *
+ * 写临时文件再原子改名：mux 失败时视频文件保持原样（无声版本完整在盘），
+ * 调用方只需降级警告，不必重渲。
+ */
+export async function muxAudioTracks(
+  videoPath: string,
+  cues: AudioTrackCue[],
+  durationSec: number,
+): Promise<void> {
+  if (cues.length === 0) return
+  const args: string[] = ['-y', '-i', videoPath]
+  const chains: string[] = []
+  const labels: string[] = []
+  cues.forEach((cue, i) => {
+    if (cue.loop) args.push('-stream_loop', '-1')
+    args.push('-i', cue.source)
+    const f: string[] = []
+    if (cue.startMs > 0) f.push(`adelay=${num(cue.startMs)}:all=1`)
+    if (cue.volume !== 1) f.push(`volume=${num(cue.volume)}`)
+    f.push(`atrim=0:${num(cue.durationMs / 1000)}`, 'asetpts=PTS-STARTPTS')
+    const label = `[a${i}]`
+    chains.push(`[${i + 1}:a]${f.join(',')}${label}`)
+    labels.push(label)
+  })
+  let finalLabel = labels[0]!
+  if (labels.length > 1) {
+    finalLabel = '[amixed]'
+    chains.push(`${labels.join('')}amix=inputs=${labels.length}:normalize=0${finalLabel}`)
+  }
+  const tmp = `${videoPath}.muxing.mp4`
+  try {
+    await exec('ffmpeg', [
+      ...args,
+      '-filter_complex', chains.join(';'),
+      '-map', '0:v', '-map', finalLabel,
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+      '-t', num(durationSec),
+      '-movflags', '+faststart',
+      tmp,
+    ])
+    renameSync(tmp, videoPath)
+  } finally {
+    rmSync(tmp, { force: true })
+  }
+}
+
 /**
  * 拼接产物时长校验（§3.4 红线的机器可查部分）：与目标帧数换算的时长偏差
  * 超过容忍值即抛错，render() 会回退全量渲染。ffprobe 不在 PATH（ffmpeg
@@ -568,12 +659,15 @@ export function stableStringify(value: unknown): string {
  * 场景指纹（§3.4）：场景内容 + 渲染参数（fps / 分辨率 / 缩放）的联合 sha256
  * 前 8 位。渲染参数入指纹防止「改参数后命中旧分辨率段」的串档；资产文件内容
  * 不入指纹（src 相同即命中，换图不换名要先删资产——文档口径）。
+ * audio 图层不参与画面（不进 codegen、音轨由 mux 按现行 spec 重混），剔除出
+ * 指纹——改音量/循环只重混音，绝不触发该幕重渲（§4.1「音轨不进段缓存」）。
  */
 export function sceneFingerprint(
   scene: Scene,
-  params: { fps: number; resolutionScale: number; width: number; height: number },
+  params: { fps: number; resolutionScale: number; width: number; height: number; codegenVersion: number },
 ): string {
-  return createHash('sha256').update(stableStringify({ scene, ...params })).digest('hex').slice(0, 8)
+  const visual: Scene = { ...scene, layers: scene.layers.filter(l => l.type !== 'audio') }
+  return createHash('sha256').update(stableStringify({ scene: visual, ...params })).digest('hex').slice(0, 8)
 }
 
 /**

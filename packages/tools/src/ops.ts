@@ -524,6 +524,8 @@ export interface RenderResultView {
   outlineNotes?: string[]
   /** 增量渲染命中情况（§3.4），未走增量时缺省。 */
   incremental?: IncrementalInfo
+  /** 混入成片的音轨（§4.1，audio 图层 assetId 列表），无声成片缺省。 */
+  audioTracks?: string[]
 }
 
 /** 后台模式下工具的即时回执：真正的渲染结果经 job_output / 完成通知到达。 */
@@ -681,6 +683,7 @@ async function startBackgroundRender(
               height: result.height,
               ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
               ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
+              ...(result.audioTracks !== undefined && result.audioTracks.length > 0 ? { audioTracks: result.audioTracks } : {}),
             },
           }))
           return { status: 'completed' as const, output: result }
@@ -754,6 +757,7 @@ async function renderSync(
         height: result.height,
         ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
         ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
+        ...(result.audioTracks !== undefined && result.audioTracks.length > 0 ? { audioTracks: result.audioTracks } : {}),
       },
     })
     return {

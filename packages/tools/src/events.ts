@@ -91,6 +91,8 @@ export interface AnimRenderFinishedData {
     scenesReused: number
     fallback?: boolean
   }
+  /** 混入成片的音轨（0.4.0 规划 §4.1，audio 图层 assetId 列表），无声成片缺省。 */
+  audioTracks?: string[]
 }
 
 /** 事件名 → 载荷。新增事件时同步更新 `plugins.d.ts` 里对 `SessionEventMap` 的合并声明。 */

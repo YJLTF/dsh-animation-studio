@@ -329,7 +329,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_create_spec',
       description:
         '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。'
-        + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。',
+        + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。'
+        + '旁白字幕：用 anim_patch 往 /narration/cues 写 [{ atMs, text, durationMs? }]（atMs 是全片绝对毫秒，durationMs 缺省按 4 字/秒估算），渲染时自动出底部字幕条。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec 标识，建议用短横线命名，如 gradient-descent' },
         title: { type: 'string', required: true, description: '片名' },
@@ -417,7 +418,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + '三条高频错误，写之前先自查：① ease 一律写对象 {"kind":"easeInOut"}，不能直接写 "easeInOut" 字符串；'
             + '② 每个图层必填五字段 id/name/type/props/tracks，一个都不能少（漏 name/tracks 工具会自动补并在回执 repairs 里回报，漏 props/type 则直接报错）；'
             + '③ type 名全小写。'
-            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group。'
+            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group | audio。'
             + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size。'
             + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）；'
             + 'arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
@@ -425,8 +426,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + 'text 支持 textAlign（left/center/right）。'
             + 'svg 用 svg 内嵌 SVG 字符串。image 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材。'
             + 'code 用 code（代码内容）+ language（typescript/ts/tsx/javascript/js/jsx/python/py/json/html/css，自动语法高亮；`{{片段}}` 可给片段着色，字符串里的 `{{` 需写 `\\{{` 转义）+ fontSize/fill。'
+            + '代码演化动画：code 图层的 props.code 轨道写多个字符串关键帧（atMs 递增），帧间自动生成逐词 diff morph——分步讲解代码的首选写法（其他图层的字符串关键帧仍是离散跳变）。'
             + 'math 用 tex 写 LaTeX 公式（如 "x = \\\\frac{-b \\\\pm \\\\sqrt{b^2-4ac}}{2a}"）。'
             + 'group 用 children: [成员图层id...] 组合，变换属性作用于整组，成员自己的动画不受影响。'
+            + 'audio 用 src:"asset:<assetId>" 引用音频资产，props 可带 volume（0~1）、loop、atMs（相对本幕开头的偏移毫秒）、stop（"sceneEnd"|"specEnd"，默认 sceneEnd）；'
+            + 'audio 不进画面，成片渲染时自动混音（回执 audioTracks 列出；anim_preview 抽帧无音频）。'
+            + '全片 BGM 的标准写法：第一幕放 audio 图层，loop:true + stop:"specEnd"。'
+            + 'transition 可选 none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn；'
+            + 'scene.exit 同形（fade/slide 系列）在幕尾整体退场，占用本幕最后 exit.durationMs。'
+            + '缓动除 linear/easeIn/easeOut/easeInOut/cubicBezier/spring 外还有 bounce（弹跳落定）/elastic（弹性超调）/back（回勾起手），强调类入场优先用这三个。'
             + '所有时间都是场景内绝对毫秒。坐标系：props.x/y 的原点在画布中心（x 右正、y 下正），画布左上角是 (-宽/2, -高/2)——不是 web 的左上角原点，居中就是 x=0,y=0；'
             + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」与缺尺寸/缺描边兜底），改完再写下一幕。',
         },
@@ -549,9 +557,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_asset_import',
       description:
         '登记一份素材（图片/svg/音频/字体）进 spec 的 assets，返回 assetId。'
-        + '本地文件会被复制进插件资产目录，http URL 原样登记。之后在图层 props 里用 src="asset:<assetId>" 引用它'
-        + '（如 image 图层）。素材是共享资源：一次导入，多个图层可用。'
-        + '注意：当前只有 image / svg 会被渲染消费；font / audio 仅登记暂不生效，先不要依赖它们出效果。',
+        + '本地文件会被复制进插件资产目录，http URL 原样登记。素材是共享资源：一次导入，多个图层可用。'
+        + '四类都已接通渲染：image/svg 在图层 props 里用 src="asset:<assetId>" 引用；'
+        + 'font 导入后 text/code 图层的 fontFamily 直接填 assetId 即生效；'
+        + 'audio 用 audio 图层的 src="asset:<assetId>" 引用（volume/loop/stop 控制播放）。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         assetId: { type: 'string', required: true, description: '资产标识（字母/数字/._-），如 gradient-icon' },
@@ -578,7 +587,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_preview',
       description:
-        '渲染若干预览帧（降分辨率）用来检查效果。传入关键时间点（毫秒）抽查，不要整片预览——慢且没必要。',
+        '渲染若干预览帧（降分辨率）用来检查效果。传入关键时间点（毫秒）抽查，不要整片预览——慢且没必要。'
+        + '注意：预览帧无音频（音频只在成片渲染尾步混入），画面效果与成片一致。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         atMs: { type: 'array', description: '抽帧时间点（绝对毫秒）', items: { type: 'number' } },
@@ -607,6 +617,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         + '长片（≥1 分钟）渲染耗时以分钟计，回执的 expectedFrames 是目标帧数；微调后用 scenes 只渲部分场景抽查能省大量时间。'
         + '段缓存默认开启：没改过的幕直接复用上次渲染结果，只重渲变更幕（回执 incremental 报告命中数）；'
         + '怀疑缓存产物有问题时传 cache:false 强制全量重渲。'
+        + 'spec 带 audio 图层时自动混音，回执 audioTracks 列出已混入的音轨。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
         + '否则同步等待到出片为止。',
       parameters: {

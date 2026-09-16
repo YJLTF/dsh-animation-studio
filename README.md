@@ -175,13 +175,13 @@ cp -r config/agent-presets/anim-studio ~/.dsh/.agent-presets/anim-studio
 | `anim_get` | 按 JSON Pointer 精确读取 spec 片段 |
 | `anim_patch` | 结构化补丁修改（唯一写途径），返回 inverse |
 | `anim_undo` | 撤销上一次修改 |
-| `anim_asset_import` | 素材登记（image/svg/audio/font）进 spec.assets；本地文件复制进插件资产目录，图层用 `src="asset:<id>"` 引用 |
-| `anim_preview` | 低分辨率抽帧检查效果（只渲染到最晚抽帧点，不渲整片） |
-| `anim_render` | 渲染成 MP4（可只渲指定场景抽查；宿主支持时转后台任务，立即返回 jobId） |
+| `anim_asset_import` | 素材登记（image/svg/audio/font 四类均接通渲染）：image/svg 用 `src="asset:<id>"` 引用；font 导入后 text/code 的 `fontFamily` 填 assetId；audio 用 audio 图层引用 |
+| `anim_preview` | 低分辨率抽帧检查效果（只渲染到最晚抽帧点，不渲整片；抽帧无音频） |
+| `anim_render` | 渲染成 MP4（段缓存默认开启，回执 `incremental` 报告命中；spec 带 audio 图层时自动混音，回执 `audioTracks` 列出；宿主支持时转后台任务） |
 
 ### 不装 DSH 也能跑：样例工程
 
-`examples/hello-gradient` 是一条 8 秒的中文教学片《梯度下降：直觉理解》，走通"IR → Motion Canvas 源码 → MP4"全链路：
+`examples/hello-gradient` 是一条约 14 秒的中文教学片《梯度下降：直觉理解》（5 幕，含 0.4.0 的代码演化/zoomIn/fade 退场/旁白字幕演示幕），走通"IR → Motion Canvas 源码 → MP4"全链路：
 
 ```bash
 pnpm install
@@ -203,10 +203,12 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 
 ## 已知限制与说明
 
-- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / code / math / group`（0.3.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；polygon 是正多边形（`sides`+`size`）、star 自动生成星形（`size`+`sides`）；svg 用内嵌 SVG 字符串；image 的 `src` 可写 `asset:<assetId>` 引用素材；code 用 `code`+`language`（typescript/ts/tsx/javascript/js/jsx/python/py/json/html/css，自动语法高亮，`{{片段}}` 可给片段着色）渲染到 Motion Canvas 的 `Code` 节点；math 用 `tex` 写 LaTeX 公式渲染到 `Latex` 节点；group 用 `children` 引用成员图层，变换作用于整组（MVP 单层分组）。不支持的属性会以警告形式降级而不是失败。
-- 旁白 / 字幕轨道是 IR 里预留的字段，本轮未实现（涉及 TTS 与音画对齐）。
+- 图层类型目前支持 `text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / code / math / group / audio`（0.4.0 起）。circle/ellipse 用 `size`（或 `width/height`，`radius` 自动换算成 size）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`start/end` 轨道画线；polygon 是正多边形（`sides`+`size`）、star 自动生成星形（`size`+`sides`）；svg 用内嵌 SVG 字符串；image 的 `src` 可写 `asset:<assetId>` 引用素材；code 用 `code`+`language`（自动语法高亮，`{{片段}}` 可给片段着色），`props.code` 轨道写多个字符串关键帧即代码演化 morph；math 用 `tex` 写 LaTeX 公式；group 用 `children` 引用成员图层；audio 用 `src:"asset:<id>"` 引用音频资产（`volume`/`loop`/`atMs`/`stop:"sceneEnd"|"specEnd"`，渲染尾步 ffmpeg 混入成片，不进画面与段缓存）。不支持的属性会以警告形式降级而不是失败。
+- 转场 `transition.kind` 支持 `none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn`；`scene.exit`（fade/slide 系列）在幕尾整体退场。缓动除 `linear/easeIn/easeOut/easeInOut/cubicBezier/spring` 外支持 `bounce/elastic/back`（强调类入场）。
+- 旁白字幕已实现（无 TTS）：`narration.cues`（`{ atMs, text, durationMs? }`，`atMs` 为全片绝对毫秒）渲染成底部字幕条；TTS 语音合成与音画对齐推迟到 0.5。
+- font 资产已接通：导入后 text/code 图层 `fontFamily` 填 assetId 即生效（渲染前会等 `document.fonts.ready`）；远端 http(s) 字体 URL 需要目标服务器允许跨源（CORS）。
 - **工作台面板是只读的**（0.2.0 M2 范围）：卡片只展示状态与产物，"撤销这步 / 预览第 N 幕"按钮驱动的最简交互（P2）未做；面板功能依赖 `dsh web`（webServer 路由 + 浏览器插槽），headless CLI 会话只有工具回执、没有卡片。
 - `/dsh-anim/media` 的放行规则是「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg`）；把产物导出到 outputDir 之外的任意位置再用面板播放，前提是该路径出现在某次工具回执里。
 - **插件事件与宿主会话日志的关系**（0.2.0 真机事故的完整记录）：宿主读回会话时对词汇表外的记录类型 fail-closed——除非该记录带 `SessionEvent.ignorable: true` 信封，否则**整个会话拒读**（报错形如「contains event type … unknown to this harness and not marked ignorable」）。宿主 0.1.6-alpha.1 的 `session.append` API 不提供 ignorable 入口，因此插件任何写入 `anim/*` 事件的构建（0.2.0-rc 之前曾以 `exec.agent.session.append` 落盘）都会让该会话无法再次加载。现行为：事件只写 sidecar；受影响的旧日志用 `python scripts/repair-session-log.py <session.v3.jsonl.zstd>` 修复（自动备份 `.bak`，给 anim/* 记录补 ignorable 标记，已用宿主自身 `Session.fromRestore` 校验通过）。若宿主未来开放 ignorable 写入，可再评估把事件切回会话日志以获得统一的会话导出/回放体验。
-- 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI），单次渲染有约 4 秒的编辑器加载等待，长片渲染耗时以分钟计。Edge 152 起新 headless 配合 SwiftShader 可完整出帧，渲染**默认 headless 无窗口**（`headless: false` 仅作调试后门，Linux 无显示时该模式需要 Xvfb）。后台渲染依赖宿主的 `ctx.jobs` 服务，无此服务时自动退回同步渲染。
+- 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI）。0.4.0 起编辑器等待动态化（Render 按钮就绪即走 + 300ms 稳定拍）、浏览器与 vite dev server 常驻复用（空闲 10 分钟回收）、工作目录按 spec 分片、段缓存默认开启（未变的幕直接复用，回执 `incremental` 报告命中；`cache:false` 强制全量），长片渲染耗时以分钟计。Edge 152 起新 headless 配合 SwiftShader 可完整出帧，渲染**默认 headless 无窗口**（`headless: false` 仅作调试后门，Linux 无显示时该模式需要 Xvfb）。后台渲染依赖宿主的 `ctx.jobs` 服务，无此服务时自动退回同步渲染。
 - `dsh plugin add` 在部分 Windows 环境会把 pnpm 转发给 cmd 执行；若 cmd 按 PATH 找不到 pnpm（本机实测出现过），直接在 profile 目录里 `pnpm add <插件路径>` 并把插件名写进 profile `package.json` 的 `dsh.profile.bundles` 即可。

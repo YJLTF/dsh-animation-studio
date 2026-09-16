@@ -59,6 +59,8 @@ export interface RenderStatusView {
     scenesReused: number
     fallback?: boolean
   }
+  /** 混入成片的音轨（§4.1），无声成片缺省。 */
+  audioTracks?: string[]
 }
 
 /**
@@ -105,6 +107,7 @@ export class RenderTracker {
       if (d.error !== undefined) job.error = d.error
       if (d.warnings !== undefined) job.warnings = d.warnings
       if (d.incremental !== undefined) job.incremental = d.incremental
+      if (d.audioTracks !== undefined) job.audioTracks = d.audioTracks
     }
   }
 

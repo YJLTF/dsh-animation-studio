@@ -139,6 +139,8 @@ export interface RenderStatus {
     scenesReused: number
     fallback?: boolean
   }
+  /** 混入成片的音轨（0.4.0 规划 §4.1），无声成片缺省。 */
+  audioTracks?: string[]
 }
 
 /** 从工作台状态 API 里找一条渲染任务；路由不可达返回 null。 */

@@ -10,9 +10,10 @@
  */
 import assert from 'node:assert/strict'
 import { execFile as execFileCallback } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
@@ -21,9 +22,14 @@ import {
   ANIMATABLE_BY_TYPE,
   COMPONENT,
   dedupeWarnings,
+  encodeFrames,
+  collectAudioTracks,
+  expandNarration,
+  generateFontsCss,
   generateProject,
   generateProjectMeta,
   MotionCanvasRenderer,
+  muxAudioTracks,
   pickScenes,
   sceneFrameBoundaries,
   sceneFingerprint,
@@ -163,13 +169,13 @@ check('validate: 报错文案可执行化——缺字段与写错值分开说，
   if (!r.ok) {
     assert.ok(r.errors.some(e => e.message.includes('{"kind":"easeInOut"}')), JSON.stringify(r.errors))
   }
-  // 未知缓动名：报错回显名字 + 可选列表
+  // 未知缓动名：报错回显名字 + 可选列表（bounce 已是合法品类，用真正不存在的名字）
   const unknownEase = demoSpec()
-  unknownEase.scenes[0].layers[0].tracks[0].keys[1].ease = { kind: 'bounce' }
+  unknownEase.scenes[0].layers[0].tracks[0].keys[1].ease = { kind: 'wobble' }
   const r2 = validateSpec(unknownEase)
   assert.equal(r2.ok, false)
   if (!r2.ok) {
-    assert.ok(r2.errors.some(e => e.message.includes('未知缓动类型 "bounce"')), JSON.stringify(r2.errors))
+    assert.ok(r2.errors.some(e => e.message.includes('未知缓动类型 "wobble"')), JSON.stringify(r2.errors))
   }
 })
 
@@ -651,6 +657,10 @@ check('preset: anim-studio 预设文件齐全且含 persona 方法论锚点', ()
   }
   assert.ok(agent.includes('中心原点'), 'persona 应钉死中心原点坐标系契约')
   assert.ok(agent.includes('props.end'), 'persona 应提到画线轨道 props.end')
+  // 0.4.0 §4.7 视频技巧包：方法论段落要盖住新能力的用法
+  for (const anchor of ['stop:"specEnd"', '{"kind":"back"}', 'props.code', 'narration/cues', 'fontFamily', 'scene.exit']) {
+    assert.ok(agent.includes(anchor), `persona 视频技巧应提到 ${anchor}`)
+  }
 })
 
 /* ------------------------------------------------------------------ host */
@@ -1348,14 +1358,25 @@ check('stableStringify: 键序无关、undefined 剔除；sceneFingerprint: 内�
   assert.equal(stableStringify({ b: 1, a: { d: 2, c: 3 } }), stableStringify({ a: { c: 3, d: 2 }, b: 1 }), '键书写顺序不影响序列化')
   assert.equal(stableStringify({ x: undefined, y: 1 }), stableStringify({ y: 1 }), 'undefined 属性不进指纹')
   assert.equal(stableStringify([1, 'a', null]), '[1,"a",null]')
-  const params = { fps: 30, resolutionScale: 1, width: 1280, height: 720 }
+  const params = { fps: 30, resolutionScale: 1, width: 1280, height: 720, codegenVersion: 1 }
   const fp = sceneFingerprint(demoSpec().scenes[0], params)
   assert.equal(sceneFingerprint(demoSpec().scenes[0], params), fp, '同内容同参数指纹一致（对象新建也一致）')
   assert.notEqual(sceneFingerprint(demoSpec().scenes[0], { ...params, fps: 60 }), fp, 'fps 入指纹防串档')
   assert.notEqual(sceneFingerprint(demoSpec().scenes[0], { ...params, resolutionScale: 0.5 }), fp, '分辨率缩放入指纹')
+  assert.notEqual(sceneFingerprint(demoSpec().scenes[0], { ...params, codegenVersion: 2 }), fp, 'codegen 产物版本入指纹——生成器语义变更使旧段失效（M2 真机教训：fill 兜底修正后旧段被吃到）')
   const changed = demoSpec().scenes[0]
   changed.layers[0].props.text = '改过的字'
   assert.notEqual(sceneFingerprint(changed, params), fp, '图层内容变化换指纹')
+  // §4.1：audio 图层不参与画面——改音量不换指纹（改音量不该触发重渲）
+  const withAudio = demoSpec().scenes[0]
+  withAudio.layers.push({ id: 'bgm', name: 'BGM', type: 'audio', props: { src: 'asset:bgm', volume: 0.5 }, tracks: [] } as never)
+  const fpAudio = sceneFingerprint(withAudio, params)
+  ;(withAudio.layers[1]!.props as { volume: number }).volume = 0.9
+  assert.equal(sceneFingerprint(withAudio, params), fpAudio, 'audio props 变化不换指纹')
+  // §4.3：字幕是场景数据——改字幕必须换指纹（否则段缓存吃到旧字幕）
+  const withSub = { ...demoSpec().scenes[0], subtitles: [{ text: '字幕', startMs: 100, endMs: 900 }] }
+  const fpSub = sceneFingerprint(withSub, params)
+  assert.notEqual(sceneFingerprint({ ...withSub, subtitles: [{ text: '改过的字幕', startMs: 100, endMs: 900 }] }, params), fpSub, '字幕变化换指纹')
 })
 
 check('sceneFrameBoundaries: 边界连续无缝、总帧数与 expected 同口径、轨道溢出时长入界（§3.4）', () => {
@@ -1533,6 +1554,360 @@ await checkA('MotionCanvasRenderer.render: 场景级增量——未变幕零渲�
   assert.equal(r4.incremental, undefined)
   assert.equal(renderCalls, 5)
 
+  rmSync(workDir, { recursive: true, force: true })
+})
+
+/* ------------------------------------------------------------ M2 效果扩面 */
+
+check('validate: audio 图层——volume/stop/loop/atMs 越界报错，缺 src 只警告，audio 轨道提醒忽略', () => {
+  const mk = (props: Record<string, unknown>, tracks: unknown[] = []) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers = [{ id: 'bgm', name: 'BGM', type: 'audio', props, tracks } as never]
+    return validateSpec(spec)
+  }
+  assert.equal(mk({ src: 'asset:bgm' }).ok, true)
+  const noSrc = mk({})
+  assert.equal(noSrc.ok, true, '缺 src 是软警告不是硬错误')
+  if (noSrc.ok) assert.ok(noSrc.warnings.some(w => w.includes('audio') && w.includes('src')), JSON.stringify(noSrc.warnings))
+  const badVolume = mk({ src: 'asset:bgm', volume: 1.5 })
+  assert.equal(badVolume.ok, false)
+  if (!badVolume.ok) assert.ok(badVolume.errors.some(e => e.path.endsWith('/props/volume')))
+  const badStop = mk({ src: 'asset:bgm', stop: 'forever' })
+  assert.equal(badStop.ok, false)
+  if (!badStop.ok) assert.ok(badStop.errors.some(e => e.path.endsWith('/props/stop')))
+  const withTracks = mk({ src: 'asset:bgm' }, [{ id: 't', target: 'props.volume', keys: [{ atMs: 0, value: 1 }] }])
+  assert.equal(withTracks.ok, true)
+  if (withTracks.ok) assert.ok(withTracks.warnings.some(w => w.includes('轨道不参与')), JSON.stringify(withTracks.warnings))
+})
+
+check('validate: 转场/退场 kind 闭合校验——写错值报错并给可选列表，zoomIn 不可作退场', () => {
+  const withTransition = (transition: unknown, exit?: unknown) => {
+    const spec = demoSpec()
+    spec.scenes[0].transition = transition as never
+    if (exit !== undefined) spec.scenes[0].exit = exit as never
+    return validateSpec(spec)
+  }
+  assert.equal(withTransition({ kind: 'flyIn', durationMs: 400 }).ok, false)
+  assert.equal(withTransition({ kind: 'zoomIn', durationMs: 400 }).ok, true)
+  assert.equal(withTransition({ kind: 'fade', durationMs: 400 }, { kind: 'slideDown', durationMs: 500 }).ok, true)
+  const badExit = withTransition({ kind: 'none', durationMs: 0 }, { kind: 'zoomIn', durationMs: 500 })
+  assert.equal(badExit.ok, false, 'zoomIn 是进入画面的形态，不可作退场')
+})
+
+check('validate: narration cues 结构——atMs 非法/空 text/durationMs 非正报错', () => {
+  const spec = demoSpec()
+  spec.narration = { cues: [{ atMs: 500, text: '你好' }, { atMs: -1, text: '坏' }, { atMs: 600, text: '' }, { atMs: 700, text: '坏', durationMs: 0 }] }
+  const r = validateSpec(spec)
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.ok(r.errors.some(e => e.path === '/narration/cues/1/atMs'))
+    assert.ok(r.errors.some(e => e.path === '/narration/cues/2/text'))
+    assert.ok(r.errors.some(e => e.path === '/narration/cues/3/durationMs'))
+  }
+})
+
+check('collectAudioTracks: 音轨清单——specEnd/loop/atMs/volume 语义、缺失资产警告降级、场景起点累计换算', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'anim-audio-'))
+  const wav = join(dir, 'bgm.wav')
+  writeFileSync(wav, 'x') // 内容无所谓，只验 existsSync 路径
+  const spec = demoSpec()
+  spec.scenes = [
+    { id: 'a', name: '一', durationMs: 2000, layers: [
+      { id: 'bgm', name: 'BGM', type: 'audio', props: { src: 'asset:bgm', volume: 0.3, loop: true, stop: 'specEnd' }, tracks: [] },
+      { id: 'ghost', name: '幽灵', type: 'audio', props: {}, tracks: [] },
+    ] },
+    { id: 'b', name: '二', durationMs: 3000, layers: [
+      { id: 'sfx', name: '音效', type: 'audio', props: { src: 'asset:sfx', atMs: 500 }, tracks: [] },
+      { id: 'loud', name: '过响', type: 'audio', props: { src: 'asset:bgm', volume: 1.5, atMs: 500 }, tracks: [] },
+    ] },
+  ] as never
+  spec.assets = {
+    bgm: { kind: 'audio', src: wav },
+    sfx: { kind: 'audio', src: join(dir, 'missing.wav') },
+  }
+  const { cues, warnings } = collectAudioTracks(spec)
+  // BGM：随第一幕起点响到片尾（2s + 3s = 5000ms）；ghost（未登记 src）与
+  // sfx（资产文件缺失）被警告降级；volume 1.5 钳制为 1 的 loud 保留
+  assert.equal(cues.length, 2, `cues: ${JSON.stringify(cues)}`)
+  assert.deepEqual(cues[0], { assetId: 'bgm', source: wav, startMs: 0, durationMs: 5000, volume: 0.3, loop: true })
+  // loud：第二幕起点 2000 + 偏移 500，响到片尾（5000），音量钳为 1
+  assert.equal(cues[1]!.startMs, 2500)
+  assert.equal(cues[1]!.durationMs, 2500)
+  assert.equal(cues[1]!.volume, 1, 'volume 1.5 已钳制为 1')
+  assert.ok(warnings.some(w => w.includes('ghost') && w.includes('src')), JSON.stringify(warnings))
+  assert.ok(warnings.some(w => w.includes('不存在')), JSON.stringify(warnings))
+  assert.ok(warnings.some(w => w.includes('1.5')), 'volume 越界钳制要给警告')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+check('collectAudioTracks: 音轨不撑长时间线——audio 轨道不参与 sceneDurationMs/specDurationMs', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [{
+    id: 'bgm', name: 'BGM', type: 'audio',
+    props: { src: 'asset:bgm' },
+    tracks: [{ id: 't', target: 'props.volume', keys: [{ atMs: 0, value: 0 }, { atMs: 90_000, value: 1 }] }],
+  } as never]
+  assert.equal(specDurationMs(spec.scenes), 2000, '写错的 audio 轨道不得把 2s 的幕撑到 90s')
+})
+
+check('generateFontsCss + project.tsx: font 资产生成 @font-face 并注入 import；无 font 资产不生成', () => {
+  const withFont = demoSpec()
+  withFont.assets = {
+    'my-font': { kind: 'font', src: 'C:/fonts/My-Font.TTF' },
+    remote: { kind: 'font', src: 'https://example.com/f/r.woff2' },
+    pic: { kind: 'image', src: 'C:/x.png' },
+  }
+  const css = generateFontsCss(withFont.assets)
+  assert.ok(css, '有 font 资产必须生成 fonts.css')
+  assert.equal(css!.path, 'fonts.css')
+  assert.ok(css!.content.includes("font-family: 'my-font'"), css!.content)
+  assert.ok(css!.content.includes("url('/assets/my-font.ttf') format('truetype')"), '文件 URL 用 safeName 净化串 + 扩展名小写')
+  assert.ok(css!.content.includes("font-family: 'remote'"), css!.content)
+  assert.ok(css!.content.includes("url('https://example.com/f/r.woff2') format('woff2')"), '远端字体 URL 原样引用并识别格式')
+  const result = generateProject(withFont)
+  const tsx = result.files.find(f => f.path === 'project.tsx')!.content
+  assert.ok(tsx.includes("import './fonts.css';"), tsx)
+  const without = generateProject(demoSpec())
+  assert.ok(!without.files.some(f => f.path === 'fonts.css'))
+  assert.ok(!without.files.find(f => f.path === 'project.tsx')!.content.includes('fonts.css'))
+})
+
+check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）——solo 切片后字幕不丢（§4.3 真机缺陷回归）', () => {
+  const spec = demoSpec()
+  spec.scenes = [
+    { id: 'a', name: '一', durationMs: 2000, layers: [] },
+    { id: 'b', name: '二', durationMs: 2000, layers: [] },
+  ] as never
+  spec.narration = {
+    cues: [
+      { atMs: 1000, text: '跨幕字幕' }, // 缺省时长 max(1200, 4字≈1000)=1200 → [1000, 2200)
+      { atMs: 5000, text: '片外 cue' }, // 全片 4000ms，起在外面
+      { atMs: 2500, text: '长'.repeat(45) },
+    ],
+  }
+  const { spec: expanded, warnings } = expandNarration(spec)
+  assert.equal(expanded.narration, undefined, '展开后顶层 narration 摘除')
+  assert.deepEqual(expanded.scenes[0]!.subtitles, [{ text: '跨幕字幕', startMs: 1000, endMs: 2000 }])
+  assert.equal(expanded.scenes[1]!.subtitles!.length, 2)
+  assert.deepEqual(expanded.scenes[1]!.subtitles![0], { text: '跨幕字幕', startMs: 0, endMs: 200 })
+  assert.equal(expanded.scenes[1]!.subtitles![1]!.text, `${'长'.repeat(39)}…`, '超长截断到 40 字含省略号')
+  assert.equal(expanded.scenes[1]!.subtitles![1]!.startMs, 500, '全局 2500ms 在幕 b 的本地时间是 500ms')
+  assert.ok(warnings.some(w => w.includes('5000')), JSON.stringify(warnings))
+  assert.ok(warnings.some(w => w.includes('40 字')), JSON.stringify(warnings))
+  // 入参不被修改
+  assert.equal(spec.scenes[0].subtitles, undefined)
+  assert.ok(spec.narration, '入参 narration 保留')
+  // 关键回归：只渲第二幕（场景级增量的 solo 切片）时字幕跟着场景走、本地时间不变——
+  // 此前在切片后的 spec 上按全局时间现场换算，第二幕字幕整条丢失
+  const solo = { ...expanded, scenes: [expanded.scenes[1]!] }
+  const tsx = generateProject(solo).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(tsx.includes('"跨幕字幕"'), `solo 切片后字幕应保留：\n${tsx}`)
+  // 跨幕字幕的幕 b 段是 [0,200)：时段 <300ms 时渐变自动减半为 100ms
+  assert.ok(tsx.includes('delay(0, nsub0tx().opacity(1, 0.1)'), tsx)
+  // 与本幕交集不足 30ms 的尾巴不生成
+  const edge = demoSpec()
+  edge.scenes = spec.scenes
+  edge.narration = { cues: [{ atMs: 1980, text: '擦边', durationMs: 40 }] }
+  assert.equal(expandNarration(edge).spec.scenes[1]!.subtitles, undefined)
+})
+
+check('codegen: 字幕条/转场扩族/exit 退场落进 TSX——绝对时间 delay、不与尾部 waitFor 打架', () => {
+  const spec = demoSpec()
+  spec.scenes[0].transition = { kind: 'zoomIn', durationMs: 500 }
+  spec.scenes[0].exit = { kind: 'fade', durationMs: 500 }
+  spec.narration = { cues: [{ atMs: 200, text: '字幕', durationMs: 1000 }] }
+  const result = generateProject(spec)
+  const tsx = result.files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  // zoomIn 入场：scale 0.6 起步 + 淡入
+  assert.ok(tsx.includes('view.scale(0.6);'), tsx)
+  assert.ok(tsx.includes('view.opacity(0);'), tsx)
+  assert.ok(tsx.includes('view.scale(1, 0.5'), tsx)
+  // exit fade：占用本幕最后 500ms（delay 1.5s 起，长 0.5s）
+  assert.ok(tsx.includes('delay(1.5, view.opacity(0, 0.5'), tsx)
+  // 退场已顶满 2s 时长：不再有尾部 waitFor 把退场后再拖一段静止
+  assert.ok(!tsx.includes('waitFor('), `exit 后不应有尾部 waitFor：\n${tsx}`)
+  // 字幕条：合成图层在 TSX 里，按时段淡入淡出（cue [200,1200]，150ms 渐变）
+  assert.ok(tsx.includes('createRef<Rect>()'), tsx)
+  assert.ok(tsx.includes('createRef<Txt>()'), tsx)
+  assert.ok(tsx.includes('"字幕"'), tsx)
+  assert.ok(tsx.includes('delay(0.2, nsub0tx().opacity(1, 0.15)'), tsx)
+  assert.ok(tsx.includes('delay(1.05, nsub0tx().opacity(0, 0.15)'), tsx)
+  // slideRight/slideDown 入场：起点与终点都相对画布中心（640/360）——
+  // 写成 0 会把整个 view（连同背景）贴到画布边缘（M2 真机抓到的潜伏缺陷）
+  const slideSpec = demoSpec()
+  slideSpec.scenes[0].transition = { kind: 'slideRight', durationMs: 400 }
+  const slideTsx = generateProject(slideSpec).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(slideTsx.includes('view.x(440);'), `slideRight 应从中心左 200px 进入：\n${slideTsx}`)
+  assert.ok(slideTsx.includes('view.y(360);'), slideTsx)
+  assert.ok(slideTsx.includes('delay(0, view.x(640, 0.4)),'), slideTsx)
+  const downSpec = demoSpec()
+  downSpec.scenes[0].transition = { kind: 'slideDown', durationMs: 400 }
+  const downTsx = generateProject(downSpec).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(downTsx.includes('view.y(160);'), downTsx)
+  assert.ok(downTsx.includes('delay(0, view.y(360, 0.4)),'), downTsx)
+  // slide 退场：滑出半幅再带 240px 余量
+  const exitSpec = demoSpec()
+  exitSpec.scenes[0].exit = { kind: 'slideLeft', durationMs: 500 }
+  const exitTsx = generateProject(exitSpec).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(exitTsx.includes('delay(1.5, view.x(-880, 0.5)),'), exitTsx)
+})
+
+check('codegen: 缓动扩族 bounce/elastic/back 映射到 MC 的 easeOut*（映射 × MC 实际导出双保险）', () => {
+  const mk = (kind: string) => {
+    const spec = demoSpec()
+    spec.scenes[0].layers[0].tracks[0].keys[1].ease = { kind } as never
+    return generateProject(spec).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  }
+  assert.ok(mk('bounce').includes(', easeOutBounce)'), mk('bounce'))
+  assert.ok(mk('elastic').includes(', easeOutElastic)'), mk('elastic'))
+  assert.ok(mk('back').includes(', easeOutBack)'), mk('back'))
+  // 防 MC 升级漂移：映射目标必须是 MC 实际导出的函数（core 无法被 node 直接
+  // import——内部有目录导入，只有 vite 能解析——所以读它的 .d.ts 静态断言）
+  const require = createRequire(import.meta.url)
+  const entry = require.resolve('@motion-canvas/core')
+  const pkgRoot = dirname(dirname(entry)) // <pkg>/lib/index.js → <pkg>
+  const decl = readFileSync(join(pkgRoot, 'lib', 'tweening', 'timingFunctions.d.ts'), 'utf8')
+  for (const fn of ['easeOutBounce', 'easeOutElastic', 'easeOutBack']) {
+    assert.ok(decl.includes(`const ${fn}`), `MC 缓动导出漂移：找不到 ${fn}（${join(pkgRoot, 'lib', 'tweening')}）`)
+  }
+})
+
+check('codegen: code morph 转正——props.code 多字符串关键帧生成带时长的补间（非离散跳变）', () => {
+  const spec = demoSpec()
+  spec.scenes[0].layers = [{
+    id: 'snippet', name: '代码', type: 'code',
+    props: { code: 'const a = 1;', language: 'typescript' },
+    tracks: [{
+      id: 'morph', target: 'props.code',
+      keys: [
+        { atMs: 0, value: 'const a = 1;' },
+        { atMs: 1000, value: 'const a = 1 + 2;', ease: { kind: 'easeInOut' } },
+      ],
+    }],
+  } as never]
+  const tsx = generateProject(spec).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  // 带时长的补间形态：code(新值, 1, easeInOutCubic)——diff morph 由 MC CodeSignal 完成
+  assert.ok(tsx.includes('.code("const a = 1 + 2;", 1, easeInOutCubic)'), `应生成带时长的 code 补间：\n${tsx}`)
+  // 初值照常落
+  assert.ok(tsx.includes('.code("const a = 1;");'), tsx)
+})
+
+check('coerceScene: 新缓动字符串（back/bounce/elastic）包装后过校验', () => {
+  const { scene, repairs } = coerceScene({
+    id: 's', name: 'S', durationMs: 1000,
+    layers: [{ id: 'l', name: 'L', type: 'rect', props: { width: 10, height: 10 }, tracks: [{ id: 't', target: 'props.opacity', keys: [{ atMs: 0, value: 0 }, { atMs: 300, value: 1, ease: 'back' }] }] }],
+  })
+  const r = validateSpec({ ...demoSpec(), scenes: [scene as never] })
+  assert.equal(r.ok, true, JSON.stringify(r.ok ? r.warnings : r.errors))
+  assert.ok(repairs.some(x => x.includes('ease')), JSON.stringify(repairs))
+})
+
+await checkA('opRender: audioTracks 进同步回执与完成事件（§4.1 契约）', async () => {
+  const { deps, emitted, emit } = renderFixture(async () => ({ ...RENDER_RESULT, audioTracks: ['bgm'] }))
+  const result = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)
+  assert.deepEqual((result as { audioTracks?: string[] }).audioTracks, ['bgm'])
+  const finished = emitted.find(e => e.type === 'anim/render-finished')!
+  assert.deepEqual((finished.data as { audioTracks?: string[] }).audioTracks, ['bgm'])
+})
+
+/** 生成单声道 16bit PCM WAV（正弦波），给 mux 冒烟当音源。 */
+function makeWav(path: string, ms: number, freq = 440, rate = 8000): void {
+  const n = Math.round((ms / 1000) * rate)
+  const data = Buffer.alloc(n * 2)
+  for (let i = 0; i < n; i++) {
+    data.writeInt16LE(Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 12000), i * 2)
+  }
+  const header = Buffer.alloc(44)
+  header.write('RIFF', 0)
+  header.writeUInt32LE(36 + data.length, 4)
+  header.write('WAVE', 8)
+  header.write('fmt ', 12)
+  header.writeUInt32LE(16, 16)
+  header.writeUInt16LE(1, 20)
+  header.writeUInt16LE(1, 22)
+  header.writeUInt32LE(rate, 24)
+  header.writeUInt32LE(rate * 2, 28)
+  header.writeUInt16LE(2, 32)
+  header.writeUInt16LE(16, 34)
+  header.write('data', 36)
+  header.writeUInt32LE(data.length, 40)
+  writeFileSync(path, Buffer.concat([header, data]))
+}
+
+/** ffprobe 读流信息；ffprobe 缺装返回 null（调用方降级为只验退出码）。 */
+async function probeStreams(path: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,duration', '-of', 'csv', path])
+    return String(stdout ?? '')
+  } catch {
+    return null
+  }
+}
+
+await checkA('muxAudioTracks: 真机 ffmpeg——adelay 对齐 + loop 钳制 + amix 求和，视频流零重编码', async () => {
+  if (!(await ffmpegAvailable())) {
+    console.log('    （本机无 ffmpeg，跳过音轨混流端到端断言）')
+    return
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'anim-mux-'))
+  const frameDir = join(dir, 'frames')
+  mkdirSync(frameDir, { recursive: true })
+  for (let i = 0; i < 10; i++) writeFileSync(join(frameDir, `${String(i).padStart(6, '0')}.png`), PNG_2X2)
+  const video = join(dir, 'video.mp4')
+  await encodeFrames(frameDir, 10, 10, video) // 10fps × 10 帧 = 1s
+  makeWav(join(dir, 'a.wav'), 300)
+  makeWav(join(dir, 'b.wav'), 2000) // 比 cue 时长长：验 atrim 钳制
+  await muxAudioTracks(video, [
+    { assetId: 'a', source: join(dir, 'a.wav'), startMs: 0, durationMs: 1000, volume: 1, loop: false },
+    { assetId: 'b', source: join(dir, 'b.wav'), startMs: 500, durationMs: 500, volume: 0.5, loop: true },
+  ], 1)
+  assert.ok(existsSync(video), '混音产物替换原视频')
+  const streams = await probeStreams(video)
+  if (streams !== null) {
+    assert.ok(streams.includes('audio'), `应有音频流：${streams}`)
+    assert.ok(streams.includes('video'), `视频流保留：${streams}`)
+  }
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await checkA('MotionCanvasRenderer.render: audio 图层端到端——增量路径拼接后自动混音，回执带 audioTracks', async () => {
+  if (!(await ffmpegAvailable())) {
+    console.log('    （本机无 ffmpeg，跳过音轨渲染端到端断言）')
+    return
+  }
+  const runtime = {
+    async materialize(): Promise<void> {},
+    async renderProject(options: { workDir: string; expectedFrames: number }) {
+      const frameDir = join(options.workDir, 'frames')
+      mkdirSync(frameDir, { recursive: true })
+      for (let i = 0; i < options.expectedFrames; i++) {
+        writeFileSync(join(frameDir, `${String(i).padStart(6, '0')}.png`), PNG_2X2)
+      }
+      return { frameDir, frameCount: options.expectedFrames }
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'anim-audio-e2e-'))
+  makeWav(join(dir, 'bgm.wav'), 2500)
+  const spec = demoSpec()
+  spec.meta.id = 'audio-e2e'
+  spec.meta.fps = 10
+  spec.assets = { bgm: { kind: 'audio', src: join(dir, 'bgm.wav') } }
+  spec.scenes[0]!.layers.push({
+    id: 'bgm', name: 'BGM', type: 'audio',
+    props: { src: 'asset:bgm', volume: 0.4, loop: true, stop: 'specEnd' },
+    tracks: [],
+  } as never)
+  const workDir = mkdtempSync(join(tmpdir(), 'anim-audio-work-'))
+  const renderer = new MotionCanvasRenderer({ runtime: runtime as never, workDir })
+  const out = join(dir, 'out.mp4')
+  const r = await renderer.render({ spec, outputPath: out }, new AbortController().signal)
+  assert.deepEqual(r.audioTracks, ['bgm'])
+  const streams = await probeStreams(out)
+  if (streams !== null) assert.ok(streams.includes('audio'), `成片应有音频流：${streams}`)
+  rmSync(dir, { recursive: true, force: true })
   rmSync(workDir, { recursive: true, force: true })
 })
 
