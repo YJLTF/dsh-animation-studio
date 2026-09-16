@@ -605,6 +605,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       description:
         '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景抽查。'
         + '长片（≥1 分钟）渲染耗时以分钟计，回执的 expectedFrames 是目标帧数；微调后用 scenes 只渲部分场景抽查能省大量时间。'
+        + '段缓存默认开启：没改过的幕直接复用上次渲染结果，只重渲变更幕（回执 incremental 报告命中数）；'
+        + '怀疑缓存产物有问题时传 cache:false 强制全量重渲。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
         + '否则同步等待到出片为止。',
       parameters: {
@@ -612,6 +614,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         outputPath: { type: 'string', description: '输出 MP4 路径，省略则用默认目录' },
         scenes: { type: 'array', description: '只渲染这些场景（0 基索引），省略则整片', items: { type: 'number' } },
         scale: { type: 'number', description: '降采样倍数：1 = 原始分辨率（默认），2 = 长宽各一半；小于 1 的值按缩放系数解释' },
+        cache: { type: 'boolean', description: '段缓存开关，默认开启；传 false 强制全量渲染（忽略所有已缓存段）' },
         renderer: { type: 'string', description: '渲染后端名，省略用默认' },
       },
       output: {

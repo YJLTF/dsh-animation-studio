@@ -18,11 +18,12 @@
  */
 
 import { execFile } from 'node:child_process'
-import { copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
-import type { AnimationSpec, Asset } from '@dsh-anim/spec'
+import type { AnimationSpec, Asset, Scene } from '@dsh-anim/spec'
 import { safeName, sceneDurationMs, specDurationMs, truncateSpecAtMs } from '@dsh-anim/spec'
 
 import type { AnimRenderer, PreviewRequest, PreviewResult, RenderDiagnostics, RenderRequest, RenderResult } from './contract.ts'
@@ -50,6 +51,11 @@ export interface MotionCanvasRuntime {
   }): Promise<{ frameDir: string; frameCount: number }>
   /** 环境自检：浏览器、WebGL、ffmpeg、中文字体。 */
   probe(): Promise<RenderDiagnostics>
+  /**
+   * 释放常驻实例（浏览器、vite dev server，§3.2）。渲染器宿主卸载时调用；
+   * 无常驻实例的实现可省略。幂等，重复调用安全。
+   */
+  dispose?(): Promise<void>
 }
 
 export interface MotionCanvasRendererOptions {
@@ -91,6 +97,11 @@ export class MotionCanvasRenderer implements AnimRenderer {
     return this.#runtime.probe()
   }
 
+  /** 释放常驻渲染实例（§3.2）。随插件卸载调用；幂等。 */
+  async dispose(): Promise<void> {
+    await this.#runtime.dispose?.()
+  }
+
   async preview(request: PreviewRequest, signal: AbortSignal): Promise<PreviewResult> {
     // 预览 = 只渲染抽样帧。Motion Canvas 没有「只渲某几帧」的入口，所以
     // 做法是：把时间线截短到最晚的抽帧点（其后的场景不渲），低分辨率出帧后
@@ -126,24 +137,63 @@ export class MotionCanvasRenderer implements AnimRenderer {
     // scenes 抽查：切片后的 spec 同时决定渲染内容与时长/帧数的报告口径。
     // 此参数曾只进契约不进实现（模型传了 scenes 却渲出整片），见优化清单 O1。
     const spec = pickScenes(request.spec, request.scenes)
-    const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
     const rawOutputPath = request.outputPath || this.#defaultOutputPath
     if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
     // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
     const outputPath = resolve(rawOutputPath)
 
+    const fps = request.spec.meta.fps
     const durationMs = specDurationMs(spec.scenes)
-    await encodeFrames(result.frameDir, result.expected, request.spec.meta.fps, outputPath)
+    const expected = Math.round((durationMs / 1000) * fps)
+    const dimensions = {
+      width: Math.round(request.spec.meta.size.width * resolutionScale),
+      height: Math.round(request.spec.meta.size.height * resolutionScale),
+    }
+
+    // 场景级增量渲染（0.4.0 规划 §3.4）：逐幕指纹比对段缓存，未变幕直接
+    // 复用，只渲缺失段再 concat。cache:false 强制全量；增量流程任何一步
+    // 失败（切段/拼接/校验）都自动回退全量渲染——绝不静默交残片的红线
+    // 在增量路径同样成立。
+    let fallbackNote: string | undefined
+    if (request.cache !== false && spec.scenes.length > 0 && expected > 0) {
+      try {
+        const incremental = await this.#renderIncremental({ spec, outputPath, fps, expected, resolutionScale, signal, onProgress: request.onProgress })
+        return {
+          outputPath,
+          frameCount: expected,
+          durationMs,
+          ...dimensions,
+          renderer: this.name,
+          expectedFrames: expected,
+          incremental: {
+            scenesTotal: spec.scenes.length,
+            scenesReused: spec.scenes.length - incremental.rendered,
+          },
+        }
+      } catch (err) {
+        if (signal.aborted) throw err
+        const message = err instanceof Error ? err.message : String(err)
+        fallbackNote = `增量渲染失败，已自动回退全量渲染：${message}`
+        console.warn(`[render-mc] ${fallbackNote}`)
+      }
+    }
+
+    const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
+    await encodeFrames(result.frameDir, result.expected, fps, outputPath)
     return {
       outputPath,
       frameCount: result.frameCount,
       durationMs,
-      // 报告实际输出尺寸：resolutionScale ≠ 1 时帧是缩过的，别谎报原始分辨率
-      width: Math.round(request.spec.meta.size.width * resolutionScale),
-      height: Math.round(request.spec.meta.size.height * resolutionScale),
+      ...dimensions,
       renderer: this.name,
       expectedFrames: result.expected,
-      ...(result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+      ...(fallbackNote === undefined
+        ? {}
+        : {
+            warnings: [fallbackNote, ...result.warnings],
+            incremental: { scenesTotal: spec.scenes.length, scenesReused: 0, fallback: true },
+          }),
+      ...(result.warnings.length > 0 && fallbackNote === undefined ? { warnings: result.warnings } : {}),
     }
   }
 
@@ -155,32 +205,143 @@ export class MotionCanvasRenderer implements AnimRenderer {
     resolutionScale: number,
     onProgress?: (done: number, total: number) => void,
   ): Promise<{ frameDir: string; frameCount: number; expected: number; warnings: string[] }> {
-    return this.#serialized(async () => {
-      if (signal.aborted) throw new Error('渲染已取消')
+    return this.#serialized(() => this.#renderFramesInternal(spec, signal, resolutionScale, onProgress))
+  }
 
-      const { files, warnings } = generateProject(spec, { resolutionScale })
-      if (warnings.length > 0) {
-        // 宿主日志保留全量（排查用）；模型与面板看到的回执版本经去重合并
-        for (const w of warnings) console.warn(`[render-mc] ${w}`)
+  async #renderFramesInternal(
+    spec: AnimationSpec,
+    signal: AbortSignal,
+    resolutionScale: number,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<{ frameDir: string; frameCount: number; expected: number; warnings: string[] }> {
+    if (signal.aborted) throw new Error('渲染已取消')
+
+    const { files, warnings } = generateProject(spec, { resolutionScale })
+    if (warnings.length > 0) {
+      // 宿主日志保留全量（排查用）；模型与面板看到的回执版本经去重合并
+      for (const w of warnings) console.warn(`[render-mc] ${w}`)
+    }
+
+    // workDir 按 specId 分子目录（0.4.0 规划 §3.3）：vite 依赖预打包缓存
+    // （<specDir>/.vite）、段缓存（<specDir>/segments）与帧产物按项目隔离，
+    // 同一 spec 的连续「patch → preview → render」不再重复付预打包成本。
+    // resetDir 只清 <specDir>/output，缓存不受影响；spec 删除不回收
+    // （与 outputDir 产物同生命周期，anim_diagnose 报告磁盘占用）。
+    const workDir = this.#specWorkDir(spec)
+    mkdirSync(workDir, { recursive: true })
+    // 资产物化：本地资产文件复制进渲染项目的 public/assets/（vite 的 public
+    // 目录 → 根 URL 可加载）。codegen 已把 image.src 的 asset:<id> 解析成
+    // /assets/<id>.<ext>，这里保证文件真的在。
+    copyAssetsToPublic(spec.assets, workDir)
+    await this.#runtime.materialize(files, workDir)
+
+    const totalMs = specDurationMs(spec.scenes)
+    const expected = Math.round((totalMs / 1000) * spec.meta.fps)
+    const result = await this.#runtime.renderProject({
+      workDir,
+      fps: spec.meta.fps,
+      expectedFrames: expected,
+      signal,
+      onProgress,
+    })
+    return { ...result, expected, warnings: dedupeWarnings(warnings) }
+  }
+
+  /** 一个 spec 的独立工作目录：缓存与中间产物按项目隔离（§3.3）。 */
+  #specWorkDir(spec: AnimationSpec): string {
+    return join(this.#workDir, safeName(spec.meta.id))
+  }
+
+  /**
+   * 场景级增量渲染（0.4.0 规划 §3.4）。
+   *
+   * 可行性根据：场景之间没有跨场景状态——转场是「本幕入场动画」、每幕是独立
+   * generator，单幕画面只由本幕 JSON + 渲染参数（fps/分辨率/缩放）决定，
+   * 所以逐幕指纹比对段缓存是安全的。资产内容变化不参与指纹（src 相同即命中，
+   * 「换图不换名要先删资产」由文档写明）；音轨永远不进段缓存（M2 的 audio
+   * mux 在 concat 之后按现行 spec 重新执行，改音量不用清缓存）。
+   *
+   * 分段方式是**逐幕独立渲染**（每缺失幕一次编辑器 solo 渲染），不是「切片
+   * 一次渲染再按声明时长切段」。真机测量（M1 验收）给出了否决后者的硬证据：
+   * MC 编辑器内每幕的实际占帧带 reset 帧/补全帧（tween 收尾的幕多一帧端点），
+   * 与 `round(时长×fps)` 预测边界恒有 ±1 漂移——按预测边界切段会让段尾裹进
+   * 下一幕的帧，下一幕改动后这帧以旧缓存泄入成片（实测：改色后上一幕段尾
+   * 残留旧色一帧）。逐幕 solo 渲染则由构造保证段内容恰好是本幕画面（实测
+   * solo 帧与整片中该幕逐帧 MAD≈0），不依赖 MC 内部边界规则，版本漂移安全。
+   *
+   * 段文件名带 `r2` 代次：第一版（切片切段）的缓存段可能含上述裹帧缺陷，
+   * 代次隔离让旧段自然失配而不误命中。
+   *
+   * 整个流程在串行闸内执行（多个 solo 渲染之间不允许被其他渲染插进来），
+   * 内部走 #renderFramesInternal 避免闸嵌套死锁。任何一步失败向上抛，
+   * 由 render() 回退全量渲染。
+   */
+  async #renderIncremental(opts: {
+    spec: AnimationSpec
+    outputPath: string
+    fps: number
+    expected: number
+    resolutionScale: number
+    signal: AbortSignal
+    onProgress?: (done: number, total: number) => void
+  }): Promise<{ rendered: number }> {
+    return this.#serialized(async () => {
+      const { spec, fps, expected, resolutionScale, signal } = opts
+      const segDir = join(this.#specWorkDir(spec), 'segments')
+      mkdirSync(segDir, { recursive: true })
+      const sceneFramesOf = (i: number): number =>
+        Math.round((sceneDurationMs(spec.scenes[i]!) / 1000) * fps)
+
+      // 指纹 = 场景 JSON 稳定序列化 + 渲染参数联合 hash：换 fps/分辨率/缩放
+      // 不会命中旧段（防串档）；段名带序号，幕的增删导致重编号时自然错位、
+      // 不会错拿旧段。
+      const hashes = spec.scenes.map(scene =>
+        sceneFingerprint(scene, {
+          fps,
+          resolutionScale,
+          width: spec.meta.size.width,
+          height: spec.meta.size.height,
+        }),
+      )
+      const segPaths = hashes.map((h, i) => join(segDir, `seg-${String(i).padStart(2, '0')}-r2-${h}.mp4`))
+      const missing = segPaths.reduce<number[]>((acc, p, i) => (existsSync(p) ? acc : [...acc, i]), [])
+
+      if (missing.length > 0) {
+        const codec = await pickVideoCodec()
+        // 进度按整片口径上报：已缓存幕的帧计入 done，面板进度条不会从 0 跳起
+        let base = 0
+        for (const i of spec.scenes.keys()) {
+          if (!missing.includes(i)) base += sceneFramesOf(i)
+        }
+        for (const i of missing) {
+          if (signal.aborted) throw new Error('渲染已取消')
+          const scene = spec.scenes[i]!
+          const sceneFrames = sceneFramesOf(i)
+          if (sceneFrames <= 0) continue // 0 帧幕不占段时间，跳过切段与拼接
+          // 单幕 solo 渲染：场景文件只含本幕，expectedFrames 即本幕帧数
+          const soloSpec: AnimationSpec = { ...spec, scenes: [scene] }
+          const progress = opts.onProgress
+            ? (done: number, total: number): void => opts.onProgress?.(base + done, expected)
+            : undefined
+          const result = await this.#renderFramesInternal(soloSpec, signal, resolutionScale, progress)
+          if (result.frameCount < sceneFrames) {
+            throw new Error(`场景 ${scene.id} solo 渲染只产出 ${result.frameCount}/${sceneFrames} 帧，不足以成段`)
+          }
+          // 原子写：先写临时名再改名——半截段绝不能留到下一轮被当成命中
+          const building = `${segPaths[i]}.building.mp4`
+          await encodeFrameRange(result.frameDir, 0, sceneFrames, fps, building, codec)
+          renameSync(building, segPaths[i]!)
+          base += sceneFrames
+        }
       }
 
-      mkdirSync(this.#workDir, { recursive: true })
-      // 资产物化：本地资产文件复制进渲染项目的 public/assets/（vite 的 public
-      // 目录 → 根 URL 可加载）。codegen 已把 image.src 的 asset:<id> 解析成
-      // /assets/<id>.<ext>，这里保证文件真的在。
-      copyAssetsToPublic(spec.assets, this.#workDir)
-      await this.#runtime.materialize(files, this.#workDir)
-
-      const totalMs = specDurationMs(spec.scenes)
-      const expected = Math.round((totalMs / 1000) * spec.meta.fps)
-      const result = await this.#runtime.renderProject({
-        workDir: this.#workDir,
-        fps: spec.meta.fps,
-        expectedFrames: expected,
-        signal,
-        onProgress,
-      })
-      return { ...result, expected, warnings: dedupeWarnings(warnings) }
+      // 拼接 + 时长校验。段间同 fps/同分辨率/同编码参数（同一台 ffmpeg 的同一
+      // 套参数），concat demuxer -c copy 零重编码
+      const parts = segPaths.filter((_, i) => sceneFramesOf(i) > 0)
+      if (parts.length === 0) throw new Error('所有场景的帧数都为 0，无可拼接内容')
+      await concatSegments(parts, opts.outputPath)
+      await validateConcatDuration(opts.outputPath, expected, fps)
+      return { rendered: missing.length }
     })
   }
 }
@@ -214,7 +375,7 @@ export async function encodeFrames(
 ): Promise<void> {
   const pattern = join(frameDir, '%06d.png')
   mkdirSync(dirname(resolve(outputPath)), { recursive: true })
-  const codec = await hasEncoder('libx264') ? 'libx264' : 'libopenh264'
+  const codec = await pickVideoCodec()
   const codecOpts = codec === 'libopenh264' ? ['-b:v', '6M'] : ['-crf', '20']
   await exec('ffmpeg', [
     '-y', '-framerate', String(fps), '-i', pattern,
@@ -224,6 +385,84 @@ export async function encodeFrames(
     '-movflags', '+faststart',
     outputPath,
   ])
+}
+
+/**
+ * 编码器选择（进程级缓存）：编码参数是段缓存拼接正确性的一半——所有段必须
+ * 同编码同参数，concat -c copy 才能零重编码。缓存成单次决策也保证同一次
+ * 增量渲染里各段与成片参数必然一致。
+ */
+let codecChoice: Promise<string> | undefined
+function pickVideoCodec(): Promise<string> {
+  codecChoice ??= hasEncoder('libx264').then(ok => (ok ? 'libx264' : 'libopenh264'))
+  return codecChoice
+}
+
+/**
+ * 把帧区间 [startFrame, startFrame + frameCount) 切成一段 MP4（§3.4）。
+ * 参数与 encodeFrames 严格一致（仅多 -start_number），保证段与整片、段与段
+ * 之间可拼接。
+ */
+export async function encodeFrameRange(
+  frameDir: string,
+  startFrame: number,
+  frameCount: number,
+  fps: number,
+  outputPath: string,
+  codec?: string,
+): Promise<void> {
+  const pattern = join(frameDir, '%06d.png')
+  mkdirSync(dirname(resolve(outputPath)), { recursive: true })
+  const c = codec ?? (await pickVideoCodec())
+  const codecOpts = c === 'libopenh264' ? ['-b:v', '6M'] : ['-crf', '20']
+  await exec('ffmpeg', [
+    '-y', '-framerate', String(fps), '-start_number', String(startFrame), '-i', pattern,
+    '-frames:v', String(frameCount),
+    '-fps_mode', 'cfr', '-r', String(fps), '-pix_fmt', 'yuv420p',
+    '-c:v', c, ...codecOpts,
+    '-movflags', '+faststart',
+    outputPath,
+  ])
+}
+
+/**
+ * 段拼接（§3.4）：concat demuxer + `-c copy` 零重编码。清单文件的转义按
+ * ffmpeg 语法处理（单引号成对翻转），Windows 盘符路径统一正斜杠。
+ */
+export async function concatSegments(segments: string[], outputPath: string): Promise<void> {
+  if (segments.length === 0) throw new Error('没有可拼接的段缓存')
+  const listPath = join(dirname(resolve(outputPath)), 'concat-list.txt')
+  const entries = segments.map(p => `file '${p.replace(/\\/g, '/').replace(/'/g, `'\\''`)}'`)
+  writeFileSync(listPath, `${entries.join('\n')}\n`, 'utf8')
+  try {
+    await exec('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', '-movflags', '+faststart', outputPath])
+  } finally {
+    rmSync(listPath, { force: true })
+  }
+}
+
+/**
+ * 拼接产物时长校验（§3.4 红线的机器可查部分）：与目标帧数换算的时长偏差
+ * 超过容忍值即抛错，render() 会回退全量渲染。ffprobe 不在 PATH（ffmpeg
+ * 精简安装）时跳过校验——concat 退出码 + 输出存在仍是最基础的闸门。
+ */
+async function validateConcatDuration(outputPath: string, expectedFrames: number, fps: number): Promise<void> {
+  let stdout: string
+  try {
+    const r = await exec('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', outputPath])
+    stdout = String(r.stdout ?? '')
+  } catch {
+    return
+  }
+  const actual = Number.parseFloat(stdout.trim())
+  if (!Number.isFinite(actual)) return
+  const expectedSec = expectedFrames / fps
+  const tolerance = Math.max(0.5, 3 / fps)
+  if (Math.abs(actual - expectedSec) > tolerance) {
+    throw new Error(
+      `拼接产物时长 ${actual.toFixed(2)}s 与预期 ${expectedSec.toFixed(2)}s 偏差超过容忍值（${tolerance.toFixed(2)}s），疑似段错位`,
+    )
+  }
 }
 
 async function hasEncoder(name: string): Promise<boolean> {
@@ -307,4 +546,55 @@ export function pickScenes(spec: AnimationSpec, scenes?: number[]): AnimationSpe
     }
   }
   return { ...spec, scenes: indices.sort((a, b) => a - b).map(i => spec.scenes[i]!) }
+}
+
+/* ------------------------------------------------- 场景级增量渲染（§3.4） */
+
+/**
+ * JSON 的键排序稳定序列化：同一份场景数据无论属性书写顺序如何，指纹一致。
+ * undefined 属性剔除（JSON.stringify 会静默丢它们，这里显式对齐语义）。
+ */
+export function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(v => stableStringify(v)).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).filter(([, v]) => v !== undefined)
+    entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/**
+ * 场景指纹（§3.4）：场景内容 + 渲染参数（fps / 分辨率 / 缩放）的联合 sha256
+ * 前 8 位。渲染参数入指纹防止「改参数后命中旧分辨率段」的串档；资产文件内容
+ * 不入指纹（src 相同即命中，换图不换名要先删资产——文档口径）。
+ */
+export function sceneFingerprint(
+  scene: Scene,
+  params: { fps: number; resolutionScale: number; width: number; height: number },
+): string {
+  return createHash('sha256').update(stableStringify({ scene, ...params })).digest('hex').slice(0, 8)
+}
+
+/**
+ * 逐幕帧边界：第 i 幕占帧 [starts[i], ends[i])。
+ *
+ * 边界按累计时长的 round 计算（不是逐幕独立 round），保证边界连续无缝、
+ * 全片总帧数与 #renderFrames 的 expected 口径完全一致——这是增量段与全量
+ * 帧列可互换的前提。场景时长用 sceneDurationMs（声明值与轨道结束时长取大，
+ * 与渲染的实际时长同口径）。
+ */
+export function sceneFrameBoundaries(scenes: Scene[], fps: number): { starts: number[]; ends: number[]; total: number } {
+  const starts: number[] = []
+  const ends: number[] = []
+  let cumMs = 0
+  let prevEnd = 0
+  for (const scene of scenes) {
+    cumMs += sceneDurationMs(scene)
+    const end = Math.round((cumMs / 1000) * fps)
+    starts.push(prevEnd)
+    ends.push(end)
+    prevEnd = end
+  }
+  return { starts, ends, total: prevEnd }
 }

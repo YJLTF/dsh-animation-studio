@@ -133,6 +133,12 @@ export interface RenderStatus {
   height?: number
   /** 生成期降级警告（同类已合并），完成卡片由此展示（0.4.0 N4）。 */
   warnings?: string[]
+  /** 增量渲染命中情况（0.4.0 规划 §3.4），未走增量时缺省。 */
+  incremental?: {
+    scenesTotal: number
+    scenesReused: number
+    fallback?: boolean
+  }
 }
 
 /** 从工作台状态 API 里找一条渲染任务；路由不可达返回 null。 */

@@ -9,7 +9,7 @@
  * 「一次修改对应一条事件」这个约束在类型上就钉死了。
  */
 
-import { copyFileSync, mkdirSync, statSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 
 import type { AnimationSpec, JsonValue, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
@@ -18,7 +18,7 @@ import type { OutlineItem } from '@dsh-anim/store'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
-import type { AnimRenderer, AnimRendererRegistry } from './render.ts'
+import type { AnimRenderer, AnimRendererRegistry, IncrementalInfo } from './render.ts'
 
 export interface AnimDeps {
   store: SpecStore
@@ -502,6 +502,8 @@ export interface RenderArgs {
   outputPath?: string
   scenes?: number[]
   scale?: number
+  /** 段缓存开关（§3.4），缺省开启；传 false 强制全量渲染。 */
+  cache?: boolean
   renderer?: string
 }
 
@@ -520,6 +522,8 @@ export interface RenderResultView {
   warnings?: string[]
   /** 大纲对账提示（中性信息），大纲不存在或完全对得上时缺省（N3）。 */
   outlineNotes?: string[]
+  /** 增量渲染命中情况（§3.4），未走增量时缺省。 */
+  incremental?: IncrementalInfo
 }
 
 /** 后台模式下工具的即时回执：真正的渲染结果经 job_output / 完成通知到达。 */
@@ -660,7 +664,7 @@ async function startBackgroundRender(
     },
     done: renderer
       .render(
-        { spec, outputPath, scenes: args.scenes, scale: args.scale, onProgress: progress },
+        { spec, outputPath, scenes: args.scenes, scale: args.scale, cache: args.cache, onProgress: progress },
         controller.signal,
       )
       .then(
@@ -676,6 +680,7 @@ async function startBackgroundRender(
               width: result.width,
               height: result.height,
               ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+              ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
             },
           }))
           return { status: 'completed' as const, output: result }
@@ -734,7 +739,7 @@ async function renderSync(
   emitRenderStart(emit, specId, 'sync', outputPath, args)
   try {
     const result = await renderer.render(
-      { spec, outputPath, scenes: args.scenes, scale: args.scale, onProgress: progress },
+      { spec, outputPath, scenes: args.scenes, scale: args.scale, cache: args.cache, onProgress: progress },
       signal,
     )
     emit({
@@ -748,6 +753,7 @@ async function renderSync(
         width: result.width,
         height: result.height,
         ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+        ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
       },
     })
     return {
@@ -857,11 +863,68 @@ export function opAssetImport(deps: AnimDeps, args: AssetImportArgs, emit: Emit)
 
 /* ------------------------------------------------------------------ 自检 */
 
+/** 段缓存占用报告的一项（§3.4 配套）。 */
+export interface CacheUsageEntry {
+  /** work 下的 spec 目录名（safeName 后的 specId）。 */
+  workDir: string
+  segments: number
+  bytes: number
+}
+
+/**
+ * 段缓存磁盘占用：各 spec 目录的段数与体积，按体积降序。
+ * 段缓存与 outputDir 产物同生命周期（spec 删除不回收，§3.3），
+ * anim_diagnose 把占用说清楚，用户才知道磁盘去哪了。
+ */
+export function scanSegmentCache(outputDir: string): { specs: CacheUsageEntry[]; totalBytes: number } {
+  const workRoot = join(outputDir, 'work')
+  const specs: CacheUsageEntry[] = []
+  let entries: string[] = []
+  try {
+    entries = readdirSync(workRoot)
+  } catch {
+    return { specs, totalBytes: 0 }
+  }
+  for (const name of entries) {
+    const segDir = join(workRoot, name, 'segments')
+    let files: string[] = []
+    try {
+      files = readdirSync(segDir).filter(f => f.endsWith('.mp4'))
+    } catch {
+      continue
+    }
+    if (files.length === 0) continue
+    let bytes = 0
+    for (const f of files) {
+      try {
+        bytes += statSync(join(segDir, f)).size
+      } catch {
+        /* 文件刚好被清了就少算它 */
+      }
+    }
+    specs.push({ workDir: name, segments: files.length, bytes })
+  }
+  specs.sort((a, b) => b.bytes - a.bytes)
+  return { specs, totalBytes: specs.reduce((acc, s) => acc + s.bytes, 0) }
+}
+
 export async function opDiagnose(
   deps: AnimDeps,
   args: { renderer?: string },
-): Promise<{ renderer: string; ok: boolean; issues: string[] }> {
+): Promise<{
+  renderer: string
+  ok: boolean
+  issues: string[]
+  /** 段缓存占用（§3.4 配套），没有任何缓存时缺省。 */
+  cache?: { specs: CacheUsageEntry[]; totalBytes: number }
+}> {
   const renderer = deps.renderers.get(args.renderer)
   const d = await renderer.diagnose()
-  return { renderer: d.renderer, ok: d.ok, issues: d.issues }
+  const cache = scanSegmentCache(deps.outputDir)
+  return {
+    renderer: d.renderer,
+    ok: d.ok,
+    issues: d.issues,
+    ...(cache.specs.length > 0 ? { cache } : {}),
+  }
 }

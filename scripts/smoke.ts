@@ -9,9 +9,11 @@
  * 用法：pnpm smoke
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { execFile as execFileCallback } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+import { promisify } from 'node:util'
 
 // 直接引用工作区源码（tsx 直跑 TS），根 package.json 因此不依赖 workspace: 协议，
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
@@ -23,7 +25,10 @@ import {
   generateProjectMeta,
   MotionCanvasRenderer,
   pickScenes,
+  sceneFrameBoundaries,
+  sceneFingerprint,
   STATIC_PROPS,
+  stableStringify,
 } from '../packages/render-mc/src/index.ts'
 import {
   applyPatch,
@@ -39,7 +44,7 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opRender, opAssetImport, opPlan, reconcileOutline } from '../packages/tools/src/ops.ts'
+import { coerceScene, opDraftScene, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
@@ -1335,6 +1340,200 @@ await checkA('opPlan: 全片时长档位提示（N5）+ 大纲落 store（N3 的
   assert.ok(!fine.pacing.some(p => p.includes('全片')), JSON.stringify(fine.pacing))
   // 大纲进状态：后续 draft/render 对账的数据源
   assert.deepEqual(store.record('gd').outline?.map(o => o.id), ['a'])
+})
+
+/* --------------------------------------------------- 0.4.0 M1：渲染产能 */
+
+check('stableStringify: 键序无关、undefined 剔除；sceneFingerprint: 内容/渲染参数敏感、结果稳定（§3.4）', () => {
+  assert.equal(stableStringify({ b: 1, a: { d: 2, c: 3 } }), stableStringify({ a: { c: 3, d: 2 }, b: 1 }), '键书写顺序不影响序列化')
+  assert.equal(stableStringify({ x: undefined, y: 1 }), stableStringify({ y: 1 }), 'undefined 属性不进指纹')
+  assert.equal(stableStringify([1, 'a', null]), '[1,"a",null]')
+  const params = { fps: 30, resolutionScale: 1, width: 1280, height: 720 }
+  const fp = sceneFingerprint(demoSpec().scenes[0], params)
+  assert.equal(sceneFingerprint(demoSpec().scenes[0], params), fp, '同内容同参数指纹一致（对象新建也一致）')
+  assert.notEqual(sceneFingerprint(demoSpec().scenes[0], { ...params, fps: 60 }), fp, 'fps 入指纹防串档')
+  assert.notEqual(sceneFingerprint(demoSpec().scenes[0], { ...params, resolutionScale: 0.5 }), fp, '分辨率缩放入指纹')
+  const changed = demoSpec().scenes[0]
+  changed.layers[0].props.text = '改过的字'
+  assert.notEqual(sceneFingerprint(changed, params), fp, '图层内容变化换指纹')
+})
+
+check('sceneFrameBoundaries: 边界连续无缝、总帧数与 expected 同口径、轨道溢出时长入界（§3.4）', () => {
+  const scene = (durationMs: number): Scene => ({
+    id: `s${durationMs}`,
+    name: String(durationMs),
+    durationMs,
+    layers: [],
+    tracks: [],
+  })
+  const scenes = [scene(1000), scene(1500), scene(500)]
+  const { starts, ends, total } = sceneFrameBoundaries(scenes, 10)
+  assert.deepEqual(starts, [0, 10, 25], '累计 round：边界连续无孔')
+  assert.deepEqual(ends, [10, 25, 30])
+  assert.equal(total, 30)
+  assert.equal(total, Math.round((specDurationMs(scenes) / 1000) * 10), '与渲染 expected 公式完全同口径')
+
+  // 轨道超出声明时长：sceneDurationMs 取大者，边界跟着实际渲染时长走
+  const overrun = demoSpec()
+  overrun.scenes[0].layers[0].tracks[0].keys.push({ atMs: 3000, value: 0 })
+  const b2 = sceneFrameBoundaries([overrun.scenes[0], scene(1000)], 10)
+  assert.equal(sceneDurationMs(overrun.scenes[0]), 3000)
+  assert.deepEqual(b2.starts, [0, 30])
+  assert.deepEqual(b2.ends, [30, 40])
+})
+
+await checkA('MotionCanvasRenderer: workDir 按 specId 分子目录——不同 spec 物化/渲染到各自目录（§3.3）', async () => {
+  const seen: string[] = []
+  const runtime = {
+    async materialize(_files: unknown, workDir: string) {
+      seen.push(workDir)
+    },
+    async renderProject(options: { workDir: string }): Promise<never> {
+      seen.push(options.workDir)
+      throw new Error('SENTINEL-STOP')
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const renderer = new MotionCanvasRenderer({ runtime: runtime as never, workDir: mkdtempSync(join(tmpdir(), 'anim-wd-')) })
+  const spec = demoSpec()
+  spec.meta.id = 'my spec' // 带空格：子目录必须经 safeName 净化
+  await assert.rejects(
+    renderer.render({ spec, outputPath: join(tmpdir(), 'wd-o.mp4') }, new AbortController().signal),
+    /SENTINEL-STOP/,
+  )
+  assert.ok(seen.length >= 2, 'materialize 与 renderProject 都应收到同一 specDir')
+  for (const dir of seen) {
+    assert.equal(dir, seen[0], '同一 spec 的物化与渲染必须落在同一目录')
+    assert.match(dir!, /my_spec$/, '子目录 = work/<safeName(meta.id)>')
+  }
+})
+
+check('scanSegmentCache: 各 spec 段数与体积按体积降序；无缓存/空目录时为零（§3.4 配套）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'anim-cache-scan-'))
+  const mk = (spec: string, files: Array<[string, number]>) => {
+    const dir = join(root, 'work', spec, 'segments')
+    mkdirSync(dir, { recursive: true })
+    for (const [f, size] of files) writeFileSync(join(dir, f), Buffer.alloc(size))
+  }
+  mk('alpha', [['seg-00-aa.mp4', 300], ['seg-01-bb.mp4', 100]])
+  mk('beta', [['seg-00-cc.mp4', 50]])
+  mkdirSync(join(root, 'work', 'empty', 'segments'), { recursive: true })
+  const scan = scanSegmentCache(root)
+  assert.deepEqual(scan.specs.map(s => s.workDir), ['alpha', 'beta'], '按体积降序，空段目录不出现')
+  assert.equal(scan.specs[0]!.segments, 2)
+  assert.equal(scan.specs[0]!.bytes, 400)
+  assert.equal(scan.totalBytes, 450)
+  assert.deepEqual(scanSegmentCache(mkdtempSync(join(tmpdir(), 'anim-cache-none-'))), { specs: [], totalBytes: 0 })
+})
+
+await checkA('opRender: 增量命中情况进回执与完成事件（§3.4）', async () => {
+  const { deps, emitted, emit } = renderFixture(async () => ({
+    ...RENDER_RESULT,
+    incremental: { scenesTotal: 3, scenesReused: 2 },
+  }))
+  const result = await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)
+  assert.deepEqual((result as { incremental?: unknown }).incremental, { scenesTotal: 3, scenesReused: 2 })
+  const finished = emitted.find(e => e.type === 'anim/render-finished')!
+  assert.deepEqual((finished.data as { incremental?: unknown }).incremental, { scenesTotal: 3, scenesReused: 2 })
+})
+
+// 2×2 的帧：yuv420p 要求宽高为偶数，1×1 会被 libx264 拒收
+const PNG_2X2 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGM4YWTEwMDAAKEAFSYCWd99v2IAAAAASUVORK5CYII=',
+  'base64',
+)
+
+const execFileAsync = promisify(execFileCallback)
+
+async function ffmpegAvailable(): Promise<boolean> {
+  try {
+    // execFile 直解析 PATH；exec 走 cmd.exe 壳，在 msys 环境下可能解析不到同一个 PATH
+    await execFileAsync('ffmpeg', ['-version'])
+    return true
+  } catch {
+    return false
+  }
+}
+
+function threeSceneSpec(): AnimationSpec {
+  const spec = demoSpec()
+  spec.meta.id = 'incr'
+  spec.meta.fps = 10
+  spec.scenes = [1, 2, 3].map(n => ({
+    id: `s${n}`,
+    name: `第${n}幕`,
+    durationMs: 1000,
+    layers: [
+      {
+        id: `l${n}`,
+        name: `层${n}`,
+        type: 'rect',
+        props: { width: 100, height: 80, x: 0, y: 0, fill: '#3388CC' },
+        tracks: [],
+      },
+    ],
+  })) as Scene[]
+  return spec
+}
+
+await checkA('MotionCanvasRenderer.render: 场景级增量——未变幕零渲染直取段缓存，改一幕只重渲一幕（§3.4）', async () => {
+  if (!(await ffmpegAvailable())) {
+    console.log('    （本机无 ffmpeg，跳过增量渲染端到端断言）')
+    return
+  }
+  let renderCalls = 0
+  const renderedScenes: number[] = []
+  const runtime = {
+    async materialize(): Promise<void> {},
+    async renderProject(options: { workDir: string; expectedFrames: number }) {
+      renderCalls++
+      const frameDir = join(options.workDir, 'frames')
+      mkdirSync(frameDir, { recursive: true })
+      for (let i = 0; i < options.expectedFrames; i++) {
+        writeFileSync(join(frameDir, `${String(i).padStart(6, '0')}.png`), PNG_2X2)
+      }
+      renderedScenes.push(options.expectedFrames)
+      return { frameDir, frameCount: options.expectedFrames }
+    },
+    async probe() {
+      return { renderer: 'motion-canvas', ok: true, issues: [] }
+    },
+  }
+  const workDir = mkdtempSync(join(tmpdir(), 'anim-incr-'))
+  const renderer = new MotionCanvasRenderer({ runtime: runtime as never, workDir })
+  const out = join(workDir, 'out.mp4')
+  const signal = new AbortController().signal
+
+  // 1) 首渲：3 幕各自 solo 渲染（每幕一次编辑器调用），段缓存建立
+  const spec = threeSceneSpec()
+  const r1 = await renderer.render({ spec, outputPath: out }, signal)
+  assert.deepEqual(r1.incremental, { scenesTotal: 3, scenesReused: 0 })
+  assert.equal(renderCalls, 3, '每幕各一次 solo 渲染')
+  assert.deepEqual(renderedScenes, [10, 10, 10], '每次 solo 渲染只含本幕帧数')
+  assert.equal(r1.frameCount, 30)
+  assert.ok(existsSync(out), '拼接产物落盘')
+
+  // 2) 内容未变（新建的等价对象）：3 幕全命中，编辑器一次都不开
+  const r2 = await renderer.render({ spec: threeSceneSpec(), outputPath: out }, signal)
+  assert.deepEqual(r2.incremental, { scenesTotal: 3, scenesReused: 3 })
+  assert.equal(renderCalls, 3, '缓存全命中时不应再进渲染器')
+
+  // 3) 改第二幕的一个属性：只 solo 重渲这一幕，另两幕继续吃缓存
+  const changed = threeSceneSpec()
+  ;(changed.scenes[1]!.layers[0]!.props as { fill: string }).fill = '#CC3333'
+  const r3 = await renderer.render({ spec: changed, outputPath: out }, signal)
+  assert.deepEqual(r3.incremental, { scenesTotal: 3, scenesReused: 2 })
+  assert.equal(renderCalls, 4)
+  assert.deepEqual(renderedScenes.slice(3), [10], '第三次渲染只渲改动的第二幕')
+
+  // 4) cache:false：强制全量，回执不带 incremental
+  const r4 = await renderer.render({ spec: threeSceneSpec(), outputPath: out, cache: false }, signal)
+  assert.equal(r4.incremental, undefined)
+  assert.equal(renderCalls, 5)
+
+  rmSync(workDir, { recursive: true, force: true })
 })
 
 console.log(`\n冒烟通过：${passed} 项`)

@@ -196,6 +196,24 @@ function RenderWarnings(props: { items: string[] }): ReactNode {
   )
 }
 
+/**
+ * 增量渲染命中情况（0.4.0 §3.4）：中性信息——「省了多少」是好事，不是告警。
+ * fallback 时也保持中性：回退本身是自动兜底，原因已在 warnings 里给到。
+ */
+function IncrementalNotes(props: { receipt: Receipt }): ReactNode {
+  const inc = props.receipt.incremental as { scenesTotal?: unknown; scenesReused?: unknown; fallback?: unknown } | undefined
+  if (!inc || typeof inc.scenesTotal !== 'number') return null
+  const total = inc.scenesTotal
+  const reused = typeof inc.scenesReused === 'number' ? inc.scenesReused : 0
+  const label =
+    inc.fallback === true
+      ? `增量流程已回退全量（${total} 幕现渲）`
+      : reused === 0
+        ? `段缓存已建立：${total} 幕全部现渲，下次未变幕将直接复用`
+        : `${reused}/${total} 幕命中段缓存，只重渲了变更幕`
+  return <Notes title="渲染提速：" items={[label]} />
+}
+
 /* ------------------------------------------------------- 建档 / 大纲 / 场景 */
 
 /** anim_create_spec：片子名片。 */
@@ -507,10 +525,12 @@ function BackgroundTicket(props: { receipt: Receipt; openFile?: ToolViewProps['o
 
   const title = `渲染${specId ? `：${specId}` : ''}`
   if (status !== null && status.status === 'completed') {
+    const statusReceipt = status as unknown as Receipt
     return (
       <Card title={`渲染完成${specId ? `：${specId}` : ''}`}>
-        <VideoPanel path={status.outputPath || outputPath} meta={status as unknown as Receipt} openFile={props.openFile} />
-        <RenderWarnings items={strings(status as unknown as Receipt, 'warnings')} />
+        <VideoPanel path={status.outputPath || outputPath} meta={statusReceipt} openFile={props.openFile} />
+        <IncrementalNotes receipt={statusReceipt} />
+        <RenderWarnings items={strings(statusReceipt, 'warnings')} />
       </Card>
     )
   }
@@ -570,6 +590,7 @@ export function RenderCard(props: ToolViewProps): ReactNode {
     <Card title={`渲染完成${str(receipt, 'specId') ? `：${str(receipt, 'specId')}` : ''}`}>
       <VideoPanel path={path} meta={receipt} openFile={props.openFile} />
       <Notes title="大纲对账：" items={strings(receipt, 'outlineNotes')} />
+      <IncrementalNotes receipt={receipt} />
       <RenderWarnings items={strings(receipt, 'warnings')} />
     </Card>
   )

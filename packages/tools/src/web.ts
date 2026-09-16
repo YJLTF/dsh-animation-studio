@@ -53,6 +53,12 @@ export interface RenderStatusView {
   error?: string
   /** 生成期降级警告（同类已合并），后台渲染的完成卡片由此展示（0.4.0 N4）。 */
   warnings?: string[]
+  /** 增量渲染命中情况（0.4.0 规划 §3.4），未走增量时缺省。 */
+  incremental?: {
+    scenesTotal: number
+    scenesReused: number
+    fallback?: boolean
+  }
 }
 
 /**
@@ -98,6 +104,7 @@ export class RenderTracker {
       if (d.height !== undefined) job.height = d.height
       if (d.error !== undefined) job.error = d.error
       if (d.warnings !== undefined) job.warnings = d.warnings
+      if (d.incremental !== undefined) job.incremental = d.incremental
     }
   }
 

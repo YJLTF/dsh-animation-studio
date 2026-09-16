@@ -85,6 +85,12 @@ export interface AnimRenderFinishedData {
    * 日志、模型与面板都看不见；与回执同源，后台渲染的完成通知也带得上。
    */
   warnings?: string[]
+  /** 增量渲染命中情况（0.4.0 规划 §3.4），未走增量时缺省。 */
+  incremental?: {
+    scenesTotal: number
+    scenesReused: number
+    fallback?: boolean
+  }
 }
 
 /** 事件名 → 载荷。新增事件时同步更新 `plugins.d.ts` 里对 `SessionEventMap` 的合并声明。 */
