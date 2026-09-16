@@ -412,10 +412,17 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
           required: true,
           description:
             '场景对象：{ id, name, durationMs, layers: [{ id, name, type, props: {...}, tracks: [{ id, target: "props.x", keys: [{ atMs, value, ease }] }] }], transition?: { kind, durationMs } }。'
+            + '完整最小示例（形状拿不准就整体照抄再改内容）：'
+            + '{"id":"intro","name":"开场","durationMs":2000,"layers":[{"id":"title","name":"标题","type":"text","props":{"text":"你好","x":0,"y":0},"tracks":[{"id":"title-fade","target":"props.opacity","keys":[{"atMs":0,"value":0},{"atMs":600,"value":1,"ease":{"kind":"easeOut"}}]}]}]}。'
+            + '三条高频错误，写之前先自查：① ease 一律写对象 {"kind":"easeInOut"}，不能直接写 "easeInOut" 字符串；'
+            + '② 每个图层必填五字段 id/name/type/props/tracks，一个都不能少（漏 name/tracks 工具会自动补并在回执 repairs 里回报，漏 props/type 则直接报错）；'
+            + '③ type 名全小写。'
             + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group。'
             + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size。'
-            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边；arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
+            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）；'
+            + 'arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
             + 'polygon 用 sides（边数）+ size（正多边形）；star 用 size + sides（角数，默认 5），形状自动生成。'
+            + 'text 支持 textAlign（left/center/right）。'
             + 'svg 用 svg 内嵌 SVG 字符串。image 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材。'
             + 'code 用 code（代码内容）+ language（typescript/ts/tsx/javascript/js/jsx/python/py/json/html/css，自动语法高亮；`{{片段}}` 可给片段着色，字符串里的 `{{` 需写 `\\{{` 转义）+ fontSize/fill。'
             + 'math 用 tex 写 LaTeX 公式（如 "x = \\\\frac{-b \\\\pm \\\\sqrt{b^2-4ac}}{2a}"）。'

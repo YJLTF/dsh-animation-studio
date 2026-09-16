@@ -154,6 +154,17 @@ function Warnings(props: { items: string[] }): ReactNode {
   return <div style={warnBox}>{props.items.map((item, i) => <div key={i}>{item}</div>)}</div>
 }
 
+/** 工具边界自动纠正清单：中性色——是「已替你修好」的信息，不是警告。 */
+function Repairs(props: { items: string[] }): ReactNode {
+  if (props.items.length === 0) return null
+  return (
+    <div style={muted}>
+      <div>已自动纠正：</div>
+      {props.items.map((item, i) => <div key={i}>{item}</div>)}
+    </div>
+  )
+}
+
 /* ------------------------------------------------------- 建档 / 大纲 / 场景 */
 
 /** anim_create_spec：片子名片。 */
@@ -218,6 +229,7 @@ export function SceneCard(props: ToolViewProps): ReactNode {
         )}
         <span style={muted}>{formatMs(num(receipt, 'durationMs'))}</span>
       </div>
+      <Repairs items={strings(receipt, 'repairs')} />
       <Warnings items={strings(receipt, 'warnings')} />
     </Card>
   )

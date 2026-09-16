@@ -13,7 +13,7 @@ import { copyFileSync, mkdirSync, statSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 
 import type { AnimationSpec, JsonValue, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
-import { readAt, safeName, specDurationMs, validateSpec } from '@dsh-anim/spec'
+import { LAYER_TYPES, readAt, safeName, specDurationMs, validateSpec } from '@dsh-anim/spec'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
@@ -227,38 +227,150 @@ export type DraftSceneResult = {
   sceneCount: number
   durationMs: number
   inverse: PatchOp[]
+  /** 边界自动纠正清单：哪些机械错误被工具改掉了。模型应读到并下次自己写对。 */
+  repairs: string[]
   /** 校验软警告（时长超声明、疑似左上角坐标系等）。模型必须读到并自行处理。 */
   warnings: string[]
 }
 
+/* ----------------------------------------------------- 草稿边界自动纠错 */
+
+export interface CoercedScene {
+  scene: Scene
+  /** 人话版修复清单，每条说清改了什么、为什么。 */
+  repairs: string[]
+}
+
+const LAYER_TYPE_SET: ReadonlySet<string> = new Set(LAYER_TYPES)
+
+/**
+ * 场景草稿的机械错误自动纠正（真机首写 `anim_draft_scene` 高频失败四类）：
+ * 1. `ease: "easeOut"` 写成字符串 → 包装成 `{ kind: 'easeOut' }`。未知缓动名
+ *    也一并包装——这样校验器报的是「未知缓动类型 "bounce"，可选：…」而不是
+ *    一句「应为对象」，模型一眼知道错在值不在形态；
+ * 2. 图层 `type` 大小写写飘（"Text"/"Circle"）→ 按不区分大小写匹配 LAYER_TYPES 纠正；
+ * 3. 漏纯展示字段 `name`（图层/场景）→ 用 id 补上；漏 `tracks`（静态图层本就合法）
+ *    → 补空数组；
+ * 4. `props.strokeWidth`（SVG 习惯名）→ 改写为规范名 `props.lineWidth`。
+ *
+ * 只修「无歧义、不丢内容」的错；拿不准的一律不动，留给 validateSpec 报错
+ * （文案自带可执行指引）。输入先深拷贝，绝不改调用方的参数对象。
+ */
+export function coerceScene(input: unknown): CoercedScene {
+  const repairs: string[] = []
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    // 场景本身不是对象：无从纠起，原样交校验器报「场景应为对象」
+    return { scene: input as Scene, repairs }
+  }
+  const scene = structuredClone(input) as Record<string, unknown>
+
+  // ease 字符串 → { kind } 包装。闭包共享计数，最后合并成一条修复说明
+  let easeWrapped = 0
+  const wrapEase = (holder: Record<string, unknown>, key: string): void => {
+    if (typeof holder[key] === 'string') {
+      holder[key] = { kind: holder[key] }
+      easeWrapped++
+    }
+  }
+
+  if ((scene.name === undefined || scene.name === null || scene.name === '') && typeof scene.id === 'string' && scene.id !== '') {
+    scene.name = scene.id
+    repairs.push(`场景缺 name，已用 id「${scene.id}」补上（name 只用于展示）`)
+  }
+
+  const typeFixed: string[] = []
+  const nameFilled: string[] = []
+  const tracksFilled: string[] = []
+  const widthRenamed: string[] = []
+  if (Array.isArray(scene.layers)) {
+    for (const l of scene.layers) {
+      if (l === null || typeof l !== 'object' || Array.isArray(l)) continue
+      const layer = l as Record<string, unknown>
+      const label = typeof layer.id === 'string' && layer.id !== '' ? layer.id : '(缺 id)'
+      if (typeof layer.type === 'string' && !LAYER_TYPE_SET.has(layer.type)) {
+        const lower = layer.type.toLowerCase()
+        if (LAYER_TYPE_SET.has(lower)) {
+          typeFixed.push(`"${layer.type}"→"${lower}"`)
+          layer.type = lower
+        }
+      }
+      if ((layer.name === undefined || layer.name === null || layer.name === '') && typeof layer.id === 'string' && layer.id !== '') {
+        layer.name = layer.id
+        nameFilled.push(label)
+      }
+      if (layer.tracks === undefined || layer.tracks === null) {
+        layer.tracks = []
+        tracksFilled.push(label)
+      }
+      // SVG 习惯名 strokeWidth 归一化为 IR 的 lineWidth（只缺一个时才改写；
+      // 两者都在则不动——规范名优先，渲染端会对冗余的 strokeWidth 告警）
+      const lp = layer.props
+      if (lp !== null && typeof lp === 'object' && !Array.isArray(lp)) {
+        const p = lp as Record<string, unknown>
+        if (p.strokeWidth !== undefined && p.lineWidth === undefined) {
+          p.lineWidth = p.strokeWidth
+          delete p.strokeWidth
+          widthRenamed.push(label)
+        }
+      }
+      if (Array.isArray(layer.tracks)) {
+        for (const t of layer.tracks) {
+          if (t === null || typeof t !== 'object' || !Array.isArray((t as Record<string, unknown>).keys)) continue
+          for (const k of (t as Record<string, unknown>).keys as unknown[]) {
+            if (k !== null && typeof k === 'object' && !Array.isArray(k)) wrapEase(k as Record<string, unknown>, 'ease')
+          }
+        }
+      }
+    }
+  }
+  if (scene.transition !== undefined && scene.transition !== null && typeof scene.transition === 'object') {
+    wrapEase(scene.transition as Record<string, unknown>, 'ease')
+  }
+
+  if (easeWrapped > 0) repairs.push(`${easeWrapped} 处 ease 由字符串包装成 { kind } 对象——下次请直接写 {"kind":"easeOut"} 形式`)
+  if (typeFixed.length > 0) repairs.push(`图层 type 大小写已纠正：${typeFixed.join('、')}（类型名全小写）`)
+  if (nameFilled.length > 0) repairs.push(`图层缺 name，已用各自 id 补上：${nameFilled.join('、')}`)
+  if (tracksFilled.length > 0) repairs.push(`图层缺 tracks，已按静态图层补空数组：${tracksFilled.join('、')}`)
+  if (widthRenamed.length > 0) repairs.push(`描边宽度 strokeWidth 已改写为 lineWidth：${widthRenamed.join('、')}（IR 的描边宽度叫 lineWidth）`)
+  return { scene: scene as unknown as Scene, repairs }
+}
+
 export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): DraftSceneResult {
-  const checked = validateSpec({ ...deps.store.get(args.specId), scenes: [args.scene] })
+  // 先过机械纠错再校验：ease 字符串、type 大小写、漏 name/tracks、strokeWidth
+  // 旧名这类机械错误不值得烧一个来回，纠正清单随回执回报让模型下次自己写对
+  const { scene, repairs } = coerceScene(args.scene)
+  const checked = validateSpec({ ...deps.store.get(args.specId), scenes: [scene] })
   if (!checked.ok) {
-    throw new AnimOpError(`场景草稿非法：${checked.errors.map(e => `${e.path || '(根)'} — ${e.message}`).join('; ')}`)
+    // 报错尾部带最小行动指引：模型不必翻工具描述就能对齐最常漏的形态
+    throw new AnimOpError(
+      `场景草稿非法：${checked.errors.map(e => `${e.path || '(根)'} — ${e.message}`).join('; ')}`
+      + '。图层必填五字段 id / name / type / props / tracks，ease 必须是对象（如 {"kind":"easeOut"}）而不是字符串',
+    )
   }
   let ops: PatchOp[]
   let inverse: PatchOp[]
   try {
-    const r = deps.store.putScene(args.specId, args.scene, args.index)
+    const r = deps.store.putScene(args.specId, scene, args.index)
     ops = r.ops
     inverse = r.inverse
   } catch (err) {
     throw new AnimOpError(err instanceof Error ? err.message : String(err))
   }
   const spec = deps.store.get(args.specId)
-  const index = spec.scenes.findIndex(s => s.id === args.scene.id)
+  const index = spec.scenes.findIndex(s => s.id === scene.id)
   const durationMs = specDurationMs(spec.scenes)
   emit({
     type: 'anim/spec-patched',
-    data: { specId: args.specId, ops, inverse, note: `写入场景「${args.scene.name}」`, durationMs },
+    data: { specId: args.specId, ops, inverse, note: `写入场景「${scene.name}」`, durationMs },
   })
   return {
     specId: args.specId,
-    sceneId: args.scene.id,
+    sceneId: scene.id,
     index,
     sceneCount: spec.scenes.length,
     durationMs,
     inverse,
+    repairs,
     warnings: checked.warnings,
   }
 }

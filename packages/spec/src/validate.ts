@@ -53,7 +53,8 @@ class Collector {
   str(path: string, obj: Record<string, unknown>, key: string): void {
     const v = obj[key]
     if (v === undefined || v === null) {
-      this.fail(`${path}/${key}`, '缺少必填字段')
+      // 报错带字段名：路径里有，但模型扫读报错时靠字段名定位更快
+      this.fail(`${path}/${key}`, `缺少必填字段「${key}」`)
       return
     }
     if (typeof v !== 'string') this.fail(`${path}/${key}`, `应为字符串，实际为 ${typeof v}`)
@@ -63,7 +64,7 @@ class Collector {
   num(path: string, obj: Record<string, unknown>, key: string, opts: { min?: number } = {}): void {
     const v = obj[key]
     if (v === undefined || v === null) {
-      this.fail(`${path}/${key}`, '缺少必填字段')
+      this.fail(`${path}/${key}`, `缺少必填字段「${key}」`)
       return
     }
     if (!isFiniteNumber(v)) {
@@ -79,7 +80,10 @@ class Collector {
 function validateEase(c: Collector, path: string, ease: unknown): void {
   if (ease === undefined) return
   if (!isRecord(ease) || typeof ease.kind !== 'string') {
-    c.fail(path, 'ease 应为 { kind: ... } 对象')
+    // 真机高频错形：直接写 ease: "easeOut" 字符串。报错给出正确形态的示例，
+    // 模型照抄即可修复，不用再猜「{ kind: ... }」里省略号是什么
+    const got = JSON.stringify(ease) ?? '非对象'
+    c.fail(path, `ease 应为 { kind: "..." } 对象（如 {"kind":"easeInOut"}），收到 ${got}${typeof ease === 'string' ? '，不能直接写字符串' : ''}`)
     return
   }
   if (!EASE_KINDS.has(ease.kind)) {
@@ -101,7 +105,7 @@ function validateKeyframe(c: Collector, path: string, k: unknown, index: number)
     return
   }
   c.num(p, k, 'atMs', { min: 0 })
-  if (!('value' in k)) c.fail(`${p}/value`, '缺少必填字段')
+  if (!('value' in k)) c.fail(`${p}/value`, `缺少必填字段「value」（该时刻的目标值）`)
   else if (!isPrimitive(k.value)) c.fail(`${p}/value`, '关键帧值应为数字/字符串/布尔')
   validateEase(c, `${p}/ease`, k.ease)
 }
@@ -139,11 +143,19 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
   }
   c.str(p, l, 'id')
   c.str(p, l, 'name')
-  if (typeof l.type !== 'string' || !LAYER_TYPE_SET.has(l.type)) {
-    c.fail(`${p}/type`, `未知图层类型，可选：${[...LAYER_TYPE_SET].join(' / ')}`)
+  // 「缺 type」和「type 值写错」是两种错法，分开说：缺字段要补字段，
+  // 写错值要换值；都不给可选列表模型就得再跑一趟工具描述
+  if (l.type === undefined || l.type === null) {
+    c.fail(`${p}/type`, `缺少 type 字段（图层类型），可选：${[...LAYER_TYPE_SET].join(' / ')}`)
+  } else if (typeof l.type !== 'string' || !LAYER_TYPE_SET.has(l.type)) {
+    c.fail(`${p}/type`, `未知图层类型 ${JSON.stringify(l.type)}，可选：${[...LAYER_TYPE_SET].join(' / ')}`)
   }
-  if (!isRecord(l.props)) c.fail(`${p}/props`, 'props 应为对象')
-  if (!Array.isArray(l.tracks)) c.fail(`${p}/tracks`, 'tracks 应为数组')
+  if (l.props === undefined || l.props === null) {
+    c.fail(`${p}/props`, '缺少 props 字段（图层的静态属性对象，文本/坐标/样式都写在里面，如 { text: "标题", x: 0, y: 0 }）')
+  } else if (!isRecord(l.props)) {
+    c.fail(`${p}/props`, 'props 应为对象')
+  }
+  if (!Array.isArray(l.tracks)) c.fail(`${p}/tracks`, 'tracks 应为数组（无动画的静态图层给空数组 []）')
   else l.tracks.forEach((t, i) => validateTrack(c, `${p}/tracks`, t, i))
 
   // 类型相关的软性体检：不阻断校验，但把「注定画不出来」的形态说清楚。

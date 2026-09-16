@@ -49,7 +49,8 @@ const LAYOUT_PROPS = ['x', 'y', 'scale', 'rotation', 'opacity', 'size', 'width',
  * 类型报错；导出是给冒烟的「枚举一致性断言」用的（0.3.x 优化清单 O14）。
  */
 export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
-  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight' },
+  // textAlign 是 MC Layout 基类的原生 signal（Txt 继承），直通即可生效
+  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign' },
   rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius' },
   // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
   // 由 normalizeLayerProps 换算成 size；见 0.3.0 规划 §1.4（圆形画不出来的修复）。
@@ -446,6 +447,12 @@ function genSceneFile(
       if (prop === 'color' && !allowed.color && allowed.fill) {
         prop = 'fill'
       }
+      // SVG 习惯名 strokeWidth 同义于 IR 的 lineWidth（真机批量踩过：所有线条
+      // 的描边宽度被静默丢弃）。lineWidth 已显式给出时不改写——规范名优先，
+      // 冗余的 strokeWidth 走下方「不支持」警告
+      if (prop === 'strokeWidth' && allowed.lineWidth && normalized.lineWidth === undefined) {
+        prop = 'lineWidth'
+      }
       const mapped = allowed[prop]
       if (!mapped) {
         warnings.push(`图层 ${layer.id} 的属性 ${rawProp} 不被 ${layer.type} 支持，已忽略`)
@@ -481,7 +488,12 @@ function genSceneFile(
     const initials = new Map<string, string>()
     const animatable = ANIMATABLE_BY_TYPE[layer.type]
     for (const track of layer.tracks) {
-      const prop = track.target.replace(/^props\./, '')
+      let prop = track.target.replace(/^props\./, '')
+      // 与静态属性侧同一约定：SVG 习惯名 strokeWidth 改写为 lineWidth 后再查
+      // 可动画集合，写 lineWidth 才能被 ANIMATABLE_BY_TYPE 放行
+      if (prop === 'strokeWidth' && !animatable.has('strokeWidth') && animatable.has('lineWidth')) {
+        prop = 'lineWidth'
+      }
       if (!animatable.has(prop)) {
         warnings.push(`图层 ${layer.id} 的轨道目标 ${track.target} 不可动画，已忽略`)
         continue

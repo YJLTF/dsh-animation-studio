@@ -211,7 +211,7 @@ async function mountMotionCanvas(ctx: Context, outputDir: string): Promise<Dispo
     const { MotionCanvasRenderer, createDefaultRuntime } = await import('@dsh-anim/render-mc')
 
     // 生成物（project.tsx / scenes/）落在 work 下，vite 以 work 为根解析；
-    // vite.config.ts 由运行时在每次渲染前生成（project 要写绝对路径）。
+    // vite.config.mts 由运行时在每次渲染前生成（project 要写绝对路径）。
     const workDir = resolve(outputDir, 'work')
 
     const renderer = new MotionCanvasRenderer({
