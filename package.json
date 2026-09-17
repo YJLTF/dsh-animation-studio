@@ -1,6 +1,6 @@
 {
   "name": "dsh-animation-studio",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "dsh plugin: an in-harness agent workbench for teaching animation & video production",
   "license": "MIT",
   "type": "module",

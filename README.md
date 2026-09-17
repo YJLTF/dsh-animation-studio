@@ -35,7 +35,7 @@
 - **事件溯源**：spec 的每次变更都是一条自包含事件（`anim/spec-created` / `anim/spec-patched` / …），`foldEvents` 从事件流还原状态——可回放、可 fork，恢复与撤销共用同一份历史。事件载荷在边界上做了深清理，能通过 dsh 的无损 JSON 严格校验。
 - **事件不进宿主会话日志，落插件自有 sidecar**：`anim/*` 事件按会话写到 `<outputDir>/sessions/<sessionId>.jsonl`。dsh 的读回路径对未知事件类型 fail-closed（记录须带 `SessionEvent.ignorable` 信封整个会话才可加载），而宿主 0.1.6-alpha.1 的 `session.append` 不提供 ignorable 入口——写会话日志等于毒化该会话（0.2.0 真机事故实证）。恢复时 sidecar 优先；宿主日志里旧版写入的 anim/* 事件用 `scripts/repair-session-log.py` 补标记后仍可作回退来源。
 - **开箱即用的 Motion Canvas 渲染**：插件启动时自动挂载渲染 Provider。自动处理 Motion Canvas 3.17 没有官方 CLI、WebGL 上下文、帧落盘子目录、尾部静止提前停帧等一整串坑；渲染超时或中断会显式报错，绝不静默产出残片。渲染前 `anim_diagnose` 会把缺 ffmpeg / 缺浏览器 / 缺中文字体说成可操作的修复建议。
-- **渲染默认走后台任务**：宿主提供 `ctx.jobs` 时，`anim_render` 立即返回 jobId 并开始渲染，进度以事件可见，模型用 `job_output` / `job_kill`（dsh-tool-jobs）收集与终止；宿主没有 jobs 服务或任务发布失败时自动退回同步渲染。
+- **渲染与预览默认走后台任务**：宿主提供 `ctx.jobs` 时，`anim_render` / `anim_preview` 立即返回 jobId 并开始工作，进度以事件可见，模型用 `job_output` / `job_kill`（dsh-tool-jobs）收集与终止；宿主没有 jobs 服务或任务发布失败时自动退回同步执行（0.1.6-alpha.1 真机即属此类，`anim_diagnose` 的 host 报告可见 `jobsOnCtx`）。
 - **渲染过程可见**：渲染按序落 `anim/render-start` / `anim/render-progress`（5% 一档节流，不灌水）/ `anim/render-finished` 事件，工作台面板与回放都能重建进度；有头调试模式下浏览器窗口标题栏同时显示进度，渲染完成后自动关闭。
 - **会话内工作台卡片 + 视频预览（dsh Web）**：每个 `anim_*` 工具调用在会话流里渲染成富卡片（spec 名片、分镜大纲、修改历史、环境自检），数据来自工具的 `presentationMeta`（持久化在结果上，刷新/回放后卡片照常重建）。**dsh Web 客户端没有视频/图片预览能力**，插件因此在宿主 webServer 上注册了同源路由：`anim_render` 的成片直接以 `<video>` 内嵌播放（支持 Range 拖进度条、下载、定位文件），`anim_preview` 的抽帧渲染成缩略图墙；转后台的渲染任务卡片自动轮询插件的状态 API 显示进度条，出片后原地变成播放器。headless（无 webServer）形态下整条路由不存在，零副作用。
 - **会话恢复**：工具执行时按会话**懒恢复**（fold）出工作台状态，含撤销历史——宿主重启、会话重开之后，旧 spec 照常 `anim_patch` / `anim_undo`，不丢不重。事件来源：插件 sidecar 优先，宿主会话日志里的旧 anim/* 事件作回退。
@@ -89,7 +89,7 @@ dsh plugin --profile web add F:\path\to\dsh-animation-studio
 请将 F:/path/to/dsh-animation-studio 打包为离线安装包
 ```
 
-打包器会：复制源码到暂存目录（跳过 node_modules / .git）→ `npm install` 生产依赖（`@deepseek-ai/*` 是 peer，由 dsh 宿主提供，不打入）→ 通过 `bundleDependencies` 把 vite、puppeteer-core、Motion Canvas、`@lezer/*` 语言包等全部运行时依赖闭包塞进 tarball → 出自包含的 `dsh-animation-studio-0.3.0.tgz`。`package.json` 的 `files` 白名单保证包内只有 `lib/` 与 `cordis.patch.yml`，干净且小。
+打包器会：复制源码到暂存目录（跳过 node_modules / .git）→ `npm install` 生产依赖（`@deepseek-ai/*` 是 peer，由 dsh 宿主提供，不打入）→ 通过 `bundleDependencies` 把 vite、puppeteer-core、Motion Canvas、`@lezer/*` 语言包等全部运行时依赖闭包塞进 tarball → 出自包含的 `dsh-animation-studio-0.4.0.tgz`。`package.json` 的 `files` 白名单保证包内只有 `lib/` 与 `cordis.patch.yml`，干净且小。
 
 构建环节是免维护的：`build.mjs` 用 esbuild alias 解析工作区内部包，暂存目录里没有 pnpm 软链也能构建——源码目录里**已经跑过 `pnpm build`** 就直接用现成的 `lib/`，没跑过打包器也会自动构建，两种情况都不需要手工干预。
 
@@ -157,12 +157,15 @@ cp -r config/agent-presets/anim-studio ~/.dsh/.agent-presets/anim-studio
 - `anim_create_spec` → 片子名片（标题 / 画布 / 帧率）；`anim_plan` → 分镜大纲 + 节奏体检；`anim_patch` / `anim_undo` → 修改历史（版本、变更数、说明、时长）；
 - `anim_preview` → 抽帧缩略图墙（每帧带时间标注）；
 - `anim_render` → **成片直接内嵌播放**：`<video>` 播放器（Range 拖动）、"在新标签打开 / 下载 / 定位文件"三个动作，元信息（分辨率 / 帧数 / 时长 / 渲染器）一行带过；
-- `anim_render` 转后台时，卡片先显示进度条（轮询插件状态 API），出片后原地变成播放器，失败/终止显示原因。
+- 渲染/预览转后台任务时，卡片先显示进度条（轮询插件状态 API），出片后原地变成播放器 / 缩略图墙，失败/终止显示原因。
 
-实现上有两条数据通道，都不经过模型：
+**0.4.0 起卡片带最简交互按钮**：`anim_plan` 卡「渲染成片」、`anim_draft_scene` 卡「预览这一幕」、`anim_patch` 卡「撤销这步」。点击即把一条结构化指令（稳定前缀 `[anim-studio 面板指令]` + JSON）经宿主 `session/prompt` API 以 queue 模式发回会话——agent 空闲则立即开新回合执行，运行中则排队。指令处理契约声明在 anim-studio 预设（收到即执行、不反问、一句话回报）。回执都带会话章（sessionId），旧日志回放出的卡片没有该章时按钮整行隐藏（也意味着：分叉/回放出旧卡点按钮，指令会发回**原**会话——v1 接受该边界）。
+
+实现上有两条数据通道 + 一条指令通道，都不经过模型：
 
 1. **卡片数据**：host 工具用 `output.presentationMeta` 把结构化回执投影到 `tool/result.meta`（随会话日志持久化），浏览器卡片优先读 meta、回退解析回执文本——刷新、回放旧会话，卡片照常重建；
-2. **媒体与状态**：插件向宿主 webServer 注册 `/dsh-anim` 前缀路由（与 client-modules 的 `/plugins` 路由同一机制）：`GET /dsh-anim/media?p=<绝对路径>` 把渲染产物送进浏览器（Range / ETag / 304 齐全），放行规则是「outputDir 内」或「工具回执里出现过的路径」，扩展名白名单，其余一律 404；`GET /dsh-anim/api/state` 输出工作台状态（specs + 渲染任务簿），后台渲染卡片的进度条靠它。
+2. **媒体与状态**：插件向宿主 webServer 注册 `/dsh-anim` 前缀路由（与 client-modules 的 `/plugins` 路由同一机制）：`GET /dsh-anim/media?p=<绝对路径>` 把渲染产物送进浏览器（Range / ETag / 304 齐全），放行规则是「outputDir 内」或「工具回执里出现过的路径」，扩展名白名单，其余一律 404；`GET /dsh-anim/api/state` 输出工作台状态（specs + 渲染/预览任务簿），后台卡片的进度条与缩略图重建靠它；
+3. **面板指令**：卡片按钮 → 同源 `POST /api/session/prompt`（与官方 client 同款信封，cookie 自动携带）→ 宿主 agent 收件箱 → 下一回合执行 anim_* 工具 → 事件流与卡片呈现结果。
 
 ### 工具一览
 
@@ -199,7 +202,7 @@ pnpm build       # esbuild 打包插件 → lib/index.js（宿主面）+ lib/cli
 pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟（含无损 JSON 事件校验，无需浏览器）
 ```
 
-冒烟测试覆盖 spec 校验 / patch 可逆 / 时间线展开与截短 / codegen 结构 / store 回滚撤销 / 事件流 fold / 渲染注册表 / 渲染后台化的事件序与同步回退 / `/dsh-anim` 请求内核（状态 API、媒体放行边界、Range/ETag），以及构建产物在真实 cordis 环境里的挂载、执行、会话恢复、web 路由注册与 client bundle 包装契约（`__ModuleLoader__` 登记、entry id、10 张卡片的插槽注册）。浏览器渲染链路（vite / puppeteer / ffmpeg）不在冒烟范围内，由 `examples/hello-gradient` 的 `scripts/render.ts` 走与 `anim_render` 完全相同的运行时路径，可当渲染链路的手动诊断入口用；卡片的真实渲染与视频播放需在 `dsh web` 真机验收。
+冒烟测试覆盖 spec 校验 / patch 可逆 / 时间线展开与截短 / codegen 结构 / store 回滚撤销 / 事件流 fold / 渲染注册表 / 渲染与预览后台化的事件序、job_kill 与同步回退 / 任务簿对预览任务的观察 / 面板指令信封（与宿主 API 逐字段对齐）/ `/dsh-anim` 请求内核（状态 API、媒体放行边界、Range/ETag），以及构建产物在真实 cordis 环境里的挂载、执行、会话恢复、回执会话章、web 路由注册与 client bundle 包装契约（`__ModuleLoader__` 登记、entry id、10 张卡片的插槽注册）。浏览器渲染链路（vite / puppeteer / ffmpeg）不在冒烟范围内，由 `examples/hello-gradient` 的 `scripts/render.ts` 走与 `anim_render` 完全相同的运行时路径，可当渲染链路的手动诊断入口用；卡片的真实渲染与视频播放需在 `dsh web` 真机验收。
 
 ## 已知限制与说明
 
@@ -207,7 +210,8 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 - 转场 `transition.kind` 支持 `none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn`；`scene.exit`（fade/slide 系列）在幕尾整体退场。缓动除 `linear/easeIn/easeOut/easeInOut/cubicBezier/spring` 外支持 `bounce/elastic/back`（强调类入场）。
 - 旁白字幕已实现（无 TTS）：`narration.cues`（`{ atMs, text, durationMs? }`，`atMs` 为全片绝对毫秒）渲染成底部字幕条；TTS 语音合成与音画对齐推迟到 0.5。
 - font 资产已接通：导入后 text/code 图层 `fontFamily` 填 assetId 即生效（渲染前会等 `document.fonts.ready`）；远端 http(s) 字体 URL 需要目标服务器允许跨源（CORS）。
-- **工作台面板是只读的**（0.2.0 M2 范围）：卡片只展示状态与产物，"撤销这步 / 预览第 N 幕"按钮驱动的最简交互（P2）未做；面板功能依赖 `dsh web`（webServer 路由 + 浏览器插槽），headless CLI 会话只有工具回执、没有卡片。
+- **面板交互（0.4.0 已做，范围有限）**：三个按钮（渲染成片 / 预览这一幕 / 撤销这步）走「结构化指令 → `session/prompt` → agent 下一回合」路径，**不新增任何机制**；指令发往出卡片的那次会话，分叉/回放的旧卡会把指令发回原会话（v1 边界）。面板功能依赖 `dsh web`（webServer 路由 + 浏览器插槽），headless CLI 会话只有工具回执、没有卡片。
+- **后台任务依赖宿主暴露 `ctx.jobs`**：dsh web 0.1.6-alpha.1 真机实测 `anim_diagnose` 报告 `jobsOnCtx=false`——插件上下文拿不到 jobs 服务，`anim_render`/`anim_preview` 在该部署走同步回退（设计内行为，同步预览同样进任务簿）。宿主未来把 dsh-tool-jobs 暴露给插件上下文后，后台票据链路（进度条 + job_output/job_kill）自动生效。
 - `/dsh-anim/media` 的放行规则是「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg`）；把产物导出到 outputDir 之外的任意位置再用面板播放，前提是该路径出现在某次工具回执里。
 - **插件事件与宿主会话日志的关系**（0.2.0 真机事故的完整记录）：宿主读回会话时对词汇表外的记录类型 fail-closed——除非该记录带 `SessionEvent.ignorable: true` 信封，否则**整个会话拒读**（报错形如「contains event type … unknown to this harness and not marked ignorable」）。宿主 0.1.6-alpha.1 的 `session.append` API 不提供 ignorable 入口，因此插件任何写入 `anim/*` 事件的构建（0.2.0-rc 之前曾以 `exec.agent.session.append` 落盘）都会让该会话无法再次加载。现行为：事件只写 sidecar；受影响的旧日志用 `python scripts/repair-session-log.py <session.v3.jsonl.zstd>` 修复（自动备份 `.bak`，给 anim/* 记录补 ignorable 标记，已用宿主自身 `Session.fromRestore` 校验通过）。若宿主未来开放 ignorable 写入，可再评估把事件切回会话日志以获得统一的会话导出/回放体验。
 - 渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI）。0.4.0 起编辑器等待动态化（Render 按钮就绪即走 + 300ms 稳定拍）、浏览器与 vite dev server 常驻复用（空闲 10 分钟回收）、工作目录按 spec 分片、段缓存默认开启（未变的幕直接复用，回执 `incremental` 报告命中；`cache:false` 强制全量），长片渲染耗时以分钟计。Edge 152 起新 headless 配合 SwiftShader 可完整出帧，渲染**默认 headless 无窗口**（`headless: false` 仅作调试后门，Linux 无显示时该模式需要 Xvfb）。后台渲染依赖宿主的 `ctx.jobs` 服务，无此服务时自动退回同步渲染。

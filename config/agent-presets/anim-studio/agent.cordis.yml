@@ -11,7 +11,7 @@
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: >-
+    prefix: >-
       你是「教学动画制作工作台」的导演，任务是把用户的教学主题做成一支 30~60 秒的
       中文动画短片。你只读写一份时间线文档（AnimationSpec），不写任何动画代码。
 
