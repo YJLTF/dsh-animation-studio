@@ -14,9 +14,9 @@ export default makeScene2D(function* (view) {
   const n1_m_star = createRef<Path>();
   view.add(<Path ref={n1_m_star} fill={"#FFB020"} x={320} y={-40} data={"M 0,-20 L 6.18034,-8.506508 L 19.02113,-6.18034 L 10,3.249197 L 11.755705,16.18034 L 0,10.514622 L -11.755705,16.18034 L -10,3.249197 L -19.02113,-6.18034 L -6.18034,-8.506508 Z"} />);
   const nsub0bg = createRef<Rect>();
-  view.add(<Rect ref={nsub0bg} x={0} y={286} width={648} height={76} radius={19} fill={"#8B97A3"} opacity={0} />);
+  view.add(<Rect ref={nsub0bg} x={0} y={288} width={483} height={73} radius={18} fill={"#8B97A3"} opacity={0} />);
   const nsub0tx = createRef<Txt>();
-  view.add(<Txt ref={nsub0tx} x={0} y={286} text={"更新规则：参数减去学习率乘梯度"} fontSize={40} fill={"#F2F5F7"} opacity={0} />);
+  view.add(<Txt ref={nsub0tx} x={0} y={288} text={"更新规则：参数减去学习率乘梯度"} fontSize={29} lineHeight={'140'} textWrap={'pre'} fill={"#F2F5F7"} opacity={0} />);
 
   // 动画初值：让每条轨道的起点在第一时间生效
   n0_m_code().code("theta = theta - alpha * grad");

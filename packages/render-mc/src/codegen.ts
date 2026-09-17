@@ -46,8 +46,10 @@ export interface GenerateResult {
  * **改 codegen 输出语义时手动 +1**（新增图层类型 / 属性兜底 / 时序语义等）。
  * v2（0.4.0 M2）：slide 转场改中心相对坐标（旧写法把 view 贴到画布边缘）、
  * code 缺 fill 兜底主题色、project.meta 背景兜底主题底色、字幕条/退场新增。
+ * v3：字幕字号改按画布高度比例（不再跟 theme.font.size），超宽自动折行、
+ * 底条随行数增高——同输入下字幕段输出变了，旧段必须失效。
  */
-export const CODEGEN_VERSION = 2
+export const CODEGEN_VERSION = 3
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -214,6 +216,67 @@ function estimateTextWidth(text: string, fontSize: number): number {
   let w = 0
   for (const ch of text) w += ch.charCodeAt(0) > 0xff ? fontSize : fontSize * 0.6
   return Math.round(w)
+}
+
+/**
+ * 字幕折行：整行估宽超出 maxTextWidth 时把 cue 折成多行（行间以 \n 连接，
+ * MC 的 Txt 原生按换行符分行走 lineHeight）。断行规则：CJK 逐字可断、
+ * 拉丁词按空白断；无空白的超长 token（长 URL 之类）按字符硬切兜底。
+ * 与 estimateTextWidth 用同一套估宽——底条尺寸按折行后的最宽行计算，
+ * 估宽误差只影响底条留白，不影响「不出画」这个硬约束。
+ */
+export function wrapSubtitleText(text: string, fontSize: number, maxTextWidth: number): string[] {
+  if (estimateTextWidth(text, fontSize) <= maxTextWidth) return [text]
+  const tokens: string[] = []
+  let word = ''
+  for (const ch of text) {
+    if (/\s/.test(ch)) {
+      if (word !== '') {
+        tokens.push(word)
+        word = ''
+      }
+      tokens.push(' ')
+    } else if (ch.charCodeAt(0) > 0xff) {
+      if (word !== '') {
+        tokens.push(word)
+        word = ''
+      }
+      tokens.push(ch)
+    } else {
+      word += ch
+    }
+  }
+  if (word !== '') tokens.push(word)
+  const fits = (s: string) => estimateTextWidth(s, fontSize) <= maxTextWidth
+  const lines: string[] = []
+  let cur = ''
+  for (const tk of tokens) {
+    if (tk === ' ') {
+      if (cur !== '') cur += ' '
+      continue
+    }
+    if (cur !== '' && fits(cur + tk)) {
+      cur += tk
+      continue
+    }
+    if (cur !== '') {
+      lines.push(cur.replace(/\s+$/, ''))
+      cur = ''
+    }
+    if (fits(tk)) {
+      cur = tk
+      continue
+    }
+    for (const c of tk) {
+      if (cur !== '' && !fits(cur + c)) {
+        lines.push(cur)
+        cur = ''
+      }
+      cur += c
+    }
+  }
+  if (cur !== '') lines.push(cur.replace(/\s+$/, ''))
+  return lines.length > 0 ? lines : [text]
 }
 
 /**
@@ -435,7 +498,11 @@ export interface SubtitleCue {
   endMs: number
 }
 
-/** 字幕条样式与画布信息（§4.3），由 generateProject 从 spec 派生。 */
+/**
+ * 字幕条样式与画布信息（§4.3），由 generateProject 从 spec 派生。
+ * fontSize 与正文字号解耦：按画布高度的 4% 取整（14~56 夹取），
+ * 超宽折行与底条几何都以它为准（wrapSubtitleText / 字幕渲染块）。
+ */
 export interface SubtitleStyle {
   mutedFill: string
   textColor: string
@@ -685,13 +752,23 @@ function genSceneFile(
 
   // 字幕条（§4.3）：底部居中，muted 半透明底条 + 主题文字色，按 cue 时段
   // 150ms 淡入淡出。字幕来自 scene.subtitles（expandNarration 的展开产物，
-  // 场景内本地毫秒），只存在于生成的 TSX 里
+  // 场景内本地毫秒），只存在于生成的 TSX 里。
+  // 超宽自动折行（wrapSubtitleText）：底条按最宽行计算、随行数增高，底边
+  // 锚定在「画布底边上方 36px」——行数变多时向上生长，不越过画布下缘。
+  let maxBandH = 0
+  let bandUsed = false
   for (const [i, cue] of (scene.subtitles ?? []).entries()) {
     const bg = `nsub${i}bg`
     const tx = `nsub${i}tx`
     const fontSize = subtitleStyle.fontSize
-    const w = estimateTextWidth(cue.text, fontSize) + 48
-    const h = Math.round(fontSize * 1.9)
+    const lineHeight = Math.round(fontSize * 1.4)
+    const padV = Math.round(fontSize * 0.55)
+    const lines = wrapSubtitleText(cue.text, fontSize, Math.round(subtitleStyle.canvasWidth * 0.86) - 48)
+    const textW = Math.max(...lines.map(l => estimateTextWidth(l, fontSize)))
+    const w = Math.min(Math.round(subtitleStyle.canvasWidth * 0.9), textW + 48)
+    const h = lines.length * lineHeight + padV * 2
+    if (h > maxBandH) maxBandH = h
+    bandUsed = true
     const y = Math.round(subtitleStyle.canvasHeight / 2 - h / 2 - 36)
     components.add('Rect')
     components.add('Txt')
@@ -699,7 +776,9 @@ function genSceneFile(
     setup.push(`const ${bg} = createRef<Rect>();`)
     setup.push(`view.add(<Rect ref={${bg}} x={0} y={${y}} width={${num(w)}} height={${h}} radius={${Math.round(h / 4)}} fill={${JSON.stringify(subtitleStyle.mutedFill)}} opacity={0} />);`)
     setup.push(`const ${tx} = createRef<Txt>();`)
-    setup.push(`view.add(<Txt ref={${tx}} x={0} y={${y}} text={${JSON.stringify(cue.text)}} fontSize={${fontSize}} fill={${JSON.stringify(subtitleStyle.textColor)}} opacity={0} />);`)
+    // MC 的 lineHeight 数字语义是 px，倍数要走字符串（'140' → 1.4 倍）；
+    // textWrap='pre' 是 \n 分行的开关（默认 DOM 布局会折叠换行符）
+    setup.push(`view.add(<Txt ref={${tx}} x={0} y={${y}} text={${JSON.stringify(lines.join('\n'))}} fontSize={${fontSize}} lineHeight={'140'} textWrap={'pre'} fill={${JSON.stringify(subtitleStyle.textColor)}} opacity={0} />);`)
     const fadeIn = 150
     const fadeOut = cue.endMs - cue.startMs < 2 * fadeIn ? Math.round((cue.endMs - cue.startMs) / 2) : fadeIn
     const fadeOutAt = Math.max(cue.startMs, cue.endMs - fadeOut)
@@ -707,6 +786,36 @@ function genSceneFile(
     tasks.push(`delay(${sec(cue.startMs)}, ${tx}().opacity(1, ${sec(fadeOut)})),`)
     tasks.push(`delay(${sec(fadeOutAt)}, ${bg}().opacity(0, ${sec(fadeOut)})),`)
     tasks.push(`delay(${sec(fadeOutAt)}, ${tx}().opacity(0, ${sec(fadeOut)})),`)
+  }
+
+  // 字幕安全区提醒（软警告）：有字幕的幕，画布底部这一横条是字幕带，正文
+  // 图层的锚点落进去会被字幕盖住。锚点级检查（props.y / props.y 轨道关键帧 /
+  // line/arrow 的 points），不追图层包围盒——居中或全屏元素（y≈0）不会误报。
+  if (bandUsed) {
+    const bandTop = subtitleStyle.canvasHeight / 2 - 36 - maxBandH
+    const offenders = new Set<string>()
+    for (const layer of scene.layers) {
+      if (layer.type === 'audio' || layer.type === 'group') continue
+      const baseY = typeof layer.props.y === 'number' ? layer.props.y : 0
+      const ys: number[] = []
+      if (baseY !== 0) ys.push(baseY)
+      for (const tr of layer.tracks) {
+        if (tr.target !== 'props.y') continue
+        for (const k of tr.keys) if (typeof k.value === 'number') ys.push(k.value)
+      }
+      const pts = layer.props.points
+      if (Array.isArray(pts)) {
+        for (const p of pts) {
+          if (Array.isArray(p) && typeof p[1] === 'number') ys.push(baseY + p[1])
+        }
+      }
+      if (ys.some(v => v > bandTop)) offenders.add(layer.id)
+    }
+    if (offenders.size > 0) {
+      warnings.push(
+        `本幕有字幕：画布底部约 ${Math.round(maxBandH + 36)}px 高的区域是字幕带，图层 ${[...offenders].join(' / ')} 的位置落在其中会被字幕遮挡，正文内容建议上移（y < ${Math.round(bandTop)}）`,
+      )
+    }
   }
 
   // 补齐到场景时长，让「留白」也进时间线
@@ -930,8 +1039,9 @@ export interface SubtitleCue {
  * 丢失且不触发重渲。
  *
  * 规则：cue 缺省时长按中文语速估（≈4 字/秒，下限 1200ms）；跨幕 cue 每幕各
- * 出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；超 40 字
- * 截断 + 警告；起点越出全片时长给软警告。原 spec 不被修改。
+ * 出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；超 80 字
+ * 软警告（渲染端自动折行，不再截断——过长字幕画面偏挤，建议拆 cue）；起点
+ * 越出全片时长给软警告。原 spec 不被修改。
  */
 export function expandNarration(spec: AnimationSpec): { spec: AnimationSpec; warnings: string[] } {
   const warnings: string[] = []
@@ -943,12 +1053,10 @@ export function expandNarration(spec: AnimationSpec): { spec: AnimationSpec; war
     if (cue.atMs >= totalMs) {
       warnings.push(`旁白 cue ${i}（${cue.atMs}ms）起于全片时长（${totalMs}ms）之外，不会出现`)
     }
-    let text = cue.text
-    if (text.length > 40) {
-      text = `${text.slice(0, 39)}…`
-      warnings.push(`旁白 cue ${i} 超过 40 字，已截断（字幕不支持自动分行，建议拆成多条 cue）`)
+    if (cue.text.length > 80) {
+      warnings.push(`旁白 cue ${i} 超过 80 字，一条 cue 建议不超过 40 字（渲染时会自动折行，但整屏都是字幕观感偏挤）`)
     }
-    return { atMs: cue.atMs, durationMs, text }
+    return { atMs: cue.atMs, durationMs, text: cue.text }
   })
   const scenes: Scene[] = []
   let cursor = 0
@@ -1022,7 +1130,9 @@ export function generateProject(
   const subtitleStyle: SubtitleStyle = {
     mutedFill: spec.theme.colors.muted ?? '#8A8F98',
     textColor: defaultTextFill,
-    fontSize: Math.min(40, Math.max(18, spec.theme.font.size)),
+    // 字幕字号与画布高度成比例（约 4%，视频字幕的常见比例），不跟正文字号
+    // （theme.font.size）走——正文 48px 的主题直接拿来当字幕就是顶天立地。
+    fontSize: Math.min(56, Math.max(14, Math.round(spec.meta.size.height * 0.04))),
     canvasWidth: spec.meta.size.width,
     canvasHeight: spec.meta.size.height,
   }

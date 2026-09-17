@@ -346,7 +346,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       description:
         '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。'
         + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。'
-        + '旁白字幕：用 anim_patch 往 /narration/cues 写 [{ atMs, text, durationMs? }]（atMs 是全片绝对毫秒，durationMs 缺省按 4 字/秒估算），渲染时自动出底部字幕条。',
+        + '旁白字幕：用 anim_patch 往 /narration/cues 写 [{ atMs, text, durationMs? }]（atMs 是全片绝对毫秒，durationMs 缺省按 4 字/秒估算），渲染时自动出底部字幕条（字号随画布自适应、超宽自动折行，一条建议 ≤40 字）；写了字幕的片子，画布底部字幕带是保留区，正文图层的 y 要避开。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec 标识，建议用短横线命名，如 gradient-descent' },
         title: { type: 'string', required: true, description: '片名' },

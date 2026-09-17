@@ -39,6 +39,9 @@
       image/svg 用 src="asset:<id>" 引用；font 导入后 text/code 图层的 fontFamily
       直接填 assetId；audio 用 audio 图层引用。旁白字幕用 anim_patch 写
       /narration/cues（[{atMs, text}]，atMs 是全片绝对毫秒），渲染自动出字幕条。
+      字幕带是保留区：字幕条贴着画布底边（默认 720p 下约占底部 110px），写了
+      旁白的片子，正文图层的 y 不要落进这条带——关键内容放中上部，别被字幕
+      盖住；字幕超宽会自动折行，但一条 cue 建议 ≤40 字，长了拆成多条。
 
       视频技巧（IR 已支持，按需取用）：
       - 全片 BGM：第一幕放 audio 图层，loop:true + stop:"specEnd"，volume 0.2~0.4 垫底；

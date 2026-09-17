@@ -35,6 +35,7 @@ import {
   sceneFingerprint,
   STATIC_PROPS,
   stableStringify,
+  wrapSubtitleText,
 } from '../packages/render-mc/src/index.ts'
 import {
   applyPatch,
@@ -1832,7 +1833,7 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
     cues: [
       { atMs: 1000, text: '跨幕字幕' }, // 缺省时长 max(1200, 4字≈1000)=1200 → [1000, 2200)
       { atMs: 5000, text: '片外 cue' }, // 全片 4000ms，起在外面
-      { atMs: 2500, text: '长'.repeat(45) },
+      { atMs: 2500, text: '长'.repeat(85) }, // 超 80 字：软警告，不再截断
     ],
   }
   const { spec: expanded, warnings } = expandNarration(spec)
@@ -1840,10 +1841,11 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
   assert.deepEqual(expanded.scenes[0]!.subtitles, [{ text: '跨幕字幕', startMs: 1000, endMs: 2000 }])
   assert.equal(expanded.scenes[1]!.subtitles!.length, 2)
   assert.deepEqual(expanded.scenes[1]!.subtitles![0], { text: '跨幕字幕', startMs: 0, endMs: 200 })
-  assert.equal(expanded.scenes[1]!.subtitles![1]!.text, `${'长'.repeat(39)}…`, '超长截断到 40 字含省略号')
+  assert.equal(expanded.scenes[1]!.subtitles![1]!.text, '长'.repeat(85), '超长 cue 不截断（折行在渲染端做）')
   assert.equal(expanded.scenes[1]!.subtitles![1]!.startMs, 500, '全局 2500ms 在幕 b 的本地时间是 500ms')
   assert.ok(warnings.some(w => w.includes('5000')), JSON.stringify(warnings))
-  assert.ok(warnings.some(w => w.includes('40 字')), JSON.stringify(warnings))
+  assert.ok(warnings.some(w => w.includes('超过 80 字')), JSON.stringify(warnings))
+  assert.ok(!warnings.some(w => w.includes('截断')), JSON.stringify(warnings))
   // 入参不被修改
   assert.equal(spec.scenes[0].subtitles, undefined)
   assert.ok(spec.narration, '入参 narration 保留')
@@ -1900,6 +1902,82 @@ check('codegen: 字幕条/转场扩族/exit 退场落进 TSX——绝对时间 d
   exitSpec.scenes[0].exit = { kind: 'slideLeft', durationMs: 500 }
   const exitTsx = generateProject(exitSpec).files.find(f => f.path.startsWith('scenes/s0-'))!.content
   assert.ok(exitTsx.includes('delay(1.5, view.x(-880, 0.5)),'), exitTsx)
+})
+
+check('codegen: 字幕自动折行——超宽 cue 折多行、字号按画布高度自适应、底条随行数增高', () => {
+  // wrapSubtitleText 单元行为：CJK 逐字断、拉丁按词断、无空白超长 token 硬切
+  const fs = 29 // 720p → round(720*0.04)=29
+  const maxW = Math.round(1280 * 0.86) - 48 // 1053
+  const cjk = wrapSubtitleText('长'.repeat(80), fs, maxW)
+  assert.ok(cjk.length === 3, `80 个 CJK 按 36 字/行应折 3 行：${JSON.stringify(cjk.map(l => l.length))}`)
+  assert.ok(cjk.every(l => l.length <= 36), JSON.stringify(cjk.map(l => l.length)))
+  const latinText = 'word '.repeat(40).trim()
+  const latin = wrapSubtitleText(latinText, fs, maxW)
+  assert.ok(latin.length > 1, '超宽拉丁文本应按词折行')
+  assert.equal(
+    latin.join(' ').replace(/\s+/g, ' ').trim(),
+    latinText.replace(/\s+/g, ' ').trim(),
+    '折行不丢词',
+  )
+  assert.deepEqual(wrapSubtitleText('短字幕', fs, maxW), ['短字幕'], '不超宽不折行')
+  const hard = wrapSubtitleText('a'.repeat(100), fs, maxW)
+  assert.ok(hard.length >= 2 && hard.every(l => estimateOk(l)), '无空白长串按字符硬切')
+  function estimateOk(l: string): boolean {
+    let w = 0
+    for (const ch of l) w += ch.charCodeAt(0) > 0xff ? fs : fs * 0.6
+    return w <= maxW
+  }
+  // 生成物：720p 字号 29（不再跟 theme.font.size=48 走）、多行文本带 \n + lineHeight
+  const spec = demoSpec()
+  spec.narration = { cues: [{ atMs: 100, text: '长'.repeat(60), durationMs: 1500 }] }
+  const r = generateProject(spec)
+  const tsx = r.files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(tsx.includes('fontSize={29}'), `720p 字幕字号应为 29：\n${tsx}`)
+  assert.ok(tsx.includes("lineHeight={'140'}"), tsx)
+  // MC 的 Txt 走 DOM 布局，\n 只有在 white-space:pre（textWrap='pre'）下才分行——
+  // 真机回归发现缺它时折行整条失效（挤成一行顶出底条）
+  assert.ok(tsx.includes("textWrap={'pre'}"), tsx)
+  const wrappedJson = JSON.stringify(`${'长'.repeat(36)}\n${'长'.repeat(24)}`)
+  assert.ok(tsx.includes(wrappedJson), `60 个 CJK 应按 36+24 折成两行：\n${tsx.slice(0, 2000)}`)
+  // 底条几何：36+24 两行 → textW=1044、w=1092、h=2*41+2*16=114、y=360-57-36=267
+  assert.ok(tsx.includes('width={1092} height={114}'), tsx)
+  assert.ok(tsx.includes('y={267}'), tsx)
+})
+
+check('codegen: 字幕安全区软警告——正文图层 y 落进底部字幕带时提示上移，无字幕不提示', () => {
+  const spec = demoSpec()
+  spec.narration = { cues: [{ atMs: 100, text: '有字幕', durationMs: 1000 }] }
+  spec.scenes[0].layers.push(
+    { id: 'low', name: '低位', type: 'rect', props: { y: 320, size: 80 }, tracks: [] },
+    { id: 'mid', name: '居中', type: 'rect', props: { size: 400 }, tracks: [] }, // 无 y=居中，不应误报
+    {
+      id: 'swoop',
+      name: '掠过',
+      type: 'rect',
+      props: { size: 60 },
+      tracks: [{ id: 'drop', target: 'props.y', keys: [{ atMs: 0, value: 330 }] }],
+    },
+  )
+  const { warnings } = generateProject(spec)
+  const hit = warnings.find(w => w.includes('字幕带'))
+  assert.ok(hit, JSON.stringify(warnings))
+  assert.ok(hit!.includes('low'), `应点名低位图层：${hit}`)
+  assert.ok(hit!.includes('swoop'), `y 轨道落带内也应点名：${hit}`)
+  assert.ok(!hit!.includes('mid'), `居中图层不应误报：${hit}`)
+  assert.ok(hit!.includes('y < 251'), `应给出安全线上值（360-36-73=251）：${hit}`)
+  // line 图层的 points 伸进字幕带同样提示
+  const lineSpec = demoSpec()
+  lineSpec.narration = { cues: [{ atMs: 100, text: '有字幕', durationMs: 1000 }] }
+  lineSpec.scenes[0].layers.push({
+    id: 'under', name: '底线', type: 'line',
+    props: { y: 200, points: [[-200, 0], [200, 80]] }, tracks: [],
+  })
+  const lineHit = generateProject(lineSpec).warnings.find(w => w.includes('字幕带'))
+  assert.ok(lineHit && lineHit.includes('under'), `points 伸进字幕带应提示：${lineHit}`)
+  // 无字幕：同样布局不提示
+  const quiet = demoSpec()
+  quiet.scenes[0].layers.push({ id: 'low2', name: '低位', type: 'rect', props: { y: 320, size: 80 }, tracks: [] })
+  assert.ok(!generateProject(quiet).warnings.some(w => w.includes('字幕带')), '无字幕时不应有安全区警告')
 })
 
 check('codegen: 缓动扩族 bounce/elastic/back 映射到 MC 的 easeOut*（映射 × MC 实际导出双保险）', () => {

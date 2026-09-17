@@ -18,9 +18,9 @@ export default makeScene2D(function* (view) {
   const n3_ball_label = createRef<Txt>();
   view.add(<Txt ref={n3_ball_label} text={"每一步都朝着更低的地方走"} fontSize={38} fill={"#F2F5F7"} x={0} y={-230} />);
   const nsub0bg = createRef<Rect>();
-  view.add(<Rect ref={nsub0bg} x={0} y={286} width={728} height={76} radius={19} fill={"#8B97A3"} opacity={0} />);
+  view.add(<Rect ref={nsub0bg} x={0} y={288} width={541} height={73} radius={18} fill={"#8B97A3"} opacity={0} />);
   const nsub0tx = createRef<Txt>();
-  view.add(<Txt ref={nsub0tx} x={0} y={286} text={"梯度下降：沿着最陡的方向走到最低点"} fontSize={40} fill={"#F2F5F7"} opacity={0} />);
+  view.add(<Txt ref={nsub0tx} x={0} y={288} text={"梯度下降：沿着最陡的方向走到最低点"} fontSize={29} lineHeight={'140'} textWrap={'pre'} fill={"#F2F5F7"} opacity={0} />);
 
   // 动画初值：让每条轨道的起点在第一时间生效
   n0_axis().end(0);
