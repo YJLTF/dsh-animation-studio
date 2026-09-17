@@ -124,6 +124,8 @@ export interface RenderStatus {
   status: 'running' | 'completed' | 'killed' | 'failed'
   outputPath: string
   percent: number
+  /** 任务类别：缺省 render；preview 为后台抽帧预览（0.4.0 §5.3）。 */
+  kind?: 'render' | 'preview'
   done?: number
   total?: number
   error?: string
@@ -131,6 +133,18 @@ export interface RenderStatus {
   durationMs?: number
   width?: number
   height?: number
+  /** 生成期降级警告（同类已合并），完成卡片由此展示（0.4.0 N4）。 */
+  warnings?: string[]
+  /** 增量渲染命中情况（0.4.0 规划 §3.4），未走增量时缺省。 */
+  incremental?: {
+    scenesTotal: number
+    scenesReused: number
+    fallback?: boolean
+  }
+  /** 混入成片的音轨（0.4.0 规划 §4.1），无声成片缺省。 */
+  audioTracks?: string[]
+  /** 后台预览的帧清单（0.4.0 §5.3），预览完成卡片由此重建缩略图。 */
+  frames?: Array<{ atMs: number; path: string }>
 }
 
 /** 从工作台状态 API 里找一条渲染任务；路由不可达返回 null。 */
@@ -146,3 +160,59 @@ export async function fetchRenderStatus(jobId: string, signal?: AbortSignal): Pr
   }
   return null
 }
+
+/* -------------------------------------------------------------- 面板指令 */
+
+/**
+ * 面板按钮 → 宿主 agent 收件箱（0.4.0 §5.1 真机拆包结论 + §5.2）。
+ *
+ * 与官方 client 同款信封 `POST /api/session/prompt`：面板与 /api 同源，fetch
+ * 自动携带签名 cookie；`queue` 模式投递到 inbox 的 next-turn 队列——agent
+ * 空闲则立即开新回合，运行中则排队。requestId 会被宿主回传进事件
+ * source.rpcId，可作对账 id。指令正文是带稳定前缀的 JSON，处理约定声明在
+ * agent 预设（config/agent-presets/anim-studio/agent.cordis.yml）。
+ */
+export async function promptAgent(sessionId: string, text: string): Promise<'accepted' | 'rejected' | 'unreachable'> {
+  const requestId = `anim-panel-${Date.now()}`
+  try {
+    const res = await fetch('/api/session/prompt', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: requestId,
+        method: 'session/prompt',
+        payload: {
+          args: {
+            request: {
+              requestId,
+              sessionId,
+              mode: 'queue',
+              content: [{ type: 'text', text }],
+            },
+          },
+        },
+      }),
+    })
+    if (res.status !== 200) return 'unreachable'
+    const body = (await res.json()) as { type?: string; result?: { ok?: boolean } }
+    return body.type === 'server-response' && body.result?.ok === true ? 'accepted' : 'rejected'
+  } catch {
+    return 'unreachable'
+  }
+}
+
+/** 结构化指令的稳定前缀：agent 预设按它识别面板指令并直接执行。 */
+export const PANEL_INSTRUCTION_PREFIX = '[anim-studio 面板指令] '
+
+/** 预览某一幕：agent 读 spec 定位该幕中点，anim_preview 抽帧。 */
+export const previewSceneInstruction = (specId: string, sceneId: string): string =>
+  PANEL_INSTRUCTION_PREFIX + JSON.stringify({ action: 'preview_scene', specId, sceneId })
+
+/** 渲染成片：agent 按现状 spec 调 anim_render。 */
+export const renderSpecInstruction = (specId: string): string =>
+  PANEL_INSTRUCTION_PREFIX + JSON.stringify({ action: 'render_spec', specId })
+
+/** 撤销最近一次修改：agent 调 anim_undo。 */
+export const undoLatestInstruction = (specId: string): string =>
+  PANEL_INSTRUCTION_PREFIX + JSON.stringify({ action: 'undo_latest', specId })

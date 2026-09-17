@@ -12,6 +12,7 @@
  */
 
 import { exec as execCallback, spawn } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,7 +21,9 @@ import { promisify } from 'node:util'
 import { createRequire } from 'node:module'
 
 import puppeteer from 'puppeteer-core'
+import type { Browser } from 'puppeteer-core'
 import { createServer } from 'vite'
+import type { ViteDevServer } from 'vite'
 
 import { collectFrames, resetDir } from './adapter.ts'
 import type { MotionCanvasRuntime } from './adapter.ts'
@@ -225,6 +228,24 @@ async function execQuiet(cmd: string): Promise<string> {
 
 /* ------------------------------------------------------------- 默认运行时 */
 
+/** 空闲回收阈值：最后一次渲染结束后，常驻实例存活这么久就整套关停（§3.2）。 */
+const IDLE_RECLAIM_MS = 10 * 60 * 1000
+
+/**
+ * 进程退出时的兜底回收：常驻浏览器是宿主进程的子进程，宿主自然退
+ * 出（事件循环排空）时若不处理会留僵尸。beforeExit 里走优雅关闭；
+ * exit 事件是同步的最后机会，直接杀浏览器根进程，尽力而为
+ * （SIGKILL / 断电救不了，正常插件卸载走的是 dispose 的优雅路径）。
+ */
+const exitHooks = new WeakMap<object, unknown>()
+
+function installExitHooks(owner: object, graceful: () => Promise<void>, killSync: () => void): void {
+  if (exitHooks.has(owner)) return
+  exitHooks.set(owner, true)
+  process.once('beforeExit', () => { void graceful() })
+  process.once('exit', killSync)
+}
+
 export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): MotionCanvasRuntime {
   const port = options.port ?? 0
   const display = options.display ?? ':99'
@@ -233,9 +254,312 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT
   const headless = options.headless ?? true
 
+  /* ------------ 常驻实例：浏览器进程级单例 + vite dev server 按 spec 一份（§3.2） ------------- */
+
+  interface EditorSession {
+    server: ViteDevServer
+    port: number
+  }
+
+  /** workDir → vite 会话。存 Promise 是为了让并发创建天然去重（串行闸下罕见，但便宜）。 */
+  const sessions = new Map<string, Promise<EditorSession>>()
+  let browserPromise: Promise<Browser> | undefined
+  let browserProc: ChildProcess | undefined
+  let xvfb: ChildProcess | undefined
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  /** 当前渲染是否已进入等帧阶段：只有「起手阶段」的失败才值得整套重建重试。 */
+  let framesStarted = false
+
+  const linuxNoDisplay = !headless && process.platform === 'linux' && !process.env.DISPLAY
+
+  async function launchBrowser(): Promise<Browser> {
+    if (chromiumPath === undefined) {
+      throw new Error('未找到可用的 Chrome/Chromium：设置 CHROME_PATH 环境变量或安装浏览器后重试')
+    }
+    // Xvfb 只服务于「有头调试 + Linux 无显示」的组合；常驻模式下随浏览器同生命周期
+    if (linuxNoDisplay && !xvfb) {
+      xvfb = spawn('Xvfb', [display, '-screen', '0', '1920x1080x24'], { stdio: 'ignore' })
+      await new Promise(r => setTimeout(r, 2000))
+    }
+    const browser = await puppeteer.launch({
+      executablePath: chromiumPath,
+      headless,
+      env: linuxNoDisplay ? { ...process.env, DISPLAY: display } : process.env,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
+        '--enable-unsafe-swiftshader',
+        // 编辑器靠 rAF 驱动渲染：窗口被遮挡/最小化时 Chromium 会节流 rAF，
+        // 帧就永远出不来（实测 Windows 上浏览器窗口可能以最小化状态启动）
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+        // 不要传 --window-position / --window-size：Edge 152 起对这两个开关
+        // 有离谱缺陷——窗口按指定几何创建了却永不显示（Win32 visible=False，
+        // 任务栏也没有），渲染照常出帧、标题状态条却永远看不见；CDP
+        // setWindowBounds 也救不回来。默认窗口尺寸对编辑器足够，出帧分辨率
+        // 由 project.meta × resolutionScale 决定，与窗口大小无关。
+      ],
+    })
+    browserProc = browser.process() ?? undefined
+    return browser
+  }
+
+  /** 浏览器进程级单例：存活检查失败（崩溃 / 被外部杀掉）就丢弃重建。 */
+  async function ensureBrowser(): Promise<Browser> {
+    if (browserPromise) {
+      const browser = await browserPromise
+      if (browser.connected) return browser
+      browserPromise = undefined
+    }
+    browserPromise = launchBrowser()
+    return browserPromise
+  }
+
+  async function createEditorServer(workDir: string): Promise<EditorSession> {
+    // project 与 output 都必须写绝对路径：MC 的 vite-plugin 会把它们原样
+    // 塞进虚拟模块/导出器配置里按相对路径处理，而虚拟模块的相对导入与
+    // exporter 的落盘目录都按 process.cwd() 解析——dsh 的 cwd 是启动目录
+    // 而不是 workDir，相对路径在这里要么 500 要么把帧写到天南海北。
+    // 配置用 .mts 后缀强制 Vite 走 ESM 链路加载：workDir 没有 "type": "module"
+    // 的 package.json，.ts 配置会被打包成 CJS require('vite')，每次渲染都刷
+    // 一条 CJS 弃用告警（真机日志回归发现）。配置内容只取决于 workDir 与
+    // outputDir，所以跟着会话写一次，复用期间不再重写。
+    const configPath = join(workDir, 'vite.config.mts')
+    mkdirSync(workDir, { recursive: true })
+    const uiModulesDir = containingModulesDir('@motion-canvas/ui')
+    writeFileSync(
+      configPath,
+      viteConfigSource(
+        join(workDir, 'project.tsx').replace(/\\/g, '/'),
+        join(workDir, outputDir).replace(/\\/g, '/'),
+        [workDir, ...(uiModulesDir ? [uiModulesDir, dirname(uiModulesDir)] : [])],
+      ),
+      'utf8',
+    )
+
+    const server = await createServer({
+      // 场景源码都物化在 workDir 下，vite 的 root 必须钉在这里，
+      // 否则 project: './project.tsx' 会相对进程 cwd 解析而落空
+      root: workDir,
+      configFile: configPath,
+      // 依赖预打包缓存必须钉在 workDir 自己身上：workDir/node_modules 是指向
+      // 插件真实 node_modules 的 junction，默认 cacheDir 会落到共享缓存里，
+      // 与其他项目/其他 spec 的优化产物串台，跑出双 core 实例的经典错乱
+      cacheDir: join(workDir, '.vite'),
+      server: { port, strictPort: true },
+      logLevel: 'warn',
+    })
+    await server.listen()
+
+    // port 0 = 由系统分派随机可用端口：编辑器页面要按实际端口访问
+    const address = server.httpServer?.address()
+    const listenPort = typeof address === 'object' && address !== null ? address.port : port
+    return { server, port: listenPort }
+  }
+
+  /**
+   * 复用前的健康检查：端口还在监听 + HTTP 真能应答。
+   * 只查 listening 不够——僵死的 server 这一位可能仍是 true，一发真实请求才算数。
+   */
+  async function serverHealthy(session: EditorSession): Promise<boolean> {
+    if (!session.server.httpServer?.listening) return false
+    try {
+      const res = await fetch(`http://localhost:${session.port}/`, { signal: AbortSignal.timeout(3000) })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
+  async function ensureEditorServer(workDir: string): Promise<EditorSession> {
+    const existing = sessions.get(workDir)
+    if (existing) {
+      const session = await existing
+      if (await serverHealthy(session)) return session
+      // 僵死：丢弃重建。close 的异常吞掉——反正已经不打算用它了
+      sessions.delete(workDir)
+      await session.server.close().catch(() => {})
+    }
+    const creating = createEditorServer(workDir)
+    sessions.set(workDir, creating)
+    return creating
+  }
+
+  /** 整套关停常驻实例：所有 spec 的 vite 会话 + 浏览器 + Xvfb。幂等。 */
+  async function disposeInstances(): Promise<void> {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = undefined
+    }
+    const closing = [...sessions.values()].map(p => p.then(s => s.server.close()).catch(() => {}))
+    sessions.clear()
+    const bp = browserPromise
+    browserPromise = undefined
+    if (bp) await bp.then(b => b.close()).catch(() => {})
+    await Promise.all(closing)
+    xvfb?.kill()
+    xvfb = undefined
+  }
+
+  /** 渲染结束后重新武装空闲回收；unref 保证常驻实例不拖住进程退出。 */
+  function armIdleReclaim(): void {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => { void disposeInstances() }, IDLE_RECLAIM_MS)
+    idleTimer.unref?.()
+  }
+
+  installExitHooks(
+    sessions,
+    () => disposeInstances(),
+    () => {
+      try { browserProc?.kill('SIGKILL') } catch { /* 已经不在了 */ }
+      try { xvfb?.kill('SIGKILL') } catch { /* 已经不在了 */ }
+    },
+  )
+
+  /* ------------------------------------------------------------- 单次渲染 */
+
+  const renderOnce = async (args: {
+    workDir: string
+    fps: number
+    expectedFrames: number
+    signal: AbortSignal
+    onProgress?: (done: number, total: number) => void
+  }): Promise<{ frameDir: string; frameCount: number }> => {
+    framesStarted = false
+    const rootDir = join(args.workDir, outputDir)
+
+    const session = await ensureEditorServer(args.workDir)
+    const browser = await ensureBrowser()
+    // 每次渲染开新页、渲完关页：浏览器实例跨渲染复用，页面状态绝不跨渲染
+    // 带入（编辑器是纯页面状态， goto 即全新）。启动时的首个空白页留给
+    // 浏览器当「保活目标」，永不关闭。
+    const page = await browser.newPage()
+    try {
+      await page.setViewport({ width: 1600, height: 900 })
+      await page.bringToFront()
+
+      // 有头调试时窗口标题就是渲染状态条；默认 headless 没有窗口，进度只走
+      // onProgress。标题更新失败绝不影响渲染本身
+      let lastTitleAt = 0
+      const setTitle = (text: string): void => {
+        // 包的 TS lib 无 DOM，document 经 globalThis 转型；函数体跑在浏览器里
+        void page.evaluate(t => {
+          (globalThis as unknown as { document: { title: string } }).document.title = t
+        }, text).catch(() => {})
+      }
+      const titleProgress = (done: number, total: number): void => {
+        args.onProgress?.(done, total)
+        const now = Date.now()
+        if (now - lastTitleAt < 500) return // 进度回调每帧都来，标题刷新限频
+        lastTitleAt = now
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0
+        setTitle(`视频渲染中 ${done}/${total} 帧（${pct}%）…`)
+      }
+
+      setTitle('动画渲染启动中：正在加载 Motion Canvas 编辑器…')
+      const loadStarted = Date.now()
+      await page.goto(`http://localhost:${session.port}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
+      const gotoMs = Date.now() - loadStarted
+      setTitle('编辑器加载中…')
+      await page.waitForSelector('canvas', { timeout: 60_000 })
+      const canvasMs = Date.now() - loadStarted - gotoMs
+
+      // 动态等待（0.4.0 规划 §3.1）：canvas 出现后轮询「Render 按钮存在且
+      // enabled」，就绪即走。轮询上限 30 秒兜底——按钮比预期晚到时多等而
+      // 不是盲点失败；计时落盘 workDir/editor-timing.json
+      const buttonStarted = Date.now()
+      let buttonReady = false
+      while (Date.now() - buttonStarted < 30_000) {
+        buttonReady = await page.$$eval(
+          'button',
+          // 回调跑在浏览器页面里；TS lib 无 DOM，disabled 经 unknown 转型读取
+          buttons => buttons.some(b => (b.textContent ?? '').trim() === 'Render' && !(b as unknown as { disabled?: boolean }).disabled),
+        )
+        if (buttonReady) break
+        await new Promise(r => setTimeout(r, 100))
+      }
+      const buttonReadyMs = Date.now() - buttonStarted
+      if (!buttonReady) {
+        // 30 秒兜底到顶还没见按钮：多等只会拖长失败路径，直接给可读报错
+        throw new Error('编辑器 30 秒内没有出现可用的 Render 按钮——编辑器加载可能卡住了。'
+          + '请重试；若反复出现，检查 <workDir> 下 vite 的报错或用 headless:false 肉眼排查。')
+      }
+      // O10 实测（0.4.0 规划 §3.1）：按钮在 canvas 后 14ms 即可点，旧版固定
+      // 4 秒等待是 99.6% 的纯余量，已按数据收紧。留一拍短稳定余量兜「按钮
+      // 先于编辑器内部状态就绪」的极端时序；真机若复现 0 帧失败再回调此值。
+      const settleMs = 300
+      await new Promise(r => setTimeout(r, settleMs))
+
+      // 自定义字体就绪（0.4.0 规划 §4.2）：canvas 的 fillText 用文档字体集，
+      // @font-face 未就绪时先渲的字形退回兜底字体（豆腐块/宋体）。canvas 用法
+      // 不会触发 @font-face 懒加载，必须 FontFace.load() 显式触发后等 ready。
+      // 无自定义字体时约 1ms；整体 5 秒封顶——字体加载慢不该拖死渲染。
+      const fontsStarted = Date.now()
+      await Promise.race([
+        page.evaluate(async () => {
+          const doc = globalThis as unknown as {
+            document: { fonts?: { ready: Promise<unknown>; forEach: (cb: (face: { load: () => Promise<unknown> }) => void) => void } }
+          }
+          const fonts = doc.document.fonts
+          if (!fonts) return
+          fonts.forEach(face => { void face.load().catch(() => {}) })
+          await fonts.ready
+        }),
+        new Promise(r => setTimeout(r, 5000)),
+      ])
+      const fontsMs = Date.now() - fontsStarted
+
+      try {
+        writeFileSync(
+          join(args.workDir, 'editor-timing.json'),
+          JSON.stringify({
+            at: new Date().toISOString(),
+            gotoMs,
+            canvasMs,
+            buttonReadyMs,
+            settleMs,
+            fontsMs,
+            editorLoadTotalMs: gotoMs + canvasMs + buttonReadyMs + settleMs + fontsMs,
+          }, null, 2),
+        )
+      } catch { /* 测量失败绝不影响渲染 */ }
+
+      // 按文本找按钮：MC 的 class 名带构建哈希，不能依赖。
+      // 用 $$eval 而不是 evaluateHandle —— 后者返回的 ElementHandle<Node> 没法直接 click。
+      const clicked = await page.$$eval('button', buttons => {
+        const target = buttons.find(b => (b.textContent ?? '').trim() === 'Render')
+        if (!target) return false
+        target.click()
+        return true
+      })
+      if (!clicked) throw new Error('找不到 Render 按钮——Motion Canvas 版本可能变了，请重新确认编辑器 UI')
+
+      setTitle('编辑器就绪，开始渲染…')
+      // 注意顺序：先等帧、再定位帧目录。exporter 的输出子目录是在首帧落盘时
+      // 才创建的，点完 Render 立刻找目录只会拿到空的 output 根目录——而等待
+      // 用的 collectFrames 会递归扫一层子目录，帧再多也救不回早已定错的目录。
+      framesStarted = true
+      const count = await waitForFrames(rootDir, args.expectedFrames, args.fps, timeoutMs, args.signal, titleProgress)
+      setTitle(`帧渲染完成（${count} 帧），正在关闭页面…`)
+      return { frameDir: findImageDir(rootDir), frameCount: count }
+    } finally {
+      await page.close().catch(() => {})
+      armIdleReclaim()
+    }
+  }
+
   return {
     async probe() {
       return probeEnvironment({ chromiumPath: options.chromiumPath, headless })
+    },
+
+    async dispose() {
+      await disposeInstances()
     },
 
     async materialize(files, workDir) {
@@ -247,134 +571,30 @@ export function createDefaultRuntime(options: DefaultRuntimeOptions = {}): Motio
       }
     },
 
-    async renderProject({ workDir, fps, expectedFrames, signal, onProgress }) {
-      const rootDir = join(workDir, outputDir)
-      // 清掉上一轮产物：旧帧混进新片是最难发现的一类错误
+    async renderProject(args) {
+      if (args.signal.aborted) throw new Error('渲染已取消')
+      const rootDir = join(args.workDir, outputDir)
+      // 清掉上一轮产物：旧帧混进新片是最难发现的一类错误。只清 output——
+      // .vite 预打包缓存与段缓存都要跨渲染存活（§3.3 / §3.4）
       resetDir(rootDir)
-
-      // Xvfb 只服务于「有头调试 + Linux 无显示」的组合；默认 headless 不需要
-      const linuxNoDisplay = !headless && process.platform === 'linux' && !process.env.DISPLAY
-      const xvfb = linuxNoDisplay ? spawn('Xvfb', [display, '-screen', '0', '1920x1080x24'], { stdio: 'ignore' }) : undefined
-      if (linuxNoDisplay) await new Promise(r => setTimeout(r, 2000))
-      if (chromiumPath === undefined) {
-        xvfb?.kill()
-        throw new Error('未找到可用的 Chrome/Chromium：设置 CHROME_PATH 环境变量或安装浏览器后重试')
+      // 渲染进行中绝不被空闲回收；结束后由 renderOnce 的 finally 重新武装
+      if (idleTimer) {
+        clearTimeout(idleTimer)
+        idleTimer = undefined
       }
+      const wasReused = sessions.has(args.workDir)
 
-      // project 与 output 都必须写绝对路径：MC 的 vite-plugin 会把它们原样
-      // 塞进虚拟模块/导出器配置里按相对路径处理，而虚拟模块的相对导入与
-      // exporter 的落盘目录都按 process.cwd() 解析——dsh 的 cwd 是启动目录
-      // 而不是 workDir，相对路径在这里要么 500 要么把帧写到天南海北
-      // 配置用 .mts 后缀强制 Vite 走 ESM 链路加载：workDir 没有 "type": "module"
-      // 的 package.json，.ts 配置会被打包成 CJS require('vite')，每次渲染都刷
-      // 一条 CJS 弃用告警（真机日志回归发现）
-      const configPath = join(workDir, 'vite.config.mts')
-      mkdirSync(workDir, { recursive: true })
-      const uiModulesDir = containingModulesDir('@motion-canvas/ui')
-      writeFileSync(
-        configPath,
-        viteConfigSource(
-          join(workDir, 'project.tsx').replace(/\\/g, '/'),
-          join(workDir, outputDir).replace(/\\/g, '/'),
-          [workDir, ...(uiModulesDir ? [uiModulesDir, dirname(uiModulesDir)] : [])],
-        ),
-        'utf8',
-      )
-
-      const server = await createServer({
-        // 场景源码都物化在 workDir 下，vite 的 root 必须钉在这里，
-        // 否则 project: './project.tsx' 会相对进程 cwd 解析而落空
-        root: workDir,
-        configFile: configPath,
-        // 依赖预打包缓存必须钉在 workDir 自己身上：workDir/node_modules 是指向
-        // 插件真实 node_modules 的 junction，默认 cacheDir 会落到共享缓存里，
-        // 与其他项目/其他 spec 的优化产物串台，跑出双 core 实例的经典错乱
-        cacheDir: join(workDir, '.vite'),
-        server: { port, strictPort: true },
-        logLevel: 'warn',
-      })
-      await server.listen()
-
-      // port 0 = 由系统分派随机可用端口：编辑器页面要按实际端口访问
-      const address = server.httpServer?.address()
-      const listenPort = typeof address === 'object' && address !== null ? address.port : port
-
-      let browser
       try {
-        browser = await puppeteer.launch({
-          executablePath: chromiumPath,
-          headless,
-          env: linuxNoDisplay ? { ...process.env, DISPLAY: display } : process.env,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--use-gl=angle',
-            '--use-angle=swiftshader',
-            '--enable-unsafe-swiftshader',
-            // 编辑器靠 rAF 驱动渲染：窗口被遮挡/最小化时 Chromium 会节流 rAF，
-            // 帧就永远出不来（实测 Windows 上浏览器窗口可能以最小化状态启动）
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--disable-background-timer-throttling',
-            // 不要传 --window-position / --window-size：Edge 152 起对这两个开关
-            // 有离谱缺陷——窗口按指定几何创建了却永不显示（Win32 visible=False，
-            // 任务栏也没有），渲染照常出帧、标题状态条却永远看不见；CDP
-            // setWindowBounds 也救不回来。默认窗口尺寸对编辑器足够，出帧分辨率
-            // 由 project.meta × resolutionScale 决定，与窗口大小无关。
-          ],
-        })
-        // 复用启动时的首个空白页而不是 newPage()：窗口里只留一个标签页，
-        // 且标题在 vite 首次预打包的白屏阶段就能挂上去
-        const [page] = await browser.pages()
-        await page.setViewport({ width: 1600, height: 900 })
-        await page.bringToFront()
-
-        // 有头调试时窗口标题就是渲染状态条；默认 headless 没有窗口，进度只走
-        // onProgress。标题更新失败绝不影响渲染本身
-        let lastTitleAt = 0
-        const setTitle = (text: string): void => {
-          // 包的 TS lib 无 DOM，document 经 globalThis 转型；函数体跑在浏览器里
-          void page.evaluate(t => {
-            (globalThis as unknown as { document: { title: string } }).document.title = t
-          }, text).catch(() => {})
+        return await renderOnce(args)
+      } catch (err) {
+        // 复用实例的「起手阶段」失败（起服务/开页/goto/找按钮）：实例可能已
+        // 僵死——整套丢弃，冷启动重试一次。等帧阶段（framesStarted）的失败
+        // 是内容/环境问题，重试同样的渲染只会再花一遍时间，原样上抛。
+        if (wasReused && !framesStarted && !args.signal.aborted) {
+          await disposeInstances()
+          return renderOnce(args)
         }
-        const titleProgress = (done: number, total: number): void => {
-          onProgress?.(done, total)
-          const now = Date.now()
-          if (now - lastTitleAt < 500) return // 进度回调每帧都来，标题刷新限频
-          lastTitleAt = now
-          const pct = total > 0 ? Math.round((done / total) * 100) : 0
-          setTitle(`视频渲染中 ${done}/${total} 帧（${pct}%）…`)
-        }
-
-        setTitle('动画渲染启动中：正在加载 Motion Canvas 编辑器…')
-        await page.goto(`http://localhost:${listenPort}/`, { waitUntil: 'networkidle2', timeout: 120_000 })
-        setTitle('编辑器加载中…')
-        await page.waitForSelector('canvas', { timeout: 60_000 })
-        await new Promise(r => setTimeout(r, 4000)) // 等编辑器完成场景加载
-
-        // 按文本找按钮：MC 的 class 名带构建哈希，不能依赖。
-        // 用 $$eval 而不是 evaluateHandle —— 后者返回的 ElementHandle<Node> 没法直接 click。
-        const clicked = await page.$$eval('button', buttons => {
-          const target = buttons.find(b => (b.textContent ?? '').trim() === 'Render')
-          if (!target) return false
-          target.click()
-          return true
-        })
-        if (!clicked) throw new Error('找不到 Render 按钮——Motion Canvas 版本可能变了，请重新确认编辑器 UI')
-
-        setTitle('编辑器就绪，开始渲染…')
-        // 注意顺序：先等帧、再定位帧目录。exporter 的输出子目录是在首帧落盘时
-        // 才创建的，点完 Render 立刻找目录只会拿到空的 output 根目录——而等待
-        // 用的 collectFrames 会递归扫一层子目录，帧再多也救不回早已定错的目录。
-        const count = await waitForFrames(rootDir, expectedFrames, fps, timeoutMs, signal, titleProgress)
-        setTitle(`帧渲染完成（${count} 帧），正在关闭浏览器…`)
-        return { frameDir: findImageDir(rootDir), frameCount: count }
-      } finally {
-        await browser?.close()
-        await server.close()
-        xvfb?.kill()
+        throw err
       }
     },
   }

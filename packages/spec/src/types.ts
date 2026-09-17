@@ -29,6 +29,12 @@ export type EaseSpec =
   | { kind: 'easeInOut' }
   | { kind: 'cubicBezier'; points: [number, number, number, number] }
   | { kind: 'spring'; stiffness?: number; damping?: number; mass?: number }
+  /** 弹跳落定（easeOutBounce）：皮球落地式回弹，入场强调最常用。 */
+  | { kind: 'bounce' }
+  /** 弹性超调（easeOutElastic）：冲过头再弹回，适合「啪」地弹出。 */
+  | { kind: 'elastic' }
+  /** 回勾起手（easeOutBack）：先反向一点再冲到位，卡片/星标弹出常用。 */
+  | { kind: 'back' }
 
 /* ---------------------------------------------------------------- 关键帧 */
 
@@ -37,7 +43,9 @@ export type KeyframeValue = number | string | boolean
 export interface Keyframe {
   /** 场景内绝对时间（毫秒）。 */
   atMs: number
-  /** 该时刻的目标值。数字可插值；字符串/布尔为离散跳变。 */
+  /** 该时刻的目标值。数字可插值；字符串/布尔默认为离散跳变——唯一的例外是
+   * code 图层的 props.code：多个字符串关键帧会生成 MC 的逐词 diff morph
+   * （代码演化动画），参见 anim_draft_scene 描述。 */
   value: KeyframeValue
   /** 从**上一个**关键帧补间到本关键帧所用的缓动；首帧无意义。 */
   ease?: EaseSpec
@@ -69,6 +77,7 @@ export const LAYER_TYPES = [
   'svg',
   'code', 'math',
   'group',
+  'audio',
 ] as const
 
 export type LayerType = (typeof LAYER_TYPES)[number]
@@ -142,6 +151,16 @@ export interface LayerProps {
   // 分组
   /** group 图层的成员图层 id 列表（同一场景内）。变换属性作用于整组。 */
   children?: LayerId[]
+  // 音频（audio 图层；不进画面，渲染尾步由 ffmpeg 混入成片）
+  /** 音量 0~1，默认 1。 */
+  volume?: number
+  /** 播到停止点仍没放完时是否循环，默认 false。 */
+  loop?: boolean
+  /** 停止时机：sceneEnd（默认）= 本幕结束；specEnd = 一直响到片尾。
+   * 第一幕 audio + loop + stop:'specEnd' 即全片 BGM 的标准写法。 */
+  stop?: 'sceneEnd' | 'specEnd'
+  /** 相对本幕开头的起始偏移（毫秒），默认 0（随幕起点开始）。 */
+  atMs?: number
   [key: string]: JsonValue | undefined
 }
 
@@ -155,8 +174,12 @@ export interface Layer {
 
 /* ------------------------------------------------------------------ 场景 */
 
+/**
+ * 入场/退场动画。kind 语义都是「整幕 view 的变换」：
+ * 入场从指定形态进入画面；exit（Scene.exit）在幕尾整体退出。
+ */
 export interface Transition {
-  kind: 'none' | 'fade' | 'slideLeft' | 'slideUp'
+  kind: 'none' | 'fade' | 'slideLeft' | 'slideUp' | 'slideRight' | 'slideDown' | 'zoomIn'
   durationMs: number
   ease?: EaseSpec
 }
@@ -169,6 +192,16 @@ export interface Scene {
   durationMs: number
   layers: Layer[]
   transition?: Transition
+  /** 幕尾退场：占用本幕最后 exit.durationMs 做整体退出。缺省无退场。
+   * 支持 fade / slideLeft / slideRight / slideUp / slideDown（zoomIn 仅入场）。 */
+  exit?: Transition
+  /**
+   * 本幕的字幕条（场景内本地毫秒，§4.3）。**宿主展开产物**：作者侧用顶层
+   * narration.cues（全片绝对毫秒），渲染入口展开成各幕的 subtitles——
+   * 展开之后字幕就是场景数据的一部分，场景级增量渲染的切片与指纹天然
+   * 正确（改字幕 → 场景 JSON 变 → 指纹变 → 重渲该幕）。
+   */
+  subtitles?: Array<{ text: string; startMs: number; endMs: number }>
   background?: string
 }
 
@@ -218,9 +251,17 @@ export interface AnimationSpec {
   theme: ThemeToken
   assets: Record<AssetId, Asset>
   scenes: Scene[]
-  /** MVP 预留：旁白轨道（实现涉及 TTS 与音画对齐，本轮不落地）。 */
+  /**
+   * 旁白字幕（0.4.0 §4.3）：渲染时展开为各幕底部的字幕条（muted 半透明底条
+   * + 主题文字色）。`atMs` 是**全片绝对毫秒**（与场景内时间轴区分）；
+   * `durationMs` 缺省按中文语速估算（≈4 字/秒，下限 1200ms）。
+   * 字幕字号按画布高度约 4% 自适应（与正文字号解耦），超宽自动折行、底条
+   * 随行数增高；底部字幕带是保留区，正文图层的 y 应避开（渲染时会提示重叠）。
+   * TTS 语音合成推迟到 0.5——届时 cues 从「显示」升级为「发声 + 显示」，
+   * IR 不再改。
+   */
   narration?: {
-    cues: Array<{ atMs: number; text: string; voice?: string }>
+    cues: Array<{ atMs: number; text: string; durationMs?: number; voice?: string }>
   }
   /** MVP 预留：字幕轨道。 */
   subtitles?: Array<{ sceneId: SceneId; atMs: number; text: string }>

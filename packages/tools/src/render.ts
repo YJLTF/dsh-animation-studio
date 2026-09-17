@@ -39,6 +39,12 @@ export interface PreviewResult {
   frames: PreviewFrame[]
   /** 实际使用的后端名，回执里带上是排查利器。 */
   renderer: string
+  /**
+   * 生成期降级警告（同类已合并计数）。此前只进宿主日志、模型看不见——
+   * 与 render-mc 侧 contract.ts 的 PreviewResult 成对改（结构对齐是两包
+   * 的显式契约）。
+   */
+  warnings?: string[]
 }
 
 export interface RenderRequest {
@@ -47,7 +53,22 @@ export interface RenderRequest {
   /** 只渲染指定场景（0 基），为空则整片。 */
   scenes?: number[]
   scale?: number
+  /**
+   * 段缓存开关（0.4.0 规划 §3.4）。默认开启：逐幕指纹比对，未变幕直接复用
+   * 上次渲染的段。显式传 false 强制全量渲染（排查缓存疑点时的保底开关）。
+   */
+  cache?: boolean
   onProgress?: (done: number, total: number) => void
+}
+
+/** 增量渲染的结果说明（§3.4），全量渲染且未尝试增量时缺省。 */
+export interface IncrementalInfo {
+  /** 本次渲染涉及的幕数。 */
+  scenesTotal: number
+  /** 直接复用段缓存的幕数（0 = 全部现渲）。 */
+  scenesReused: number
+  /** 增量流程失败、自动回退全量渲染时为 true；原因见 warnings。 */
+  fallback?: boolean
 }
 
 export interface RenderResult {
@@ -57,6 +78,17 @@ export interface RenderResult {
   width: number
   height: number
   renderer: string
+  /** 本片目标帧数（fps × 时长），与进度事件的 total 同口径。 */
+  expectedFrames?: number
+  /** 生成期降级警告（同类已合并计数），语义同 PreviewResult.warnings。 */
+  warnings?: string[]
+  /** 增量渲染命中情况（§3.4）；未走增量（cache:false / 空片）时缺省。 */
+  incremental?: IncrementalInfo
+  /**
+   * 混入成片的音轨（0.4.0 规划 §4.1）：audio 图层的 assetId 列表。
+   * 空/缺省 = 无声成片。音轨在编码/拼接之后从现行 spec 重新混入，不进段缓存。
+   */
+  audioTracks?: string[]
 }
 
 export interface AnimRenderer {

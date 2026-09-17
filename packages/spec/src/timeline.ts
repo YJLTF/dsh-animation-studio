@@ -28,10 +28,12 @@ function trackEndMs(track: Track): number {
   return end
 }
 
-/** 场景内所有动画的自然结束时间（忽略声明时长）。 */
+/** 场景内所有动画的自然结束时间（忽略声明时长）。audio 图层不进画面，
+ * 其轨道（写错的 volume 轨道之类）不得把时间线撑长。 */
 function sceneContentEndMs(scene: Scene): number {
   let end = 0
   for (const layer of scene.layers) {
+    if (layer.type === 'audio') continue
     for (const track of layer.tracks) end = Math.max(end, trackEndMs(track))
   }
   return end

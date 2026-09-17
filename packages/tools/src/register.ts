@@ -285,6 +285,22 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     }
   }
   const disposers: Array<() => void> = []
+  /**
+   * §5.2 面板最简交互：工具回执统一带上会话 id。卡片按钮把结构化指令发回
+   * 「出这张卡片的会话」（session/prompt，见 client 面 promptAgent）；
+   * 老宿主形态没有 agent.session 时原样返回，回执不带该字段。
+   */
+  const stampSession = (result: unknown, exec: { agent?: unknown } | undefined): unknown => {
+    const session = (exec?.agent as { session?: { id?: unknown } } | undefined)?.session
+    if (typeof session?.id !== 'string' || session.id === '') return result
+    if (
+      result !== null && typeof result === 'object' && !Array.isArray(result)
+      && (result as { sessionId?: unknown }).sessionId === undefined
+    ) {
+      return { ...(result as Record<string, unknown>), sessionId: session.id }
+    }
+    return result
+  }
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
     // 单一收口：每个工具执行前做会话懒恢复（事件归因由 emitFor 按调用绑定）
     const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
@@ -293,7 +309,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         hydrate?.(exec?.agent)
         const result = await originalExecute(args, exec as never)
         indexMediaFromResult(options.media, result)
-        return result
+        return stampSession(result, exec)
       }
       ;(definition as { execute: unknown }).execute = wrapped
     }
@@ -329,7 +345,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_create_spec',
       description:
         '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。'
-        + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。',
+        + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。'
+        + '旁白字幕：用 anim_patch 往 /narration/cues 写 [{ atMs, text, durationMs? }]（atMs 是全片绝对毫秒，durationMs 缺省按 4 字/秒估算），渲染时自动出底部字幕条（字号随画布自适应、超宽自动折行，一条建议 ≤40 字）；写了字幕的片子，画布底部字幕带是保留区，正文图层的 y 要避开。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec 标识，建议用短横线命名，如 gradient-descent' },
         title: { type: 'string', required: true, description: '片名' },
@@ -417,7 +434,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + '三条高频错误，写之前先自查：① ease 一律写对象 {"kind":"easeInOut"}，不能直接写 "easeInOut" 字符串；'
             + '② 每个图层必填五字段 id/name/type/props/tracks，一个都不能少（漏 name/tracks 工具会自动补并在回执 repairs 里回报，漏 props/type 则直接报错）；'
             + '③ type 名全小写。'
-            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group。'
+            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group | audio。'
             + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size。'
             + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）；'
             + 'arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
@@ -425,8 +442,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + 'text 支持 textAlign（left/center/right）。'
             + 'svg 用 svg 内嵌 SVG 字符串。image 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材。'
             + 'code 用 code（代码内容）+ language（typescript/ts/tsx/javascript/js/jsx/python/py/json/html/css，自动语法高亮；`{{片段}}` 可给片段着色，字符串里的 `{{` 需写 `\\{{` 转义）+ fontSize/fill。'
+            + '代码演化动画：code 图层的 props.code 轨道写多个字符串关键帧（atMs 递增），帧间自动生成逐词 diff morph——分步讲解代码的首选写法（其他图层的字符串关键帧仍是离散跳变）。'
             + 'math 用 tex 写 LaTeX 公式（如 "x = \\\\frac{-b \\\\pm \\\\sqrt{b^2-4ac}}{2a}"）。'
             + 'group 用 children: [成员图层id...] 组合，变换属性作用于整组，成员自己的动画不受影响。'
+            + 'audio 用 src:"asset:<assetId>" 引用音频资产，props 可带 volume（0~1）、loop、atMs（相对本幕开头的偏移毫秒）、stop（"sceneEnd"|"specEnd"，默认 sceneEnd）；'
+            + 'audio 不进画面，成片渲染时自动混音（回执 audioTracks 列出；anim_preview 抽帧无音频）。'
+            + '全片 BGM 的标准写法：第一幕放 audio 图层，loop:true + stop:"specEnd"。'
+            + 'transition 可选 none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn；'
+            + 'scene.exit 同形（fade/slide 系列）在幕尾整体退场，占用本幕最后 exit.durationMs。'
+            + '缓动除 linear/easeIn/easeOut/easeInOut/cubicBezier/spring 外还有 bounce（弹跳落定）/elastic（弹性超调）/back（回勾起手），强调类入场优先用这三个。'
             + '所有时间都是场景内绝对毫秒。坐标系：props.x/y 的原点在画布中心（x 右正、y 下正），画布左上角是 (-宽/2, -高/2)——不是 web 的左上角原点，居中就是 x=0,y=0；'
             + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」与缺尺寸/缺描边兜底），改完再写下一幕。',
         },
@@ -549,8 +573,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_asset_import',
       description:
         '登记一份素材（图片/svg/音频/字体）进 spec 的 assets，返回 assetId。'
-        + '本地文件会被复制进插件资产目录，http URL 原样登记。之后在图层 props 里用 src="asset:<assetId>" 引用它'
-        + '（如 image 图层）。素材是共享资源：一次导入，多个图层可用。',
+        + '本地文件会被复制进插件资产目录，http URL 原样登记。素材是共享资源：一次导入，多个图层可用。'
+        + '四类都已接通渲染：image/svg 在图层 props 里用 src="asset:<assetId>" 引用；'
+        + 'font 导入后 text/code 图层的 fontFamily 直接填 assetId 即生效；'
+        + 'audio 用 audio 图层的 src="asset:<assetId>" 引用（volume/loop/stop 控制播放）。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         assetId: { type: 'string', required: true, description: '资产标识（字母/数字/._-），如 gradient-icon' },
@@ -577,7 +603,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_preview',
       description:
-        '渲染若干预览帧（降分辨率）用来检查效果。传入关键时间点（毫秒）抽查，不要整片预览——慢且没必要。',
+        '渲染若干预览帧（降分辨率）用来检查效果。传入关键时间点（毫秒）抽查，不要整片预览——慢且没必要。'
+        + '注意：预览帧无音频（音频只在成片渲染尾步混入），画面效果与成片一致。'
+        + '宿主支持后台任务时立即返回 jobId，帧清单用 job_output 收集；否则同步等待到出帧。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         atMs: { type: 'array', description: '抽帧时间点（绝对毫秒）', items: { type: 'number' } },
@@ -587,12 +615,25 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
-        // meta 用对象（客户端 readReceipt 对数组会回退到解析回执文本）
-        presentationMeta: (_args, value) => ({ frames: (value as { frames?: unknown }).frames ?? [] }) as never,
+        // meta 投影整个回执：kind/jobId 要到卡片，frames 数组是同步回执的主体
+        presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'terminal', title: `anim preview ${args.specId}` }),
+      presentResult: (_args, result) => {
+        // 纯函数：从回执里区分「已转后台」与「同步出帧」两种回执
+        let title = '预览帧就绪'
+        try {
+          const first = result.content[0] as { text?: string } | undefined
+          const parsed = typeof first?.text === 'string' ? (JSON.parse(first.text) as { kind?: string }) : undefined
+          if (parsed?.kind === 'background') title = '预览已转后台任务'
+        } catch {
+          /* 解析不出就维持默认标题 */
+        }
+        return { card: 'generic', title, content: result.content }
+      },
       async execute(args, exec) {
-        return (await opPreview(deps, args, exec.signal)) as never
+        const owner = (exec as { agent?: unknown }).agent
+        return (await opPreview(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
       },
     }),
   )
@@ -603,6 +644,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_render',
       description:
         '把 spec 渲染成 MP4。耗时操作：先用 anim_preview 确认效果再调它；可只渲染指定场景抽查。'
+        + '长片（≥1 分钟）渲染耗时以分钟计，回执的 expectedFrames 是目标帧数；微调后用 scenes 只渲部分场景抽查能省大量时间。'
+        + '段缓存默认开启：没改过的幕直接复用上次渲染结果，只重渲变更幕（回执 incremental 报告命中数）；'
+        + '怀疑缓存产物有问题时传 cache:false 强制全量重渲。'
+        + 'spec 带 audio 图层时自动混音，回执 audioTracks 列出已混入的音轨。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
         + '否则同步等待到出片为止。',
       parameters: {
@@ -610,6 +655,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         outputPath: { type: 'string', description: '输出 MP4 路径，省略则用默认目录' },
         scenes: { type: 'array', description: '只渲染这些场景（0 基索引），省略则整片', items: { type: 'number' } },
         scale: { type: 'number', description: '降采样倍数：1 = 原始分辨率（默认），2 = 长宽各一半；小于 1 的值按缩放系数解释' },
+        cache: { type: 'boolean', description: '段缓存开关，默认开启；传 false 强制全量渲染（忽略所有已缓存段）' },
         renderer: { type: 'string', description: '渲染后端名，省略用默认' },
       },
       output: {

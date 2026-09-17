@@ -13,10 +13,11 @@
  *    直接把 makeScene2D 内联进 scenes 数组，渲染器会在 reloadScenes 里崩掉。
  */
 
-import { extname } from 'node:path'
+import { existsSync } from 'node:fs'
+import { extname, resolve } from 'node:path'
 
 import type { AnimationSpec, Asset, EaseSpec, JsonValue, KeyframeValue, Layer, LayerProps, LayerType, Scene } from '@dsh-anim/spec'
-import { safeName, sceneDurationMs, tweensOf } from '@dsh-anim/spec'
+import { PROP_ALIASES, safeName, sceneDurationMs, specDurationMs, tweensOf } from '@dsh-anim/spec'
 
 export interface GeneratedFile {
   /** 相对项目 src 目录的路径。 */
@@ -28,9 +29,27 @@ export interface GenerateResult {
   files: GeneratedFile[]
   /** 生成期降级（属性不被支持、图层类型未实现等），不阻断渲染。 */
   warnings: string[]
+  /**
+   * 音轨清单（§4.1）：audio 图层不进 MC 帧合成，由 adapter 在编码/拼接之后
+   * 按这份清单 ffmpeg 二次混音。改音量不用清段缓存——音轨永远从现行 spec
+   * 重新收集，段缓存只管画面。
+   */
+  audioTracks: AudioTrackCue[]
 }
 
 /* ------------------------------------------------------------ 属性白名单 */
+
+/**
+ * codegen 产物语义版本（§3.4）：进场景指纹。场景指纹哈希的是场景 JSON +
+ * 渲染参数，而真正决定段内容的是 codegen 的输出——生成器行为一变（如
+ * 「code 缺 fill 兜底主题色」这类不改输入只改输出的修正），旧段必须失效。
+ * **改 codegen 输出语义时手动 +1**（新增图层类型 / 属性兜底 / 时序语义等）。
+ * v2（0.4.0 M2）：slide 转场改中心相对坐标（旧写法把 view 贴到画布边缘）、
+ * code 缺 fill 兜底主题色、project.meta 背景兜底主题底色、字幕条/退场新增。
+ * v3：字幕字号改按画布高度比例（不再跟 theme.font.size），超宽自动折行、
+ * 底条随行数增高——同输入下字幕段输出变了，旧段必须失效。
+ */
+export const CODEGEN_VERSION = 3
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -73,6 +92,9 @@ export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   code: { code: 'code', fontSize: 'fontSize', fontFamily: 'fontFamily', fill: 'fill' },
   // Latex 组件（SVGNode）：tex 是 SVG 源，fill/fontSize 由 MC 的 Shape 信号提供
   math: { tex: 'tex', fontSize: 'fontSize', fill: 'fill' },
+  // audio 不进 MC 画面生成（genSceneFile 在 emitNode 之前跳过），此表只为
+  // Record<LayerType, …> 的完整性存在
+  audio: {},
 }
 
 /**
@@ -103,6 +125,7 @@ export const COMPONENT: Record<LayerType, string> = {
   svg: 'SVG',
   code: 'Code',
   math: 'Latex',
+  audio: 'Node', // audio 永不 emitNode（不进画面），此处仅满足 Record 完整性
 }
 
 /**
@@ -186,8 +209,83 @@ function starPath(size: number, sides: number): string {
 }
 
 /**
+ * 字幕底条宽度用的粗估：CJK 字符按全宽（1em）、其余按 0.6em。
+ * 只求底条别把文字挤出去，不追求像素级精确。
+ */
+function estimateTextWidth(text: string, fontSize: number): number {
+  let w = 0
+  for (const ch of text) w += ch.charCodeAt(0) > 0xff ? fontSize : fontSize * 0.6
+  return Math.round(w)
+}
+
+/**
+ * 字幕折行：整行估宽超出 maxTextWidth 时把 cue 折成多行（行间以 \n 连接，
+ * MC 的 Txt 原生按换行符分行走 lineHeight）。断行规则：CJK 逐字可断、
+ * 拉丁词按空白断；无空白的超长 token（长 URL 之类）按字符硬切兜底。
+ * 与 estimateTextWidth 用同一套估宽——底条尺寸按折行后的最宽行计算，
+ * 估宽误差只影响底条留白，不影响「不出画」这个硬约束。
+ */
+export function wrapSubtitleText(text: string, fontSize: number, maxTextWidth: number): string[] {
+  if (estimateTextWidth(text, fontSize) <= maxTextWidth) return [text]
+  const tokens: string[] = []
+  let word = ''
+  for (const ch of text) {
+    if (/\s/.test(ch)) {
+      if (word !== '') {
+        tokens.push(word)
+        word = ''
+      }
+      tokens.push(' ')
+    } else if (ch.charCodeAt(0) > 0xff) {
+      if (word !== '') {
+        tokens.push(word)
+        word = ''
+      }
+      tokens.push(ch)
+    } else {
+      word += ch
+    }
+  }
+  if (word !== '') tokens.push(word)
+  const fits = (s: string) => estimateTextWidth(s, fontSize) <= maxTextWidth
+  const lines: string[] = []
+  let cur = ''
+  for (const tk of tokens) {
+    if (tk === ' ') {
+      if (cur !== '') cur += ' '
+      continue
+    }
+    if (cur !== '' && fits(cur + tk)) {
+      cur += tk
+      continue
+    }
+    if (cur !== '') {
+      lines.push(cur.replace(/\s+$/, ''))
+      cur = ''
+    }
+    if (fits(tk)) {
+      cur = tk
+      continue
+    }
+    for (const c of tk) {
+      if (cur !== '' && !fits(cur + c)) {
+        lines.push(cur)
+        cur = ''
+      }
+      cur += c
+    }
+  }
+  if (cur !== '') lines.push(cur.replace(/\s+$/, ''))
+  return lines.length > 0 ? lines : [text]
+}
+
+/**
  * 按类型把 props 归一化成最终要写进 JSX 的属性表，并产出警告。
- * 处理三类「模型常写错、静默画不出来」的形态：
+ * 处理四类「模型常写错、静默画不出来」的形态：
+ * - 属性别名（color→fill、strokeWidth→lineWidth，权威表 PROP_ALIASES）→
+ *   归一在最先：它必须发生在颜色/尺寸兜底判断之前，否则「无色兜底」会把
+ *   别名遮成主题色。规范名已给出时别名保留，留给下方白名单走「不支持」
+ *   告警（规范名优先）；本类型不支持规范名时同样保留原名，让告警说人话；
  * - circle 的 radius/r → size×2（MC Circle 没有 radius 信号）；
  * - circle 缺尺寸 → 默认 size=100（MC 默认 0×0 不可见）；
  * - 封闭形状（rect/circle/ellipse/polygon/star）既无 fill 也无 stroke → 主题文字色兜底；
@@ -206,6 +304,14 @@ function normalizeLayerProps(
   for (const [k, v] of Object.entries(props)) {
     if (v === undefined) continue
     out[k] = v as JsonValue
+  }
+  // 属性别名归一（表在 @dsh-anim/spec）：必须先于一切兜底判断
+  const staticAllowed = STATIC_PROPS[type]
+  for (const [alias, canonical] of Object.entries(PROP_ALIASES)) {
+    if (out[alias] !== undefined && out[canonical] === undefined && staticAllowed[canonical] !== undefined) {
+      out[canonical] = out[alias]
+      delete out[alias]
+    }
   }
   if (type === 'group') {
     // children 是组合引用，由 genSceneFile 消费，不是节点属性
@@ -371,10 +477,39 @@ function easeExpr(
       imports.local.add('springTiming')
       return `springTiming(${num(ease.stiffness ?? 170)}, ${num(ease.damping ?? 26)}, ${num(ease.mass ?? 1)})`
     }
+    case 'bounce':
+      imports.core.add('easeOutBounce')
+      return 'easeOutBounce'
+    case 'elastic':
+      imports.core.add('easeOutElastic')
+      return 'easeOutElastic'
+    case 'back':
+      imports.core.add('easeOutBack')
+      return 'easeOutBack'
   }
 }
 
 /* ------------------------------------------------------------ 场景生成 */
+
+/** 一条字幕在本幕内的呈现时段（本地毫秒），由 planSubtitles 换算。 */
+export interface SubtitleCue {
+  text: string
+  startMs: number
+  endMs: number
+}
+
+/**
+ * 字幕条样式与画布信息（§4.3），由 generateProject 从 spec 派生。
+ * fontSize 与正文字号解耦：按画布高度的 4% 取整（14~56 夹取），
+ * 超宽折行与底条几何都以它为准（wrapSubtitleText / 字幕渲染块）。
+ */
+export interface SubtitleStyle {
+  mutedFill: string
+  textColor: string
+  fontSize: number
+  canvasWidth: number
+  canvasHeight: number
+}
 
 function genSceneFile(
   scene: Scene,
@@ -384,6 +519,7 @@ function genSceneFile(
   assets: Record<string, Asset>,
   warnings: string[],
   usedHighlighters: Set<string>,
+  subtitleStyle: SubtitleStyle,
 ): GeneratedFile {
   const components = new Set<string>()
   const coreImports = new Set<string>()
@@ -442,26 +578,20 @@ function genSceneFile(
     for (const key of COMMON_PROPS) allowed[key] = key
     const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings, assets)
     for (const [rawProp, value] of Object.entries(normalized)) {
-      let prop = rawProp
-      // 模型几乎必然写过 color：语义就是填充色，按 fill 处理而不是丢弃
-      if (prop === 'color' && !allowed.color && allowed.fill) {
-        prop = 'fill'
-      }
-      // SVG 习惯名 strokeWidth 同义于 IR 的 lineWidth（真机批量踩过：所有线条
-      // 的描边宽度被静默丢弃）。lineWidth 已显式给出时不改写——规范名优先，
-      // 冗余的 strokeWidth 走下方「不支持」警告
-      if (prop === 'strokeWidth' && allowed.lineWidth && normalized.lineWidth === undefined) {
-        prop = 'lineWidth'
-      }
-      const mapped = allowed[prop]
+      // 别名归一已在 normalizeLayerProps 完成（先于兜底判断）；走到这里的
+      // 别名键都是「规范名已给出」或「本类型不支持规范名」的冗余形态，
+      // 白名单查不到自然落到下方「不支持」告警——规范名优先，不静默覆盖
+      const mapped = allowed[rawProp]
       if (!mapped) {
         warnings.push(`图层 ${layer.id} 的属性 ${rawProp} 不被 ${layer.type} 支持，已忽略`)
         continue
       }
       attrs.push(`${mapped}={${litProp(value)}}`)
     }
-    // text/math 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——兜底主题文字色
-    if ((layer.type === 'text' || layer.type === 'math') && normalized.fill === undefined && normalized.color === undefined) {
+    // text/math/code 没写 fill 时 MC 默认深色，在深底上就是「黑字黑底」看不见——
+    // 兜底主题文字色（normalize 阶段 color 已归一为 fill 或被白名单拦下，这里只看 fill；
+    // code 的默认色在自带的深色底上同样不可见，真机 M2 验收抓到后一并纳入）
+    if ((layer.type === 'text' || layer.type === 'math' || layer.type === 'code') && normalized.fill === undefined) {
       attrs.push(`fill={${JSON.stringify(defaultTextFill)}}`)
     }
     // code 图层写了 language：挂上对应高亮器（带语言的 code 图层才触发 code-highlight 模块生成）
@@ -489,10 +619,11 @@ function genSceneFile(
     const animatable = ANIMATABLE_BY_TYPE[layer.type]
     for (const track of layer.tracks) {
       let prop = track.target.replace(/^props\./, '')
-      // 与静态属性侧同一约定：SVG 习惯名 strokeWidth 改写为 lineWidth 后再查
-      // 可动画集合，写 lineWidth 才能被 ANIMATABLE_BY_TYPE 放行
-      if (prop === 'strokeWidth' && !animatable.has('strokeWidth') && animatable.has('lineWidth')) {
-        prop = 'lineWidth'
+      // 轨道目标走同一张别名表（@dsh-anim/spec）：存量 spec 里已落库的
+      // props.strokeWidth 轨道由此一并复活（0.3.x O21 的延续，表驱动化）
+      const alias = PROP_ALIASES[prop]
+      if (alias !== undefined && !animatable.has(prop) && animatable.has(alias)) {
+        prop = alias
       }
       if (!animatable.has(prop)) {
         warnings.push(`图层 ${layer.id} 的轨道目标 ${track.target} 不可动画，已忽略`)
@@ -516,8 +647,15 @@ function genSceneFile(
     initial.push(...initials.values())
   }
 
-  // 主循环：group 的成员随所属组一起生成（保证父节点先于子节点存在）
+  // 主循环：group 的成员随所属组一起生成（保证父节点先于子节点存在）。
+  // audio 图层不进画面（音轨走 adapter 的 ffmpeg mux），整体跳过
   for (const layer of scene.layers) {
+    if (layer.type === 'audio') {
+      if (layer.tracks.length > 0) {
+        warnings.push(`audio 图层 ${layer.id} 的轨道不参与画面与时长，已忽略`)
+      }
+      continue
+    }
     if (parentOf.has(layer.id)) continue // 成员由所属 group 内联生成
     if (layer.type === 'group') {
       const name = emitNode(layer, 'view')
@@ -533,31 +671,161 @@ function genSceneFile(
     emitTracks(layer)
   }
 
-  // 进入转场
+  // 入场转场：view 级变换。**view.x/y 是位置分量**（MC 的画布中心在
+  // size/2），slide 系列的起点/终点都必须相对画布中心表达——写成 0 会把
+  // 整个 view（连同背景矩形）贴到画布左/上缘（0.2 起的潜伏缺陷，M2 真机
+  // 验收抽帧时抓到：slide 入场后半屏露黑、内容整体偏移半幅）。
+  const cx = subtitleStyle.canvasWidth / 2
+  const cy = subtitleStyle.canvasHeight / 2
   if (scene.transition && scene.transition.kind !== 'none') {
     const ease = easeExpr(scene.transition.ease, imports)
     const easeArg = ease ? `, ${ease}` : ''
     const d = sec(scene.transition.durationMs)
-    if (scene.transition.kind === 'fade') {
-      initial.push('view.opacity(0);')
-      tasks.push(`delay(0, view.opacity(1, ${d}${easeArg})),`)
-    } else if (scene.transition.kind === 'slideLeft') {
-      initial.push('view.x(200);')
-      tasks.push(`delay(0, view.x(0, ${d}${easeArg})),`)
-    } else if (scene.transition.kind === 'slideUp') {
-      initial.push('view.y(200);')
-      tasks.push(`delay(0, view.y(0, ${d}${easeArg})),`)
+    switch (scene.transition.kind) {
+      case 'fade':
+        initial.push('view.opacity(0);')
+        tasks.push(`delay(0, view.opacity(1, ${d}${easeArg})),`)
+        break
+      case 'slideLeft':
+        initial.push(`view.x(${num(cx + 200)});`, `view.y(${num(cy)});`)
+        tasks.push(`delay(0, view.x(${num(cx)}, ${d}${easeArg})),`)
+        break
+      case 'slideRight':
+        initial.push(`view.x(${num(cx - 200)});`, `view.y(${num(cy)});`)
+        tasks.push(`delay(0, view.x(${num(cx)}, ${d}${easeArg})),`)
+        break
+      case 'slideUp':
+        initial.push(`view.y(${num(cy + 200)});`, `view.x(${num(cx)});`)
+        tasks.push(`delay(0, view.y(${num(cy)}, ${d}${easeArg})),`)
+        break
+      case 'slideDown':
+        initial.push(`view.y(${num(cy - 200)});`, `view.x(${num(cx)});`)
+        tasks.push(`delay(0, view.y(${num(cy)}, ${d}${easeArg})),`)
+        break
+      case 'zoomIn':
+        initial.push('view.scale(0.6);', 'view.opacity(0);')
+        tasks.push(`delay(0, view.scale(1, ${d}${easeArg})),`)
+        tasks.push(`delay(0, view.opacity(1, ${d}${easeArg})),`)
+        break
+      default:
+        warnings.push(`转场类型 ${String(scene.transition.kind)} 未实现，已忽略`)
     }
   }
 
   const duration = sceneDurationMs(scene)
+
+  // 幕尾退场（§4.4）：占用本幕最后 exit.durationMs 做整体退出。退场任务把
+  // 时间线顶到场景末尾，因此 lastEnd 必须纳入 exitEnd——否则尾部 waitFor
+  // 补齐逻辑会在退场后再拖一段静止时间，退场永远放不完。slide 退场滑出
+  // 半幅再带 240px 余量，保证画面完全离场。
+  let exitCoveredDuration = false
+  if (scene.exit && scene.exit.kind !== 'none' && scene.exit.durationMs > 0) {
+    const ease = easeExpr(scene.exit.ease, imports)
+    const easeArg = ease ? `, ${ease}` : ''
+    const d = sec(scene.exit.durationMs)
+    const exitStart = sec(Math.max(0, duration - scene.exit.durationMs))
+    switch (scene.exit.kind) {
+      case 'fade':
+        tasks.push(`delay(${exitStart}, view.opacity(0, ${d}${easeArg})),`)
+        exitCoveredDuration = true
+        break
+      case 'slideLeft':
+        tasks.push(`delay(${exitStart}, view.x(${num(-(cx + 240))}, ${d}${easeArg})),`)
+        exitCoveredDuration = true
+        break
+      case 'slideRight':
+        tasks.push(`delay(${exitStart}, view.x(${num(cx + cx + 240)}, ${d}${easeArg})),`)
+        exitCoveredDuration = true
+        break
+      case 'slideUp':
+        tasks.push(`delay(${exitStart}, view.y(${num(-(cy + 240))}, ${d}${easeArg})),`)
+        exitCoveredDuration = true
+        break
+      case 'slideDown':
+        tasks.push(`delay(${exitStart}, view.y(${num(cy + cy + 240)}, ${d}${easeArg})),`)
+        exitCoveredDuration = true
+        break
+      default:
+        warnings.push(`退场类型 ${String(scene.exit.kind)} 暂不支持（可选：fade / slideLeft / slideRight / slideUp / slideDown），已忽略`)
+    }
+  }
+
+  // 字幕条（§4.3）：底部居中，muted 半透明底条 + 主题文字色，按 cue 时段
+  // 150ms 淡入淡出。字幕来自 scene.subtitles（expandNarration 的展开产物，
+  // 场景内本地毫秒），只存在于生成的 TSX 里。
+  // 超宽自动折行（wrapSubtitleText）：底条按最宽行计算、随行数增高，底边
+  // 锚定在「画布底边上方 36px」——行数变多时向上生长，不越过画布下缘。
+  let maxBandH = 0
+  let bandUsed = false
+  for (const [i, cue] of (scene.subtitles ?? []).entries()) {
+    const bg = `nsub${i}bg`
+    const tx = `nsub${i}tx`
+    const fontSize = subtitleStyle.fontSize
+    const lineHeight = Math.round(fontSize * 1.4)
+    const padV = Math.round(fontSize * 0.55)
+    const lines = wrapSubtitleText(cue.text, fontSize, Math.round(subtitleStyle.canvasWidth * 0.86) - 48)
+    const textW = Math.max(...lines.map(l => estimateTextWidth(l, fontSize)))
+    const w = Math.min(Math.round(subtitleStyle.canvasWidth * 0.9), textW + 48)
+    const h = lines.length * lineHeight + padV * 2
+    if (h > maxBandH) maxBandH = h
+    bandUsed = true
+    const y = Math.round(subtitleStyle.canvasHeight / 2 - h / 2 - 36)
+    components.add('Rect')
+    components.add('Txt')
+    coreImports.add('createRef')
+    setup.push(`const ${bg} = createRef<Rect>();`)
+    setup.push(`view.add(<Rect ref={${bg}} x={0} y={${y}} width={${num(w)}} height={${h}} radius={${Math.round(h / 4)}} fill={${JSON.stringify(subtitleStyle.mutedFill)}} opacity={0} />);`)
+    setup.push(`const ${tx} = createRef<Txt>();`)
+    // MC 的 lineHeight 数字语义是 px，倍数要走字符串（'140' → 1.4 倍）；
+    // textWrap='pre' 是 \n 分行的开关（默认 DOM 布局会折叠换行符）
+    setup.push(`view.add(<Txt ref={${tx}} x={0} y={${y}} text={${JSON.stringify(lines.join('\n'))}} fontSize={${fontSize}} lineHeight={'140'} textWrap={'pre'} fill={${JSON.stringify(subtitleStyle.textColor)}} opacity={0} />);`)
+    const fadeIn = 150
+    const fadeOut = cue.endMs - cue.startMs < 2 * fadeIn ? Math.round((cue.endMs - cue.startMs) / 2) : fadeIn
+    const fadeOutAt = Math.max(cue.startMs, cue.endMs - fadeOut)
+    tasks.push(`delay(${sec(cue.startMs)}, ${bg}().opacity(0.6, ${sec(fadeOut)})),`)
+    tasks.push(`delay(${sec(cue.startMs)}, ${tx}().opacity(1, ${sec(fadeOut)})),`)
+    tasks.push(`delay(${sec(fadeOutAt)}, ${bg}().opacity(0, ${sec(fadeOut)})),`)
+    tasks.push(`delay(${sec(fadeOutAt)}, ${tx}().opacity(0, ${sec(fadeOut)})),`)
+  }
+
+  // 字幕安全区提醒（软警告）：有字幕的幕，画布底部这一横条是字幕带，正文
+  // 图层的锚点落进去会被字幕盖住。锚点级检查（props.y / props.y 轨道关键帧 /
+  // line/arrow 的 points），不追图层包围盒——居中或全屏元素（y≈0）不会误报。
+  if (bandUsed) {
+    const bandTop = subtitleStyle.canvasHeight / 2 - 36 - maxBandH
+    const offenders = new Set<string>()
+    for (const layer of scene.layers) {
+      if (layer.type === 'audio' || layer.type === 'group') continue
+      const baseY = typeof layer.props.y === 'number' ? layer.props.y : 0
+      const ys: number[] = []
+      if (baseY !== 0) ys.push(baseY)
+      for (const tr of layer.tracks) {
+        if (tr.target !== 'props.y') continue
+        for (const k of tr.keys) if (typeof k.value === 'number') ys.push(k.value)
+      }
+      const pts = layer.props.points
+      if (Array.isArray(pts)) {
+        for (const p of pts) {
+          if (Array.isArray(p) && typeof p[1] === 'number') ys.push(baseY + p[1])
+        }
+      }
+      if (ys.some(v => v > bandTop)) offenders.add(layer.id)
+    }
+    if (offenders.size > 0) {
+      warnings.push(
+        `本幕有字幕：画布底部约 ${Math.round(maxBandH + 36)}px 高的区域是字幕带，图层 ${[...offenders].join(' / ')} 的位置落在其中会被字幕遮挡，正文内容建议上移（y < ${Math.round(bandTop)}）`,
+      )
+    }
+  }
+
   // 补齐到场景时长，让「留白」也进时间线
   const lastEnd = scene.layers.reduce((max, layer) => {
+    if (layer.type === 'audio') return max
     for (const track of layer.tracks) {
       for (const t of tweensOf(track)) max = Math.max(max, t.startMs + t.durationMs)
     }
     return max
-  }, scene.transition?.durationMs ?? 0)
+  }, Math.max(scene.transition?.durationMs ?? 0, ...(scene.subtitles ?? []).map(c => c.endMs), exitCoveredDuration ? duration : 0))
   // 没有任何 yield 的场景时长为 0，渲染时会直接被跳过——务必至少撑住声明时长
   const tail = duration - lastEnd
   const needsWaitFor = tasks.length === 0 || tail > 1
@@ -634,7 +902,9 @@ export function generateProjectMeta(spec: AnimationSpec, resolutionScale = 1): s
   const meta = {
     version: 0,
     shared: {
-      background: spec.meta.background ?? null,
+      // 背景兜底主题底色：view 滑入/缩放入场时背景矩形会短暂离位，露出的是
+      // project 背景——留 null（黑）会让 slide/zoom 入场的第一帧发黑
+      background: spec.meta.background ?? spec.theme.colors.background ?? null,
       range: [0, null] as [number, null],
       size: { x: spec.meta.size.width, y: spec.meta.size.height },
       audioOffset: 0,
@@ -653,6 +923,187 @@ export function generateProjectMeta(spec: AnimationSpec, resolutionScale = 1): s
   return JSON.stringify(meta, null, 2)
 }
 
+/* ------------------------------------------------- 音轨清单 / 字幕 / 字体 */
+
+/**
+ * 一条待混音的音轨（§4.1）。时间与时长都是**渲染成片口径**的绝对值：
+ * 场景起点按 sceneDurationMs 累计换算，`anim_render` 的 scenes 抽查渲染
+ * 的是切片后的 spec，音轨清单也从切片后重新收集，两边天然一致。
+ */
+export interface AudioTrackCue {
+  /** 引用的资产 id（回执 audioTracks 展示用；直连 URL 时为图层 id）。 */
+  assetId: string
+  /** ffmpeg 输入源：本地绝对路径或 http(s) URL。 */
+  source: string
+  /** 全片绝对起点（毫秒）。 */
+  startMs: number
+  /** 播放时长（毫秒），已按 stop 语义截断。 */
+  durationMs: number
+  /** 音量 0~1（越界已钳制）。 */
+  volume: number
+  /** 播到时长尽头仍没放完时循环。 */
+  loop: boolean
+}
+
+/**
+ * 从 spec 收集音轨清单（§4.1）。
+ *
+ * audio 图层不进 MC 帧合成（MC 的 Audio 节点不参与导出），成片的音频由
+ * adapter 在编码/拼接之后按本清单 ffmpeg 二次混入。解析规则与 image 的
+ * asset: 引用同构：`asset:<id>` 解析成资产文件的本地绝对路径（ffmpeg 不认
+ * vite 的 /assets URL，但认文件路径），http(s) URL 原样透传（ffmpeg 可直接
+ * 流式拉取）。文件缺失只警告不阻断——缺音轨的片子仍是无声成片，不该让
+ * 整个渲染失败。
+ */
+export function collectAudioTracks(spec: AnimationSpec): { cues: AudioTrackCue[]; warnings: string[] } {
+  const warnings: string[] = []
+  const cues: AudioTrackCue[] = []
+  const totalMs = specDurationMs(spec.scenes)
+  let cursor = 0
+  for (const scene of spec.scenes) {
+    const sceneDur = sceneDurationMs(scene)
+    for (const layer of scene.layers) {
+      if (layer.type !== 'audio') continue
+      const props = layer.props
+      const src = typeof props.src === 'string' ? props.src : undefined
+      let source: string | undefined
+      let assetId = layer.id
+      if (src === undefined || src.trim() === '') {
+        warnings.push(`audio 图层 ${layer.id} 未提供 src（用 "asset:<assetId>" 引用已导入的音频资产），已忽略`)
+      } else if (src.startsWith('asset:')) {
+        assetId = src.slice('asset:'.length)
+        const asset = spec.assets[assetId]
+        if (!asset) {
+          warnings.push(`audio 图层 ${layer.id} 引用了未登记的资产 ${assetId}（用 anim_asset_import 登记后再引用），已忽略`)
+        } else if (/^https?:\/\//.test(asset.src)) {
+          source = asset.src
+        } else {
+          const abs = resolve(asset.src)
+          if (existsSync(abs)) source = abs
+          else warnings.push(`audio 图层 ${layer.id} 的资产文件不存在：${abs}，已忽略`)
+        }
+      } else if (/^https?:\/\//.test(src)) {
+        source = src
+      } else {
+        warnings.push(`audio 图层 ${layer.id} 的 src 应为 "asset:<assetId>" 或 http(s) URL，已忽略`)
+      }
+      if (source === undefined) continue
+
+      const offsetMs = typeof props.atMs === 'number' && Number.isFinite(props.atMs) ? Math.max(0, props.atMs) : 0
+      const startMs = cursor + offsetMs
+      const stopAt = props.stop === 'specEnd' ? totalMs : cursor + sceneDur
+      if (startMs >= stopAt) {
+        warnings.push(`audio 图层 ${layer.id} 的起点（${startMs}ms）不早于停止点（${stopAt}ms），无声可放，已忽略`)
+        continue
+      }
+      let volume = 1
+      if (props.volume !== undefined) {
+        if (typeof props.volume === 'number' && Number.isFinite(props.volume)) {
+          volume = Math.min(1, Math.max(0, props.volume))
+          if (volume !== props.volume) {
+            warnings.push(`audio 图层 ${layer.id} 的 volume ${props.volume} 超出 0~1，已钳制为 ${volume}`)
+          }
+        } else {
+          warnings.push(`audio 图层 ${layer.id} 的 volume 应为数字，已按 1 处理`)
+        }
+      }
+      cues.push({
+        assetId,
+        source,
+        startMs,
+        durationMs: stopAt - startMs,
+        volume,
+        loop: props.loop === true,
+      })
+    }
+    cursor += sceneDur
+  }
+  return { cues, warnings }
+}
+
+/** 一条字幕在本幕内的呈现时段（本地毫秒）。 */
+export interface SubtitleCue {
+  text: string
+  startMs: number
+  endMs: number
+}
+
+/**
+ * 旁白字幕展开（§4.3）：把顶层 `narration.cues`（**全片绝对毫秒**）展开成
+ * 各幕的 `scene.subtitles`（场景内本地毫秒），返回的 spec 不再带 narration。
+ *
+ * 为什么在渲染入口展开而不是在 codegen 里现场换算：展开之后字幕就是场景
+ * JSON 的一部分——场景级增量渲染按场景指纹缓存，字幕改动天然触发该幕重渲；
+ * scenes 抽查 / 幕级 solo 切片后字幕跟着场景走、本地时间不丢。真机验收发现
+ * 的缺陷即来源于此：在切片后的 spec 上现场换算全局时间，第二幕的字幕整条
+ * 丢失且不触发重渲。
+ *
+ * 规则：cue 缺省时长按中文语速估（≈4 字/秒，下限 1200ms）；跨幕 cue 每幕各
+ * 出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；超 80 字
+ * 软警告（渲染端自动折行，不再截断——过长字幕画面偏挤，建议拆 cue）；起点
+ * 越出全片时长给软警告。原 spec 不被修改。
+ */
+export function expandNarration(spec: AnimationSpec): { spec: AnimationSpec; warnings: string[] } {
+  const warnings: string[] = []
+  const cues = spec.narration?.cues ?? []
+  if (cues.length === 0) return { spec, warnings }
+  const totalMs = specDurationMs(spec.scenes)
+  const expanded = cues.map((cue, i) => {
+    const durationMs = cue.durationMs ?? Math.max(1200, Math.round((cue.text.length / 4) * 1000))
+    if (cue.atMs >= totalMs) {
+      warnings.push(`旁白 cue ${i}（${cue.atMs}ms）起于全片时长（${totalMs}ms）之外，不会出现`)
+    }
+    if (cue.text.length > 80) {
+      warnings.push(`旁白 cue ${i} 超过 80 字，一条 cue 建议不超过 40 字（渲染时会自动折行，但整屏都是字幕观感偏挤）`)
+    }
+    return { atMs: cue.atMs, durationMs, text: cue.text }
+  })
+  const scenes: Scene[] = []
+  let cursor = 0
+  for (const scene of spec.scenes) {
+    const sceneDur = sceneDurationMs(scene)
+    const sceneStart = cursor
+    cursor += sceneDur
+    const subs: SubtitleCue[] = []
+    for (const cue of expanded) {
+      // cue（全片绝对毫秒）与本幕窗口 [sceneStart, sceneStart+sceneDur) 的
+      // 交集，换算成场景内本地毫秒
+      const start = Math.max(cue.atMs, sceneStart) - sceneStart
+      const end = Math.min(cue.atMs + cue.durationMs, sceneStart + sceneDur) - sceneStart
+      if (end - start <= 30) continue
+      subs.push({ text: cue.text, startMs: start, endMs: end })
+    }
+    scenes.push(subs.length > 0 ? { ...scene, subtitles: subs } : scene)
+  }
+  return { spec: { ...spec, scenes, narration: undefined }, warnings }
+}
+
+/**
+ * font 资产 → fonts.css（§4.2）：每个 font 资产一条 @font-face。
+ * family 直接用 assetId 原文（opAssetImport 限制为 [A-Za-z0-9._-]，可安全
+ * 进 CSS 引号串），模型在 text/code 图层写 fontFamily: "<assetId>" 即生效；
+ * 文件 URL 用 safeName 净化串，与 copyAssetsToPublic 落盘的文件名严格一致。
+ * http(s) 字体 URL 原样引用（注意远端字体需要 CORS 头，否则 canvas 拿不到）。
+ * 没有 font 资产时不生成，项目保持最小。
+ */
+const FONT_FORMATS: Record<string, string> = { ttf: 'truetype', otf: 'opentype', woff: 'woff', woff2: 'woff2' }
+
+export function generateFontsCss(assets: Record<string, Asset>): GeneratedFile | undefined {
+  const fonts = Object.entries(assets).filter(([, a]) => a.kind === 'font')
+  if (fonts.length === 0) return undefined
+  const rules = fonts.map(([id, asset]) => {
+    const isRemote = /^https?:\/\//.test(asset.src)
+    const ext = extname(isRemote ? asset.src.split(/[?#]/)[0]! : asset.src).slice(1).toLowerCase()
+    const url = isRemote ? asset.src : `/assets/${safeName(id)}${ext ? `.${ext}` : ''}`
+    const format = FONT_FORMATS[ext] ?? 'truetype'
+    return `@font-face {\n  font-family: '${id}';\n  src: url('${url}') format('${format}');\n}`
+  })
+  return {
+    path: 'fonts.css',
+    content: `/* 自定义字体（font 资产 → @font-face）。由 @dsh-anim/render-mc 生成，请勿手工编辑。 */\n${rules.join('\n')}\n`,
+  }
+}
+
 /* ------------------------------------------------------------------ 入口 */
 
 /** 把一份 spec 编译成可直接交给 Motion Canvas 构建的项目文件。 */
@@ -666,15 +1117,39 @@ export function generateProject(
 
   const files: GeneratedFile[] = [{ path: 'anim-easing.ts', content: EASING_FILE }]
 
+  // 旁白 cues → 各幕 subtitles（§4.3）：字幕变成场景数据的一部分，
+  // 场景级增量渲染的切片与指纹因此天然正确（见 expandNarration 注释）
+  const expanded = expandNarration(spec)
+  warnings.push(...expanded.warnings)
+  spec = expanded.spec
+
+  // font 资产 → fonts.css（§4.2）：project.tsx 里 import 使 @font-face 生效
+  const fontsCss = generateFontsCss(spec.assets)
+  if (fontsCss) files.push(fontsCss)
+
+  const subtitleStyle: SubtitleStyle = {
+    mutedFill: spec.theme.colors.muted ?? '#8A8F98',
+    textColor: defaultTextFill,
+    // 字幕字号与画布高度成比例（约 4%，视频字幕的常见比例），不跟正文字号
+    // （theme.font.size）走——正文 48px 的主题直接拿来当字幕就是顶天立地。
+    fontSize: Math.min(56, Math.max(14, Math.round(spec.meta.size.height * 0.04))),
+    canvasWidth: spec.meta.size.width,
+    canvasHeight: spec.meta.size.height,
+  }
+
   // code 图层用了 language 才生成高亮模块：没有任何 code 图层时，
   // 生成物不依赖 @lezer/* 语言包，项目保持最小。
   const usedHighlighters = new Set<string>()
   spec.scenes.forEach((scene, i) => {
-    files.push(genSceneFile(scene, i, background, defaultTextFill, spec.assets, warnings, usedHighlighters))
+    files.push(genSceneFile(scene, i, background, defaultTextFill, spec.assets, warnings, usedHighlighters, subtitleStyle))
   })
   if (usedHighlighters.size > 0) {
     files.push({ path: 'code-highlight.ts', content: CODE_HIGHLIGHT_FILE })
   }
+
+  // 音轨清单（§4.1）：audio 不进帧合成，adapter 在编码/拼接后按清单混音
+  const audio = collectAudioTracks(spec)
+  warnings.push(...audio.warnings)
 
   const imports = spec.scenes.map((s, i) => `import s${i} from './scenes/s${i}-${sanitize(s.id)}?scene';`)
   const L: string[] = []
@@ -685,6 +1160,7 @@ export function generateProject(
   L.push(' * `?scene` 后缀是必需的：vite 插件会给场景补上 makeProject 需要的运行时字段。')
   L.push(' */')
   for (const line of imports) L.push(line)
+  if (fontsCss) L.push("import './fonts.css';")
   L.push(`import {makeProject} from '@motion-canvas/core';`)
   L.push('')
   L.push('export default makeProject({')
@@ -697,5 +1173,5 @@ export function generateProject(
   files.push({ path: 'project.tsx', content: L.join('\n') })
   files.push({ path: 'project.meta', content: generateProjectMeta(spec, options.resolutionScale ?? 1) })
 
-  return { files, warnings }
+  return { files, warnings, audioTracks: audio.cues }
 }

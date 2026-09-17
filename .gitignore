@@ -21,3 +21,4 @@ output/
 # 编辑器
 .vscode/
 .idea/
+.tmp/

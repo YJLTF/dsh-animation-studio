@@ -211,7 +211,8 @@ assert.equal(undone.applied, 1)
 
 const got = await byName['anim_get'].execute({ specId: 'smoke', path: '/scenes/0/layers/0/props/text' }, exec)
 assert.equal(got.value, '你好')
-console.log('  ✔ create → plan → draft → patch → undo → get 执行链路通过')
+assert.equal(planned.sessionId, 'sess-main', '§5.2：回执应盖会话章（面板按钮把指令发回当前会话靠它）')
+console.log('  ✔ create → plan → draft → patch → undo → get 执行链路通过（回执带 sessionId）')
 
 // sidecar 的形状：类型齐全、按序落盘、宿主日志零污染
 const sidecar = readSidecar(sessionsDir, 'sess-main')

@@ -27,6 +27,13 @@ export const spec: AnimationSpec = {
     font: { family: 'Noto Sans CJK SC', size: 48 },
   },
   assets: {},
+  // 0.4.0 §4.3：旁白字幕（atMs 为全片绝对毫秒），渲染时自动出底部字幕条
+  narration: {
+    cues: [
+      { atMs: 300, text: '梯度下降：沿着最陡的方向走到最低点' },
+      { atMs: 11500, text: '更新规则：参数减去学习率乘梯度' },
+    ],
+  },
 
   scenes: [
     {
@@ -319,6 +326,55 @@ export const spec: AnimationSpec = {
                 { atMs: 1300, value: 1, ease: { kind: 'easeOut' } },
                 { atMs: 2800, value: 1 },
                 { atMs: 3200, value: 0 },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'morph',
+      name: '0.4.0 技巧演示：代码演化 / back 弹入 / zoomIn 入场 / fade 退场',
+      durationMs: 3000,
+      transition: { kind: 'zoomIn', durationMs: 450 },
+      exit: { kind: 'fade', durationMs: 500 },
+      layers: [
+        {
+          id: 'm-code',
+          name: '演化代码',
+          type: 'code',
+          props: {
+            code: 'theta = theta - alpha * grad',
+            language: 'python',
+            fontSize: 34,
+            fill: '#F2F5F7',
+            x: 0,
+            y: -40,
+          },
+          // 0.4.0 §4.6 代码演化：props.code 多字符串关键帧 → 逐词 diff morph
+          tracks: [
+            {
+              id: 'code-morph',
+              target: 'props.code',
+              keys: [
+                { atMs: 0, value: 'theta = theta - alpha * grad' },
+                { atMs: 1600, value: 'theta = theta - 0.1 * grad', ease: { kind: 'easeInOut' } },
+              ],
+            },
+          ],
+        },
+        {
+          id: 'm-star',
+          name: '强调星（back 弹入）',
+          type: 'star',
+          props: { size: 40, fill: '#FFB020', x: 320, y: -40 },
+          tracks: [
+            {
+              id: 'star-back',
+              target: 'props.scale',
+              keys: [
+                { atMs: 1800, value: 0 },
+                { atMs: 2300, value: 1, ease: { kind: 'back' } },
               ],
             },
           ],

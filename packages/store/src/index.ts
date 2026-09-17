@@ -12,6 +12,22 @@
 import type { AnimationSpec, JsonValue, PatchOp, Scene } from '@dsh-anim/spec'
 import { applyPatch, specDurationMs, validateSpec } from '@dsh-anim/spec'
 
+/**
+ * 分镜大纲条目（`anim/outline-updated` 载荷的最小切片；store 只保存不解释）。
+ * 形状与 tools 包 events.ts 的 AnimOutlineData 对齐，但放宽字段必填性——
+ * 回放遇到旧版载荷时以能保存的部分为准。
+ */
+export interface OutlineItem {
+  id: string
+  name: string
+  /** 这一幕要让学生明白什么。 */
+  intent?: string
+  /** 旁白草稿，可为空。 */
+  narration?: string
+  /** 建议时长（毫秒）。 */
+  durationMs?: number
+}
+
 export interface PatchRecord {
   ops: PatchOp[]
   inverse: PatchOp[]
@@ -24,6 +40,12 @@ export interface SpecRecord {
   /** patch 应用次数，UI 用来判断「我这份是不是最新的」。 */
   version: number
   history: PatchRecord[]
+  /**
+   * 最新一份分镜大纲（opPlan 写入 / foldEvents 回放）。
+   * 大纲进状态才能做「大纲 ↔ 实际场景」对账：幕数不符、id 错位、时长偏差
+   * 不再无人说话（0.4.0 规划 N3）。
+   */
+  outline?: OutlineItem[]
 }
 
 export class SpecStoreError extends Error {}
@@ -111,9 +133,12 @@ export class SpecStore {
   /** 撤销最后一次修改。 */
   undo(specId: string): PatchOp[] | undefined {
     const record = this.record(specId)
-    const last = record.history.pop()
+    const last = record.history[record.history.length - 1]
     if (!last) return undefined
+    // 先应用、成功后再出栈：inverse 万一应用失败（历史与当前态漂移，如坏
+    // 事件恢复），记录还在、spec 不动——「撤销失败还把历史丢了」比不撤销更糟
     const { value } = applyPatch(record.spec, last.inverse)
+    record.history.pop()
     record.spec = value
     record.version += 1
     return last.inverse
@@ -135,6 +160,15 @@ export class SpecStore {
 
   durationMs(specId: string): number {
     return specDurationMs(this.get(specId).scenes)
+  }
+
+  /**
+   * 记录最新一份分镜大纲。这是 opPlan 的状态侧写入（事件由 ops 层照发），
+   * 回放时 foldEvents 消费同一条 `anim/outline-updated`——两条路径保存的
+   * 是同一份大纲，对账才不会在恢复后的会话里失明。
+   */
+  setOutline(specId: string, outline: readonly OutlineItem[]): void {
+    this.record(specId).outline = [...outline]
   }
 }
 
@@ -177,8 +211,17 @@ export function foldEvents(events: readonly AnimEventView[]): SpecStore {
         }
         break
       }
+      case 'anim/outline-updated': {
+        // 大纲进状态（对账用）；spec 尚未创建（乱序回放）时跳过不崩
+        const data = ev.data as { specId?: unknown; outline?: unknown }
+        if (typeof data.specId !== 'string' || !Array.isArray(data.outline)) break
+        if (store.has(data.specId)) {
+          store.record(data.specId).outline = data.outline as OutlineItem[]
+        }
+        break
+      }
       default:
-        // outline / render-* 不影响 spec 状态
+        // render-* 只讲渲染进度，不影响 spec 状态
         break
     }
   }

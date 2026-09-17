@@ -219,6 +219,14 @@ async function mountMotionCanvas(ctx: Context, outputDir: string): Promise<Dispo
       workDir,
     })
     provideRenderer(ctx, renderer, { isDefault: true })
+    // 插件卸载（含 HMR）时释放常驻浏览器与 vite 实例（0.4.0 规划 §3.2）
+    return async () => {
+      try {
+        await renderer.dispose()
+      } catch {
+        /* 卸载期的释放失败不拖垮宿主 */
+      }
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     try {
@@ -226,9 +234,8 @@ async function mountMotionCanvas(ctx: Context, outputDir: string): Promise<Dispo
     } catch {
       console.warn(`[dsh-anim-studio] Motion Canvas 渲染后端加载失败：${message}`)
     }
+    return () => {}
   }
-  // 注册表自身的生命周期由 provide effect 管理，这里无需额外注销
-  return () => {}
 }
 
 export { foldEvents }

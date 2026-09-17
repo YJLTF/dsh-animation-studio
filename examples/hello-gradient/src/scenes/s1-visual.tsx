@@ -3,7 +3,7 @@
  * 由 @dsh-anim/render-mc 从 AnimationSpec 生成，请勿手工编辑。
  */
 import {all, createRef, delay, easeInCubic, easeInOutCubic, easeOutCubic} from '@motion-canvas/core';
-import {makeScene2D, Circle, Line, Txt} from '@motion-canvas/2d';
+import {makeScene2D, Circle, Line, Rect, Txt} from '@motion-canvas/2d';
 import {springTiming} from '../anim-easing';
 
 export default makeScene2D(function* (view) {
@@ -17,6 +17,10 @@ export default makeScene2D(function* (view) {
   view.add(<Circle ref={n2_ball} fill={"#FFB020"} x={-240} y={-150} size={64} />);
   const n3_ball_label = createRef<Txt>();
   view.add(<Txt ref={n3_ball_label} text={"每一步都朝着更低的地方走"} fontSize={38} fill={"#F2F5F7"} x={0} y={-230} />);
+  const nsub0bg = createRef<Rect>();
+  view.add(<Rect ref={nsub0bg} x={0} y={288} width={541} height={73} radius={18} fill={"#8B97A3"} opacity={0} />);
+  const nsub0tx = createRef<Txt>();
+  view.add(<Txt ref={nsub0tx} x={0} y={288} text={"梯度下降：沿着最陡的方向走到最低点"} fontSize={29} lineHeight={'140'} textWrap={'pre'} fill={"#F2F5F7"} opacity={0} />);
 
   // 动画初值：让每条轨道的起点在第一时间生效
   n0_axis().end(0);
@@ -41,5 +45,9 @@ export default makeScene2D(function* (view) {
     delay(1.3, n3_ball_label().opacity(1, 1.4)),
     delay(2.7, n3_ball_label().opacity(0, 0.3)),
     delay(0, view.opacity(1, 0.35)),
+    delay(0, nsub0bg().opacity(0.6, 0.15)),
+    delay(0, nsub0tx().opacity(1, 0.15)),
+    delay(1.9, nsub0bg().opacity(0, 0.15)),
+    delay(1.9, nsub0tx().opacity(0, 0.15)),
   );
 });

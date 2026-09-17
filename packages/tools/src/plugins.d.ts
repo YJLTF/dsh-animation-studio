@@ -23,6 +23,8 @@ declare module '@deepseek-ai/dsh-session' {
     'anim/render-start': import('./events.ts').AnimRenderStartData
     'anim/render-progress': import('./events.ts').AnimRenderProgressData
     'anim/render-finished': import('./events.ts').AnimRenderFinishedData
+    'anim/preview-start': import('./events.ts').AnimPreviewStartData
+    'anim/preview-finished': import('./events.ts').AnimPreviewFinishedData
   }
 }
 
