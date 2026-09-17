@@ -95,6 +95,28 @@ export interface AnimRenderFinishedData {
   audioTracks?: string[]
 }
 
+/**
+ * 预览任务结束（0.4.0 §5.3，O19）：preview 与 render 同待遇转宿主 jobs 后，
+ * 帧清单经事件落盘，后台预览的卡片轮询 /api/state 才重建得出来。
+ * `status` 缺省即 completed；killed / failed 时 frames 无意义，允许缺省。
+ */
+export interface AnimPreviewStartData {
+  specId: string
+  /** 后台任务为 ctx.jobs 的品牌化 id（形如 anim-preview-1）；同步回退为 'sync'。 */
+  jobId: string
+}
+
+export interface AnimPreviewFinishedData {
+  specId: string
+  jobId: string
+  frames?: Array<{ atMs: number; path: string }>
+  status?: 'killed' | 'failed'
+  /** status 为 failed 时的人类可读原因。 */
+  error?: string
+  /** 生成期降级警告，随帧一起给后台完成卡片展示。 */
+  warnings?: string[]
+}
+
 /** 事件名 → 载荷。新增事件时同步更新 `plugins.d.ts` 里对 `SessionEventMap` 的合并声明。 */
 export interface AnimEventDataMap {
   'anim/spec-created': AnimSpecCreatedData
@@ -103,6 +125,8 @@ export interface AnimEventDataMap {
   'anim/render-start': AnimRenderStartData
   'anim/render-progress': AnimRenderProgressData
   'anim/render-finished': AnimRenderFinishedData
+  'anim/preview-start': AnimPreviewStartData
+  'anim/preview-finished': AnimPreviewFinishedData
 }
 
 export type AnimEventType = keyof AnimEventDataMap

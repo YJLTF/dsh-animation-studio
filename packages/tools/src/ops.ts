@@ -458,14 +458,147 @@ export function opDraftScene(deps: AnimDeps, args: DraftSceneArgs, emit: Emit): 
 
 /* ------------------------------------------------------------------ 渲染 */
 
+export interface PreviewArgs {
+  specId: string
+  atMs?: number[]
+  scale?: number
+  renderer?: string
+}
+
+export interface PreviewFrame {
+  atMs: number
+  path: string
+}
+
+export interface PreviewResultView {
+  specId: string
+  renderer: string
+  frames: PreviewFrame[]
+  warnings?: string[]
+}
+
+/** 后台模式下预览的即时回执：帧清单经 preview-finished 事件与 job_output 到达。 */
+export interface PreviewBackgroundTicket {
+  kind: 'background'
+  jobId: string
+  specId: string
+  next: string
+}
+
+/**
+ * 抽帧预览（0.4.0 §5.3，O19）：宿主提供 ctx.jobs 时转后台任务——工具立即返回
+ * jobId，帧清单以 preview-finished 事件与 job_output 到达，面板卡片轮询
+ * /api/state 重建缩略图。宿主没有 jobs 服务或发布失败时维持同步回退。
+ */
 export async function opPreview(
   deps: AnimDeps,
-  args: { specId: string; atMs?: number[]; scale?: number; renderer?: string },
+  args: PreviewArgs,
   signal: AbortSignal,
-): Promise<{ specId: string; renderer: string; frames: Array<{ atMs: number; path: string }>; warnings?: string[] }> {
+  emit: Emit = () => {},
+  jobs?: AnimJobsService,
+  owner?: unknown,
+): Promise<PreviewResultView | PreviewBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
+  if (jobs) {
+    // 与 opRender 同一降级链：先带 owner，失败退无主，再失败退同步
+    for (const ownerCandidate of [owner, undefined]) {
+      try {
+        return await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
+      } catch {
+        /* 发布失败，尝试下一档 */
+      }
+    }
+  }
+  return await previewSync(args, { spec, renderer }, signal, emit)
+}
+
+async function startBackgroundPreview(
+  args: PreviewArgs,
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer },
+  emit: Emit,
+  jobs: AnimJobsService,
+  owner: unknown,
+): Promise<PreviewBackgroundTicket> {
+  const { spec, renderer } = resolved
+  const specId = args.specId
+  const controller = new AbortController()
+  const jobIdBox: { value: string | null } = { value: null }
+  // 事件与 jobId 的先后保障与渲染同款：id 未定先缓冲，确定后按因果序补发
+  const gate = createRenderEventGate(emit, jobIdBox)
+  const finishedId = (): string => jobIdBox.value ?? 'anim-preview'
+  const run = (): AnimJobHandle => ({
+    cancel: (reason?: unknown) => {
+      controller.abort(reason instanceof Error ? reason : new Error(reason ? String(reason) : '预览任务被终止'))
+    },
+    done: renderer
+      .preview({ spec, atMs: args.atMs, scale: args.scale ?? 2 }, controller.signal)
+      .then(
+        result => {
+          gate.pass(() => ({
+            type: 'anim/preview-finished',
+            data: {
+              specId,
+              jobId: finishedId(),
+              frames: result.frames.map(f => ({ atMs: f.atMs, path: f.path })),
+              ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+            },
+          }))
+          return { status: 'completed' as const, output: result }
+        },
+        (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err)
+          if (controller.signal.aborted) {
+            gate.pass(() => ({
+              type: 'anim/preview-finished',
+              data: { specId, jobId: finishedId(), status: 'killed' },
+            }))
+            return { status: 'killed' as const, detail: message }
+          }
+          gate.pass(() => ({
+            type: 'anim/preview-finished',
+            data: { specId, jobId: finishedId(), status: 'failed', error: message },
+          }))
+          return { status: 'failed' as const, detail: message }
+        },
+      ),
+  })
+  const jobId = await jobs.start({
+    kind: 'anim-preview',
+    label: `抽帧预览「${spec.meta.title}」(${specId})`,
+    ...(owner === undefined ? {} : { owner }),
+    run,
+  })
+  const id = typeof jobId === 'string' ? jobId : String(jobId ?? 'anim-preview')
+  jobIdBox.value = id
+  gate.pass(() => ({ type: 'anim/preview-start', data: { specId, jobId: id } }))
+  gate.flush()
+  return {
+    kind: 'background',
+    jobId: id,
+    specId,
+    next: '预览已在后台进行。用 job_output 收集帧清单；需要终止时用 job_kill。',
+  }
+}
+
+async function previewSync(
+  args: PreviewArgs,
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer },
+  signal: AbortSignal,
+  emit: Emit,
+): Promise<PreviewResultView> {
+  const { spec, renderer } = resolved
+  emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'sync' } })
   const result = await renderer.preview({ spec, atMs: args.atMs, scale: args.scale ?? 2 }, signal)
+  emit({
+    type: 'anim/preview-finished',
+    data: {
+      specId: args.specId,
+      jobId: 'sync',
+      frames: result.frames.map(f => ({ atMs: f.atMs, path: f.path })),
+      ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+    },
+  })
   return {
     specId: args.specId,
     renderer: result.renderer,

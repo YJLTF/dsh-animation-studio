@@ -124,6 +124,8 @@ export interface RenderStatus {
   status: 'running' | 'completed' | 'killed' | 'failed'
   outputPath: string
   percent: number
+  /** 任务类别：缺省 render；preview 为后台抽帧预览（0.4.0 §5.3）。 */
+  kind?: 'render' | 'preview'
   done?: number
   total?: number
   error?: string
@@ -141,6 +143,8 @@ export interface RenderStatus {
   }
   /** 混入成片的音轨（0.4.0 规划 §4.1），无声成片缺省。 */
   audioTracks?: string[]
+  /** 后台预览的帧清单（0.4.0 §5.3），预览完成卡片由此重建缩略图。 */
+  frames?: Array<{ atMs: number; path: string }>
 }
 
 /** 从工作台状态 API 里找一条渲染任务；路由不可达返回 null。 */

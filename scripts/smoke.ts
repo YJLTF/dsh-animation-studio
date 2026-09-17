@@ -50,8 +50,8 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache } from '../packages/tools/src/ops.ts'
-import type { AnimDeps, AnimJobsService } from '../packages/tools/src/ops.ts'
+import { coerceScene, opDraftScene, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache } from '../packages/tools/src/ops.ts'
+import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
 import type { KernelResponse } from '../packages/tools/src/web.ts'
@@ -878,8 +878,8 @@ await checkA('MotionCanvasRenderer: preview/render 共用串行闸——并发�
   assert.equal(b.frames.length, 1)
 })
 
-/** 渲染测试共用脚手架：假后端 + 事件收集器。 */
-function renderFixture(renderImpl: AnimRenderer['render']) {  const store = new SpecStore()
+/** 渲染测试共用脚手架：假后端 + 事件收集器。previewImpl 缺省时 preview 一律抛错。 */
+function renderFixture(renderImpl: AnimRenderer['render'], previewImpl?: AnimRenderer['preview']) {  const store = new SpecStore()
   store.create('gd', demoSpec())
   const emitted: AnimEvent[] = []
   const emit = (event: AnimEvent): void => {
@@ -890,9 +890,9 @@ function renderFixture(renderImpl: AnimRenderer['render']) {  const store = new 
     {
       name: 'fake',
       diagnose: async () => ({ renderer: 'fake', ok: true, issues: [] }),
-      preview: async () => {
+      preview: previewImpl ?? (async () => {
         throw new Error('preview 未在本测试中使用')
-      },
+      }),
       render: renderImpl,
     },
     { isDefault: true },
@@ -1040,6 +1040,104 @@ await checkA('opRender: 相对 outputPath 解析成绝对路径——适配器�
   assert.ok(isAbsolute(result.outputPath), `回执应给绝对路径，收到 ${result.outputPath}`)
   const start = emitted.find(e => e.type === 'anim/render-start')
   assert.ok(isAbsolute((start!.data as { outputPath: string }).outputPath), 'render-start 事件的 outputPath 也是绝对路径')
+})
+
+/* ------------------------------------------------- §5.3 预览后台化（O19） */
+
+const PREVIEW_FRAMES = [
+  { atMs: 100, path: '.tmp/frames/p-100.png' },
+  { atMs: 900, path: '.tmp/frames/p-900.png' },
+]
+
+await checkA('opPreview: 有 jobs 走后台——票据立即返回 jobId，帧清单经 preview-finished 事件落盘', async () => {
+  const { deps, emitted, emit } = renderFixture(
+    async () => {
+      throw new Error('render 未在本测试中使用')
+    },
+    async () => ({ renderer: 'fake', frames: PREVIEW_FRAMES, warnings: ['降级示例'] }),
+  )
+  let started = 0
+  const jobs: AnimJobsService = {
+    start(spec) {
+      started++
+      assert.equal(spec.kind, 'anim-preview')
+      spec.run()
+      return 'anim-preview-3'
+    },
+  }
+  const ticket = await opPreview(deps, { specId: 'gd', atMs: [100, 900] }, new AbortController().signal, emit, jobs, {})
+  assert.equal(started, 1)
+  assert.equal(ticket.kind, 'background')
+  assert.equal(ticket.jobId, 'anim-preview-3')
+  assert.deepEqual(
+    emitted.map(e => e.type),
+    ['anim/preview-start', 'anim/preview-finished'],
+    '后台预览的事件顺序：start 立起卡片，finished 带帧清单',
+  )
+  assert.equal((emitted[0].data as { jobId: string }).jobId, 'anim-preview-3')
+  const finished = emitted[1] as { data: { frames?: Array<{ atMs: number }>; warnings?: string[] } }
+  assert.deepEqual(finished.data.frames?.map(f => f.atMs), [100, 900])
+  assert.deepEqual(finished.data.warnings, ['降级示例'])
+})
+
+await checkA('opPreview: job_kill 触发 cancel → killed 事件；无 jobs 时同步回退且事件照发', async () => {
+  // killed 路径：cancel 后后端拒绝
+  const killed = renderFixture(
+    async () => {
+      throw new Error('unused')
+    },
+    (options, signal) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('aborted')))
+        void options
+      }),
+  )
+  let handle: AnimJobHandle | undefined
+  const jobsKill: AnimJobsService = {
+    start(spec) {
+      handle = spec.run()
+      return 'anim-preview-9'
+    },
+  }
+  const ticket = await opPreview(killed.deps, { specId: 'gd' }, new AbortController().signal, killed.emit, jobsKill, {})
+  assert.equal(ticket.kind, 'background')
+  handle!.cancel('用户终止')
+  await new Promise(r => setTimeout(r, 10))
+  const finished = killed.emitted.find(e => e.type === 'anim/preview-finished')
+  assert.ok(finished, '取消后应有 preview-finished')
+  assert.equal((finished.data as { status?: string }).status, 'killed')
+
+  // 同步回退：无 jobs（老签名调用方式依旧可用），回执带帧，事件流同款
+  const sync = renderFixture(
+    async () => {
+      throw new Error('unused')
+    },
+    async () => ({ renderer: 'fake', frames: PREVIEW_FRAMES }),
+  )
+  const result = await opPreview(sync.deps, { specId: 'gd', atMs: [100, 900] }, new AbortController().signal, sync.emit)
+  assert.deepEqual(result.frames.map(f => f.atMs), [100, 900])
+  assert.deepEqual(
+    sync.emitted.map(e => e.type),
+    ['anim/preview-start', 'anim/preview-finished'],
+    '同步预览也发 start/finished 事件（回放与任务簿同一口径）',
+  )
+  assert.equal((sync.emitted[0].data as { jobId: string }).jobId, 'sync')
+})
+
+await checkA('RenderTracker: 预览任务与渲染同簿——kind=preview、完成带帧清单（§5.3）', async () => {
+  const tracker = new RenderTracker()
+  tracker.observe({ type: 'anim/preview-start', data: { specId: 'gd', jobId: 'anim-preview-5' } })
+  tracker.observe({
+    type: 'anim/preview-finished',
+    data: { specId: 'gd', jobId: 'anim-preview-5', frames: PREVIEW_FRAMES, warnings: ['降级示例'] },
+  })
+  const snap = tracker.snapshot()
+  assert.equal(snap.length, 1)
+  assert.equal(snap[0].kind, 'preview')
+  assert.equal(snap[0].status, 'completed')
+  assert.equal(snap[0].percent, 100)
+  assert.equal(snap[0].frames?.length, 2)
+  assert.deepEqual(snap[0].warnings, ['降级示例'])
 })
 
 /* ------------------------------------------------- /dsh-anim 请求内核 */

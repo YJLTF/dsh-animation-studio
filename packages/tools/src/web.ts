@@ -35,13 +35,15 @@ export const ANIM_ROUTE_PREFIX = '/dsh-anim'
 
 /* ---------------------------------------------------------------- 渲染任务簿 */
 
-/** 一条渲染任务的可展示状态（/api/state 的 renders 项）。 */
+/** 一条渲染/预览任务的可展示状态（/api/state 的 renders 项）。 */
 export interface RenderStatusView {
   jobId: string
   specId: string
   status: 'running' | 'completed' | 'killed' | 'failed'
   outputPath: string
   percent: number
+  /** 任务类别：缺省 render（旧簿子条目的兼容）；preview 为抽帧预览（§5.3）。 */
+  kind?: 'render' | 'preview'
   done?: number
   total?: number
   startedAt: number
@@ -61,6 +63,8 @@ export interface RenderStatusView {
   }
   /** 混入成片的音轨（§4.1），无声成片缺省。 */
   audioTracks?: string[]
+  /** 后台预览的帧清单（§5.3），预览完成卡片由此重建缩略图。 */
+  frames?: Array<{ atMs: number; path: string }>
 }
 
 /**
@@ -108,6 +112,32 @@ export class RenderTracker {
       if (d.warnings !== undefined) job.warnings = d.warnings
       if (d.incremental !== undefined) job.incremental = d.incremental
       if (d.audioTracks !== undefined) job.audioTracks = d.audioTracks
+      return
+    }
+    // 预览任务与渲染同簿（§5.3）：条目小得多，没有进度，完成时带帧清单
+    if (event.type === 'anim/preview-start') {
+      const d = event.data
+      this.#jobs.set(d.jobId, {
+        jobId: d.jobId,
+        specId: d.specId,
+        status: 'running',
+        outputPath: '',
+        percent: 0,
+        kind: 'preview',
+        startedAt: Date.now(),
+      })
+      return
+    }
+    if (event.type === 'anim/preview-finished') {
+      const d = event.data
+      const job = this.#jobs.get(d.jobId)
+      if (!job) return
+      job.status = d.status ?? 'completed'
+      job.finishedAt = Date.now()
+      if (job.status === 'completed') job.percent = 100
+      if (d.frames !== undefined) job.frames = d.frames
+      if (d.error !== undefined) job.error = d.error
+      if (d.warnings !== undefined) job.warnings = d.warnings
     }
   }
 

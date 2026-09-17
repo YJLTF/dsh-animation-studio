@@ -588,7 +588,8 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_preview',
       description:
         '渲染若干预览帧（降分辨率）用来检查效果。传入关键时间点（毫秒）抽查，不要整片预览——慢且没必要。'
-        + '注意：预览帧无音频（音频只在成片渲染尾步混入），画面效果与成片一致。',
+        + '注意：预览帧无音频（音频只在成片渲染尾步混入），画面效果与成片一致。'
+        + '宿主支持后台任务时立即返回 jobId，帧清单用 job_output 收集；否则同步等待到出帧。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         atMs: { type: 'array', description: '抽帧时间点（绝对毫秒）', items: { type: 'number' } },
@@ -598,12 +599,25 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       output: {
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => text(JSON.stringify(value, null, 2)),
-        // meta 用对象（客户端 readReceipt 对数组会回退到解析回执文本）
-        presentationMeta: (_args, value) => ({ frames: (value as { frames?: unknown }).frames ?? [] }) as never,
+        // meta 投影整个回执：kind/jobId 要到卡片，frames 数组是同步回执的主体
+        presentationMeta: (_args, value) => value as never,
       },
       presentCall: args => ({ card: 'terminal', title: `anim preview ${args.specId}` }),
+      presentResult: (_args, result) => {
+        // 纯函数：从回执里区分「已转后台」与「同步出帧」两种回执
+        let title = '预览帧就绪'
+        try {
+          const first = result.content[0] as { text?: string } | undefined
+          const parsed = typeof first?.text === 'string' ? (JSON.parse(first.text) as { kind?: string }) : undefined
+          if (parsed?.kind === 'background') title = '预览已转后台任务'
+        } catch {
+          /* 解析不出就维持默认标题 */
+        }
+        return { card: 'generic', title, content: result.content }
+      },
       async execute(args, exec) {
-        return (await opPreview(deps, args, exec.signal)) as never
+        const owner = (exec as { agent?: unknown }).agent
+        return (await opPreview(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
       },
     }),
   )
