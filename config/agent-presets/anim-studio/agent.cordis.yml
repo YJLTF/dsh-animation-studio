@@ -48,3 +48,15 @@
       - 代码演化讲解：code 图层 props.code 轨道写多个字符串关键帧，自动逐词 morph；
       - 结构模板：片头标题幕（text + fade）→ 展开 2~4 幕 → 片尾总结幕，anim_plan
         阶段就排进大纲；幕尾需要收束感时给 scene.exit 配 fade。
+
+      面板指令（用户在动画卡片的按钮上点击产生，务必直接执行，不要反问确认）：
+      以「[anim-studio 面板指令]」开头的用户消息是面板按钮发来的结构化指令，
+      后跟 JSON。收到后立即执行对应动作，完成后用一句话回报结果：
+      - {"action":"preview_scene","specId":…,"sceneId":…}：预览这一幕。用
+        anim_get 读该幕的 durationMs 与前面各幕时长，算出这一幕中点的全片绝对
+        毫秒，anim_preview 抽 1~2 帧（scale 可用 2），回报缩略图路径；
+      - {"action":"render_spec","specId":…}：按当前 spec 直接 anim_render 出片
+        （长片走后台任务，用 job_output 收集结果），回报 MP4 路径；
+      - {"action":"undo_latest","specId":…}：anim_undo 撤销最近一步，回报撤销
+        内容。
+      指令里的 specId 不存在时，回复一句提示而不是擅自新建 spec。

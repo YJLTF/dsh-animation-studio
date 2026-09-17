@@ -125,7 +125,7 @@ export function PreviewCard(props: ToolViewProps): ReactNode {
   }
   if (block.isError) return <Card title="抽帧预览失败">{block.error?.reason ?? str(readReceipt(block), 'error')}</Card>
   const receipt = readReceipt(block)
-  if (str(receipt, 'kind') === 'background') return <PreviewTicket receipt={receipt} />
+  if (receipt && str(receipt, 'kind') === 'background') return <PreviewTicket receipt={receipt} />
   const frames = list(receipt, 'frames').filter(f => typeof f.path === 'string')
   if (!receipt || frames.length === 0) return <Fallback {...props} running="抽帧预览" />
   return (

@@ -2,7 +2,8 @@
 
 import type { ReactNode } from 'react'
 
-import { formatMs, num, readReceipt, str, strings, type ToolViewProps } from '../protocol.ts'
+import { formatMs, num, readReceipt, str, strings, previewSceneInstruction, type ToolViewProps } from '../protocol.ts'
+import { PanelActions } from './actions.tsx'
 import { Card, Fallback, Notes, Repairs, Warnings } from './primitives.tsx'
 import { muted, row } from './styles.ts'
 
@@ -11,8 +12,10 @@ export function SceneCard(props: ToolViewProps): ReactNode {
   if (!receipt) return <Fallback {...props} running="写入场景" />
   const index = num(receipt, 'index')
   const count = num(receipt, 'sceneCount')
+  const specId = str(receipt, 'specId')
+  const sceneId = str(receipt, 'sceneId')
   return (
-    <Card title={`写入场景：${str(receipt, 'sceneName') ?? str(receipt, 'sceneId') ?? ''}`}>
+    <Card title={`写入场景：${str(receipt, 'sceneName') ?? sceneId ?? ''}`}>
       <div style={row}>
         {index !== undefined && count !== undefined && (
           <span style={muted}>
@@ -24,6 +27,10 @@ export function SceneCard(props: ToolViewProps): ReactNode {
       <Repairs items={strings(receipt, 'repairs')} />
       <Notes title="大纲对账：" items={strings(receipt, 'outlineNotes')} />
       <Warnings items={strings(receipt, 'warnings')} />
+      <PanelActions
+        sessionId={str(receipt, 'sessionId')}
+        actions={specId !== undefined && sceneId !== undefined ? [{ label: '预览这一幕', instruction: previewSceneInstruction(specId, sceneId) }] : []}
+      />
     </Card>
   )
 }

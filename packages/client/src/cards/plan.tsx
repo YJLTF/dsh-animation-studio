@@ -2,7 +2,8 @@
 
 import type { ReactNode } from 'react'
 
-import { formatMs, list, num, readReceipt, str, strings, type ToolViewProps } from '../protocol.ts'
+import { formatMs, list, num, readReceipt, renderSpecInstruction, str, strings, type ToolViewProps } from '../protocol.ts'
+import { PanelActions } from './actions.tsx'
 import { Card, Fallback, Warnings } from './primitives.tsx'
 import { muted, row } from './styles.ts'
 
@@ -11,8 +12,9 @@ export function PlanCard(props: ToolViewProps): ReactNode {
   if (!receipt) return <Fallback {...props} running="规划分镜" />
   const outline = list(receipt, 'outline')
   const totalMs = num(receipt, 'totalMs')
+  const specId = str(receipt, 'specId')
   return (
-    <Card title={`分镜大纲：${str(receipt, 'specId') ?? ''}`}>
+    <Card title={`分镜大纲：${specId ?? ''}`}>
       {outline.map((item, i) => (
         <div key={i} style={row}>
           <span style={muted}>{i + 1}.</span>
@@ -27,6 +29,10 @@ export function PlanCard(props: ToolViewProps): ReactNode {
         </span>
       </div>
       <Warnings items={strings(receipt, 'pacing')} />
+      <PanelActions
+        sessionId={str(receipt, 'sessionId')}
+        actions={specId !== undefined ? [{ label: '渲染成片', instruction: renderSpecInstruction(specId) }] : []}
+      />
     </Card>
   )
 }

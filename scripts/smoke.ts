@@ -1140,6 +1140,58 @@ await checkA('RenderTracker: 预览任务与渲染同簿——kind=preview、完
   assert.deepEqual(snap[0].warnings, ['降级示例'])
 })
 
+await checkA('promptAgent: 面板指令信封与 §5.1 拆包结论一致——POST /api/session/prompt、queue、稳定前缀', async () => {
+  const { PANEL_INSTRUCTION_PREFIX, previewSceneInstruction, promptAgent, renderSpecInstruction, undoLatestInstruction } =
+    await import('../packages/client/src/protocol.ts')
+  // 指令构造器：前缀 + 可解析 JSON + 动作齐全（预设与卡片两端的契约锚点）
+  for (const [text, action] of [
+    [previewSceneInstruction('gd', 's1'), 'preview_scene'],
+    [renderSpecInstruction('gd'), 'render_spec'],
+    [undoLatestInstruction('gd'), 'undo_latest'],
+  ] as const) {
+    assert.ok(text.startsWith(PANEL_INSTRUCTION_PREFIX), '指令必须带稳定前缀')
+    const parsed = JSON.parse(text.slice(PANEL_INSTRUCTION_PREFIX.length)) as { action: string; specId: string }
+    assert.equal(parsed.action, action)
+    assert.equal(parsed.specId, 'gd')
+  }
+  // 信封：stub 全局 fetch 捕获请求，逐一验证三种结果映射
+  const calls: Array<{ url: string; init?: RequestInit }> = []
+  const realFetch = globalThis.fetch
+  const json = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init })
+    return json(200, { type: 'server-response', rpcId: 'r', result: { ok: true, value: { accepted: true } } })
+  }) as typeof fetch
+  try {
+    assert.equal(await promptAgent('session-x', previewSceneInstruction('gd', 's1')), 'accepted')
+    globalThis.fetch = (async () => json(200, { type: 'server-response', rpcId: 'r', result: { ok: false, error: { code: 'x', message: 'y', details: {} } } })) as typeof fetch
+    assert.equal(await promptAgent('session-x', 'x'), 'rejected')
+    globalThis.fetch = (async () => json(401, 'unauthorized')) as typeof fetch
+    assert.equal(await promptAgent('session-x', 'x'), 'unreachable')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  assert.equal(calls[0].url, '/api/session/prompt')
+  assert.equal(calls[0].init?.method, 'POST')
+  assert.equal((calls[0].init?.headers as { 'content-type': string })['content-type'], 'application/json')
+  const envelope = JSON.parse(String(calls[0].init?.body)) as {
+    type: string
+    method: string
+    rpcId: string
+    payload: { args: { request: { requestId: string; sessionId: string; mode: string; content: Array<{ type: string; text: string }> } } }
+  }
+  assert.equal(envelope.type, 'client-request')
+  assert.equal(envelope.method, 'session/prompt')
+  const request = envelope.payload.args.request
+  assert.equal(request.sessionId, 'session-x')
+  assert.equal(request.mode, 'queue')
+  assert.equal(request.requestId, envelope.rpcId, 'requestId 与 rpcId 一致（宿主回传 source.rpcId 可对账）')
+  assert.match(request.requestId, /^anim-panel-/)
+  assert.equal(request.content.length, 1)
+  assert.equal(request.content[0].type, 'text')
+  assert.ok(request.content[0].text.startsWith(PANEL_INSTRUCTION_PREFIX))
+})
+
 /* ------------------------------------------------- /dsh-anim 请求内核 */
 
 /** 内核响应统一收流成 Buffer，断言才好写。 */

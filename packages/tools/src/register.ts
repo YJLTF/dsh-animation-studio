@@ -285,6 +285,22 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     }
   }
   const disposers: Array<() => void> = []
+  /**
+   * §5.2 面板最简交互：工具回执统一带上会话 id。卡片按钮把结构化指令发回
+   * 「出这张卡片的会话」（session/prompt，见 client 面 promptAgent）；
+   * 老宿主形态没有 agent.session 时原样返回，回执不带该字段。
+   */
+  const stampSession = (result: unknown, exec: { agent?: unknown } | undefined): unknown => {
+    const session = (exec?.agent as { session?: { id?: unknown } } | undefined)?.session
+    if (typeof session?.id !== 'string' || session.id === '') return result
+    if (
+      result !== null && typeof result === 'object' && !Array.isArray(result)
+      && (result as { sessionId?: unknown }).sessionId === undefined
+    ) {
+      return { ...(result as Record<string, unknown>), sessionId: session.id }
+    }
+    return result
+  }
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
     // 单一收口：每个工具执行前做会话懒恢复（事件归因由 emitFor 按调用绑定）
     const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
@@ -293,7 +309,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         hydrate?.(exec?.agent)
         const result = await originalExecute(args, exec as never)
         indexMediaFromResult(options.media, result)
-        return result
+        return stampSession(result, exec)
       }
       ;(definition as { execute: unknown }).execute = wrapped
     }
