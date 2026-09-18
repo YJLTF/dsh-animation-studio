@@ -13,7 +13,7 @@
 
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -63,6 +63,8 @@ export interface TtsConfig {
   volume?: number
   /** 单条合成超时（毫秒，默认 120000）。 */
   timeoutMs?: number
+  /** 单条失败后的额外重试次数（默认 2，退避 500ms/1500ms；0 关闭）。edge-tts 这类网络引擎的瞬时拒绝（NoAudioReceived 等）靠它救回。 */
+  retries?: number
 }
 
 /** 挂进 AnimDeps 的 TTS 服务：合成器 + 规范化后的默认值。 */
@@ -90,14 +92,20 @@ export function createTtsService(config: TtsConfig): TtsService {
         .replaceAll('{stdin}', req.text),
     )
     const useStdin = config.command.includes('{stdin}')
-    await exec(argv[0]!, argv.slice(1), {
-      ...(useStdin ? { input: req.text } : {}),
-      timeout: config.timeoutMs ?? 120_000,
-      windowsHide: true,
-    })
-    if (!existsSync(req.outFile)) {
-      throw new Error(`TTS 命令执行完毕但未产出音频文件（检查命令模板的 {outFile} 占位符与参数）`)
+    const run = async (): Promise<void> => {
+      removeQuietly(req.outFile)
+      await exec(argv[0]!, argv.slice(1), {
+        ...(useStdin ? { input: req.text } : {}),
+        timeout: config.timeoutMs ?? 120_000,
+        windowsHide: true,
+      })
+      if (!existsSync(req.outFile)) {
+        throw new Error(`TTS 命令执行完毕但未产出音频文件（检查命令模板的 {outFile} 占位符与参数）`)
+      }
     }
+    // 网络引擎的合成失败大多是服务端瞬时拒绝，重试常能救回；每次尝试前清掉
+    // 产物——失败那趟往往已把文件建出来（0 字节/半截），不清会污染缓存命中判断
+    await runWithRetries(run, 1 + Math.max(0, config.retries ?? 2))
     return { filePath: req.outFile, durationMs: await probeAudioDurationMs(req.outFile) }
   }
   return {
@@ -110,6 +118,29 @@ export function createTtsService(config: TtsConfig): TtsService {
 
 function clamp01(v: number): number {
   return Math.min(1, Math.max(0, v))
+}
+
+/** 有限次重试（attempts = 总尝试次数），第 k 次重试前退避 backoffMs×3^(k-1)。耗尽后抛最后一次的错误。 */
+export async function runWithRetries<T>(fn: () => Promise<T>, attempts: number, backoffMs = 500): Promise<T> {
+  let last: unknown
+  for (let i = 0; i < Math.max(1, attempts); i++) {
+    if (i > 0) await new Promise(resolve => setTimeout(resolve, backoffMs * 3 ** (i - 1)))
+    try {
+      return await fn()
+    } catch (err) {
+      last = err
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last))
+}
+
+/** 删掉失败尝试留下的坏产物（0 字节/半截文件）；删不掉也不影响主流程，后续时长校验会兜底。 */
+function removeQuietly(filePath: string): void {
+  try {
+    rmSync(filePath, { force: true })
+  } catch {
+    /* 被占用等删不掉就算了 */
+  }
 }
 
 /** ffprobe 实测音频时长（毫秒）。ffprobe 缺装或读不出时抛错（调用方降级）。 */
@@ -195,15 +226,26 @@ export async function synthesizeNarration(
     const voice = typeof cue.voice === 'string' && cue.voice !== '' ? cue.voice : tts.defaultVoice
     const hash = createHash('sha256').update(JSON.stringify({ text, voice: voice ?? null, rate })).digest('hex').slice(0, 16)
     const outFile = join(cacheDir, `${safeName(String(spec.meta.id))}-${hash}.mp3`)
+    const synth = (): Promise<number> =>
+      tts.synthesizer({ text, ...(voice !== undefined ? { voice } : {}), rate, outFile }).then(r => r.durationMs)
     let audioMs: number
     try {
-      // 缓存命中（同 text/voice/rate 已合成过）直接实测时长，不重调命令
-      audioMs = existsSync(outFile)
-        ? await probeAudioDurationMs(outFile)
-        : await tts.synthesizer({ text, ...(voice !== undefined ? { voice } : {}), rate, outFile }).then(r => r.durationMs)
+      if (existsSync(outFile)) {
+        try {
+          // 缓存命中（同 text/voice/rate 已合成过）直接实测时长，不重调命令
+          audioMs = await probeAudioDurationMs(outFile)
+        } catch {
+          // 坏缓存（如历史失败残留的 0 字节文件）：删掉重合成，缓存只信「读得出时长」的文件
+          removeQuietly(outFile)
+          audioMs = await synth()
+        }
+      } else {
+        audioMs = await synth()
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       warnings.push(`旁白 cue #${i}（「${text.slice(0, 20)}${text.length > 20 ? '…' : ''}」）合成失败，已降级为纯字幕：${message}`)
+      removeQuietly(outFile)
       continue
     }
     tracks.push({ source: outFile, startMs: starts[i]!, durationMs: audioMs, volume })

@@ -55,7 +55,7 @@ import { coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, o
 import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
-import { synthesizeNarration, type TtsService } from '../packages/tools/src/tts.ts'
+import { runWithRetries, synthesizeNarration, type TtsService } from '../packages/tools/src/tts.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
 import type { KernelResponse } from '../packages/tools/src/web.ts'
 
@@ -2349,6 +2349,54 @@ await checkA('synthesizeNarration: 单条合成失败降级纯字幕不拖垮其
   assert.ok(r.warnings.some(w => w.includes('为空')), '空文本跳过有提示')
   assert.equal(r.notes.length, 1)
   rmSync(dir, { recursive: true, force: true })
+})
+
+await checkA('synthesizeNarration: 坏缓存自愈——读不出时长的残留文件删掉重合成，不永久降级', async () => {
+  const spec = demoSpec()
+  spec.narration = { cues: [{ atMs: 0, text: '坏缓存里的一句' }] }
+  let calls = 0
+  const tts: TtsService = {
+    rate: '+0%',
+    volume: 1,
+    synthesizer: async req => {
+      calls++
+      // 模拟真实引擎留坑：文件已建出但 0 字节（失败残留的典型形态）
+      writeFileSync(req.outFile, '')
+      return { filePath: req.outFile, durationMs: 1800 }
+    },
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'anim-tts-poison-'))
+  const first = await synthesizeNarration(spec, tts, dir)
+  assert.equal(first.tracks.length, 1)
+  assert.equal(calls, 1)
+  // 第二次：缓存「命中」但 ffprobe 读不出 0 字节文件 → 必须删掉重合成，而不是降级
+  const second = await synthesizeNarration(spec, tts, dir)
+  assert.equal(second.tracks.length, 1, '坏缓存自愈后仍有音轨')
+  assert.equal(second.tracks[0]?.durationMs, 1800)
+  assert.equal(calls, 2, '坏缓存触发了重合成')
+  assert.equal(second.warnings.length, 0, '自愈路径不产生降级警告')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await checkA('runWithRetries: 前败后成按次数救回；耗尽抛最后一次的错误', async () => {
+  let n = 0
+  const ok = await runWithRetries(async () => {
+    n++
+    if (n < 3) throw new Error(`boom-${n}`)
+    return 'fine'
+  }, 3, 1)
+  assert.equal(ok, 'fine')
+  assert.equal(n, 3)
+  let m = 0
+  await assert.rejects(
+    () => runWithRetries(async () => {
+      m++
+      throw new Error(`always-${m}`)
+    }, 2, 1),
+    /always-2/,
+    '重试耗尽应抛最后一次的错误',
+  )
+  assert.equal(m, 2)
 })
 
 console.log(`\n冒烟通过：${passed} 项`)

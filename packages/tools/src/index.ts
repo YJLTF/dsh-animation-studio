@@ -49,6 +49,7 @@ export const Config: Schema<Config> = Schema.object({
     rate: Schema.string().description('默认语速占位值（edge-tts 形如 "+0%"，引擎语义各异）'),
     volume: Schema.number().description('旁白音量 0~1，默认 1'),
     timeoutMs: Schema.number().description('单条合成超时（毫秒），默认 120000'),
+    retries: Schema.number().description('单条失败后的额外重试次数（默认 2，退避 500ms/1500ms；0 关闭）'),
   }).description('配音配置：留空 = 旁白只出字幕不发声'),
 })
 

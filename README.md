@@ -118,7 +118,9 @@ dsh plugin --profile web add ./dsh-animation-studio-<版本>.tgz
 - **edge-tts**（免费，需网络）：`pip install edge-tts`，命令模板见上；声音列表 `edge-tts --list-voices | grep zh-CN`；
 - **piper**（完全离线）：`command: ["piper", "--model", "{voice}", "--output_file", "{outFile}"]`，文本走 stdin（模板含 `{stdin}` 占位时自动从 stdin 喂文本）。
 
-注意：**TTS 会把旁白文本送进配置的外部命令（可能出网）**，离线环境请用 piper 类本地引擎；cue 级 `voice` 字段可逐条换声（先经 `voices` 映射表翻译）。单条合成失败只降级为纯字幕并给警告，绝不阻塞出片。渲染回执的 `speechNotes` 列出每条语音的实测时长与溢出毫秒——时间线要不要挪由模型用 `anim_patch` 决策，工具不会自动改时间轴。
+注意：**TTS 会把旁白文本送进配置的外部命令（可能出网）**，离线环境请用 piper 类本地引擎；cue 级 `voice` 字段可逐条换声（先经 `voices` 映射表翻译）。单条合成失败只降级为纯字幕并给警告，绝不阻塞出片；失败自动重试（默认 2 次，`tts.retries` 可调），失败/坏缓存残留文件会被清掉，服务恢复后重渲即自愈。渲染回执的 `speechNotes` 列出每条语音的实测时长与溢出毫秒——时间线要不要挪由模型用 `anim_patch` 决策，工具不会自动改时间轴。
+
+**选声音的经验（2026-09 真机教训）**：edge-tts 走的是微软 Edge 的非公开接口，服务端会阶段性掐掉部分声音——`*Multilingual*` 与多数 `en-US-*` 声音出现过整批 `NoAudioReceived`（报错像参数错了，其实声音不可用），而 `zh-CN-XiaoxiaoNeural / XiaoyiNeural / YunxiNeural / YunyangNeural` 等标准中文声音一直稳。配置后先用单条命令试一下声音再上片：`edge-tts --voice zh-CN-XiaoxiaoNeural --text "测试" --write-media test.mp3`，产物 0 字节即该声音被拒。
 
 ### 验证安装
 
