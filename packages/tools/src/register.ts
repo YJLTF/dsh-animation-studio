@@ -45,7 +45,7 @@ import {
  * 按会话一文件、行即事件）。绝不写宿主会话日志（`session.append`）：dsh 的
  * 读回路径对未知事件类型 fail-closed——除非记录带 `SessionEvent.ignorable: true`
  * 信封，整个会话拒读（「likely written by a newer harness」）；而宿主
- * 0.1.6-alpha.1 的 append API 不提供 ignorable 入口，写入 anim/* 事件等于
+ * 0.1.6-alpha.2 的 append API 仍不提供 ignorable 入口，写入 anim/* 事件等于
  * 毒化该会话日志（真机事故：session-0ea61fc8）。等宿主开放
  * ignorable 写入后再评估切回。
  *

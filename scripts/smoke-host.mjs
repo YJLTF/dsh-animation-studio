@@ -3,7 +3,7 @@
  * 在真实 cordis Context + 真实 @deepseek-ai/dsh-tools 环境里把插件跑起来，
  * 验证 Config 校验、工具注册与 execute 调用链路。
  *
- * 持久化模型（宿主 0.1.6-alpha.1 实证）：anim/* 事件绝不写宿主会话日志——
+ * 持久化模型（宿主 0.1.6-alpha.2 实证）：anim/* 事件绝不写宿主会话日志——
  * 读回路径对未知事件类型 fail-closed（`SessionEvent.ignorable` 才放行），
  * 而 `session.append` 不提供 ignorable 入口，写了整个会话拒读。事件落
  * 插件自有的 sidecar JSONL（`<outputDir>/sessions/<sessionId>.jsonl`）。

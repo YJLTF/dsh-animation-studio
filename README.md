@@ -4,7 +4,7 @@
 
 你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 10 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程——中途可以随时抽查画面、把某个关键帧挪几百毫秒、或者撤销上一步。模型全程不写动画代码，只读写一份数据文档。
 
-基于 **dsh 0.1.6-alpha.1** 真机实证开发（类型开发基线 0.1.5-rc.2，peer 依赖声明为 `>=0.1.5-rc.2`），可无缝配合 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
+基于 **dsh 0.1.6-alpha.1** 真机实证开发（类型开发基线 0.1.5-rc.2，peer 依赖声明为 `>=0.1.5-rc.2`），**0.1.6-alpha.2** 兼容性已验证——宿主挂载冒烟（工具注册、执行链路、sidecar 落盘、会话恢复、web 路由、client 卡片）在其内置生态（cordis 4.0.2 / dsh-tools 0.1.6-alpha.2 / schemastery 3.18.2）下全绿。可无缝配合 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
 
 ```
 模型 ──anim_*工具──▶ AnimationSpec (JSON IR) ──▶ 渲染适配器 ──▶ MP4
