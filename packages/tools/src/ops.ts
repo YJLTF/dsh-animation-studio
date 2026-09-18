@@ -529,8 +529,15 @@ export interface PreviewClipInfo {
  * 命中该幕时，直接回放段视频——原画质、带音频、零渲染开销。段缓存是
  * anim_render 的副产品，这里只是把它送到面板；未命中返回 undefined，走正常
  * 抽帧路径（预期管理不变：抽帧无音频）。
+ * `displayMs` 是配音渲染时传给指纹的实测语音时长——查段口径必须与渲染一致，
+ * 否则 TTS spec 的段永远不命中（真机 E2E 抓到的失配）。
  */
-export function previewClipFastPath(spec: AnimationSpec, renderer: AnimRenderer, args: PreviewArgs): PreviewClipInfo | undefined {
+export function previewClipFastPath(
+  spec: AnimationSpec,
+  renderer: AnimRenderer,
+  args: PreviewArgs,
+  displayMs?: number[],
+): PreviewClipInfo | undefined {
   const find = renderer.findSceneSegment?.bind(renderer)
   if (!find) return undefined
   const at = args.atMs ?? []
@@ -543,7 +550,7 @@ export function previewClipFastPath(spec: AnimationSpec, renderer: AnimRenderer,
     sceneIndex = idx
   }
   if (sceneIndex === -1) return undefined
-  const segment = find(spec, sceneIndex, args.scale)
+  const segment = find(spec, sceneIndex, args.scale, displayMs)
   if (!segment) return undefined
   return { path: segment.path, sceneId: spec.scenes[sceneIndex]!.id, sceneIndex, durationMs: segment.durationMs }
 }
@@ -582,7 +589,18 @@ export async function opPreview(
 ): Promise<PreviewResultView | PreviewBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
-  // 单幕直放快路径（0.5.0 §3.2）：零渲染开销，无「后台」可言，命中即同步返回
+  // 单幕直放快路径（0.5.0 §3.2）：零渲染开销，无「后台」可言，命中即同步返回。
+  // 配音 spec 先按缓存口径还原 displayMs（渲染后命中缓存近零开销），
+  // 保证查段指纹与 anim_render 完全同口径。
+  if (deps.tts && (spec.narration?.cues.length ?? 0) > 0) {
+    const speechBuild = await buildSpeech(spec, deps)
+    const clip = previewClipFastPath(spec, renderer, args, speechBuild?.displayMs)
+    if (clip) {
+      emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
+      emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
+      return { specId: args.specId, renderer: renderer.name, frames: [], clip }
+    }
+  }
   const clip = previewClipFastPath(spec, renderer, args)
   if (clip) {
     emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
@@ -591,13 +609,15 @@ export async function opPreview(
   }
   if (jobs) {
     // 与 opRender 同一降级链：先带 owner，失败退无主，再失败退同步
+    let lastError: unknown
     for (const ownerCandidate of [owner, undefined]) {
       try {
         return await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
-      } catch {
-        /* 发布失败，尝试下一档 */
+      } catch (err) {
+        lastError = err
       }
     }
+    console.warn(`[dsh-anim-studio] 后台预览发布失败（owner 与无主两档均被拒），退回同步抽帧：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
   return await previewSync(args, { spec, renderer }, signal, emit)
 }
@@ -867,13 +887,16 @@ export async function opRender(
   if (jobs) {
     // 先带 owner（结果可归属、job_output/job_kill 的访问控制按 owner 走）；
     // owner 没有附加 job controller 时退到无主任务；再不行退同步渲染。
+    // 失败原因落宿主日志——「jobs 在但 start 拒绝」的门控问题要能被看见。
+    let lastError: unknown
     for (const ownerCandidate of [owner, undefined]) {
       try {
         return await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes, speech }, emit, jobs, ownerCandidate)
-      } catch {
-        /* 发布失败，尝试下一档 */
+      } catch (err) {
+        lastError = err
       }
     }
+    console.warn(`[dsh-anim-studio] 后台渲染发布失败（owner 与无主两档均被拒），退回同步渲染：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
   return await renderSync(args, { spec, renderer, outputPath, outlineNotes, speech }, signal, emit)
 }

@@ -120,5 +120,5 @@ export interface AnimRenderer {
   /**
    * 单幕段缓存查找（0.5.0 规划 §3.2，可选能力）。与 host 包 render.ts 成对改。
    */
-  findSceneSegment?(spec: AnimationSpec, sceneIndex: number, scale?: number): { path: string; durationMs: number } | null
+  findSceneSegment?(spec: AnimationSpec, sceneIndex: number, scale?: number, displayMs?: number[]): { path: string; durationMs: number } | null
 }

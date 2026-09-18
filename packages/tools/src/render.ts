@@ -153,7 +153,7 @@ export interface AnimRenderer {
    * 不进串行闸。指纹口径与增量渲染完全一致（场景 JSON + 渲染参数 + codegen
    * 版本），后端没有段缓存概念时可缺省此方法，预览自动回退抽帧。
    */
-  findSceneSegment?(spec: AnimationSpec, sceneIndex: number, scale?: number): { path: string; durationMs: number } | null
+  findSceneSegment?(spec: AnimationSpec, sceneIndex: number, scale?: number, displayMs?: number[]): { path: string; durationMs: number } | null
 }
 
 /**

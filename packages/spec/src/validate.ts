@@ -223,11 +223,11 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
       c.fail(`${p}/props/fill/type`, `渐变 type 应为 "linear" / "radial" / "conic"，实际为 ${JSON.stringify(gtype)}`)
     }
     if (!Array.isArray(g.stops) || g.stops.length < 2) {
-      c.fail(`${p}/props/fill/stops`, '渐变 stops 需要 >= 2 个 { offset, color }（offset 为 0~1）')
+      c.fail(`${p}/props/fill/stops`, '渐变 stops 需要 >= 2 个 [offset, color]（offset 为 0~1）')
     } else {
       g.stops.forEach((st, i) => {
-        if (!isRecord(st) || !isFiniteNumber(st.offset) || typeof st.color !== 'string') {
-          c.fail(`${p}/props/fill/stops/${i}`, 'stop 应为 { offset: 0~1, color: "#rgb" }')
+        if (!Array.isArray(st) || st.length !== 2 || !isFiniteNumber(st[0]) || typeof st[1] !== 'string') {
+          c.fail(`${p}/props/fill/stops/${i}`, 'stop 应为 [offset(0~1), "#rgb"] 元组，如 [0.5, "#4C9AFF"]')
         }
       })
     }

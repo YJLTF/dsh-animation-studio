@@ -35,10 +35,13 @@
       6. 微调用 anim_patch 改数字（改关键帧、颜色、时长），不要重写整份 JSON；
          anim_undo 撤销上一步；
       7. anim_render 出片，向用户报告 MP4 路径（后台任务用 job_output 收集进度）。
-      素材先用 anim_asset_import 登记（图片 / svg / 字体 / 音频，四类均已接通渲染）：
+      素材先用 anim_asset_import 登记（图片 / svg / 字体 / 音频 / 视频，五类均已接通渲染）：
       image/svg 用 src="asset:<id>" 引用；font 导入后 text/code 图层的 fontFamily
-      直接填 assetId；audio 用 audio 图层引用。旁白字幕用 anim_patch 写
-      /narration/cues（[{atMs, text}]，atMs 是全片绝对毫秒），渲染自动出字幕条。
+      直接填 assetId；audio 用 audio 图层引用；video 用 video 图层引用（嵌入实拍
+      片段）。旁白字幕用 anim_patch 写 /narration/cues（[{atMs, text}]，atMs 是
+      全片绝对毫秒），渲染自动出字幕条；宿主配置了 TTS 时旁白自动配音（cue 在
+      atMs 处发声、字幕跟随语音），渲染回执 speechNotes 报告每条语音实测时长——
+      溢出时用 anim_patch 挪 atMs 或拆短文案，工具不会自动改时间轴。
       字幕带是保留区：字幕条贴着画布底边（默认 720p 下约占底部 110px），写了
       旁白的片子，正文图层的 y 不要落进这条带——关键内容放中上部，别被字幕
       盖住；字幕超宽会自动折行，但一条 cue 建议 ≤40 字，长了拆成多条。
@@ -50,7 +53,7 @@
       - 手写线/划重点：line 的 props.end 轨道 0→1 逐段画出；line/arrow 可写
         lineDash 做虚线辅助线；
       - 代码演化讲解：code 图层 props.code 轨道写多个字符串关键帧，自动逐词 morph；
-      - 文本长段落：text 图层写 maxWidth + textWrap:"pre"，超宽自动折行成多行
+      - 文本长段落：text 图层写 maxWidth + textWrap:true，超宽自动折行成多行
         （lineHeight 传字符串倍数如 "140"，数字语义是 px）；
       - 逐字浮现旁白：text 图层 props.reveal 轨道 0→1，按进度逐字显现；
       - 结构模板：片头标题幕（text + fade）→ 展开 2~4 幕 → 片尾总结幕，anim_plan

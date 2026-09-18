@@ -87,9 +87,15 @@ function stripUndefined<T>(value: T): T {
  * 探测宿主的 ctx.jobs 服务（结构探测：宿主侧类型不在本包的类型面上）。
  * 没有该服务时渲染类工具自动走同步路径，行为与 0.1.x 一致。
  */
-function probeJobs(ctx: Context): AnimJobsService | undefined {
-  const jobs = probe(ctx, 'jobs') as { start?: unknown } | undefined
-  return jobs && typeof jobs.start === 'function' ? (jobs as AnimJobsService) : undefined
+function probeJobs(ctx: Context, jobsBox?: { value?: unknown }): AnimJobsService | undefined {
+  // 捕获盒优先：cordis 按 inject 许可属性访问，主插件上下文直接读 ctx.jobs
+  // 会因未声明而抛错（吞错后恒 undefined）——真机 jobsOnCtx=false 的根因。
+  const candidates = [jobsBox?.value, probe(ctx, 'jobs')]
+  for (const jobs of candidates) {
+    const j = jobs as { start?: unknown } | undefined
+    if (j && typeof j.start === 'function') return j as AnimJobsService
+  }
+  return undefined
 }
 
 /**
@@ -208,6 +214,7 @@ function hostServiceReport(
   ctx: Context,
   exec: { agent?: unknown },
   sessionsDir: string | undefined,
+  jobsBox?: { value?: unknown },
 ): Record<string, unknown> {
   const read = (obj: unknown, key: string): unknown => {
     try {
@@ -216,7 +223,11 @@ function hostServiceReport(
       return undefined
     }
   }
-  const jobs = read(ctx, 'jobs')
+  // jobs 走捕获盒优先（0.5.0 §2.1）：主插件上下文未经 inject 许可读不到它，
+  // 捕获子插件拿到后在 box 里；两处都探，谁有用谁
+  const jobs = [jobsBox?.value, read(ctx, 'jobs')].find(
+    (j): j is { start?: unknown } => typeof (j as { start?: unknown } | undefined)?.start === 'function',
+  )
   const session = read(ctx, 'session')
   const sessions = read(ctx, 'sessions')
   const agentSession = read(read(exec, 'agent'), 'session') as { id?: unknown }
@@ -227,7 +238,7 @@ function hostServiceReport(
     sessionOnCtx: typeof (session as { append?: unknown } | undefined)?.append === 'function',
     sessionsRegistryOnCtx: typeof (sessions as { get?: unknown } | undefined)?.get === 'function',
     // 后台渲染链路：jobsOnCtx 为 false 时渲染一律走同步回退
-    jobsOnCtx: typeof (jobs as { start?: unknown } | undefined)?.start === 'function',
+    jobsOnCtx: jobs !== undefined,
   }
 }
 
@@ -250,6 +261,11 @@ export interface RegisterOptions {
   tracker?: { observe(event: AnimEvent): void }
   /** 产物媒体索引：工具回执里出现过的文件路径才可被 /dsh-anim/media 服务。 */
   media?: { add(path: string): void }
+  /**
+   * jobs 服务捕获盒（0.5.0 §2.1）：宿主有 jobs 时由捕获子插件异步填入。
+   * 按引用读——捕获时机可能晚于注册，但一定早于第一次真正的渲染调用。
+   */
+  jobsBox?: { value?: unknown }
 }
 
 /**
@@ -334,7 +350,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       presentCall: () => ({ card: 'generic', title: '检查渲染环境', kind: 'read' }),
       async execute(args, exec) {
         const result = await opDiagnose(deps, args)
-        return { ...result, host: hostServiceReport(ctx, exec, sessionsDir) } as never
+        return { ...result, host: hostServiceReport(ctx, exec, sessionsDir, options.jobsBox) } as never
       },
     }),
   )
@@ -439,7 +455,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）、lineDash 虚线样式（如 [8,6]，rect 也支持）；'
             + 'arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
             + 'polygon 用 sides（边数）+ size（正多边形）；star 用 size + sides（角数，默认 5），形状自动生成。'
-            + 'text 支持 textAlign（left/center/right）；长段落写 maxWidth（像素，超宽自动折行）+ textWrap:"pre"；'
+            + 'text 支持 textAlign（left/center/right）；长段落写 maxWidth + textWrap:true（超宽自动折行；textWrap 值为字符串 "pre" 时只认显式换行）；'
             + '逐字打字机：text 图层的 props.reveal 轨道写 0→1 关键帧，文本按进度逐字浮现（旁白配音的标配）。'
             + 'fill 可以是纯色字符串或渐变对象 {type:"linear", from:[x,y], to:[x,y], stops:[[0,"#色"],[1,"#色"]]}（radial 用 fromRadius/toRadius；坐标是图层本地坐标，中心原点）。'
             + 'svg 用 svg 内嵌 SVG 字符串。image/video 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材（video 资产 kind 为 video，mp4/webm/mov）。'
@@ -649,7 +665,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       },
       async execute(args, exec) {
         const owner = (exec as { agent?: unknown }).agent
-        return (await opPreview(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
+        return (await opPreview(deps, args, exec.signal, emitFor(exec), probeJobs(ctx, options.jobsBox), owner)) as never
       },
     }),
   )
@@ -698,7 +714,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       },
       async execute(args, exec) {
         const owner = (exec as { agent?: unknown }).agent
-        return (await opRender(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
+        return (await opRender(deps, args, exec.signal, emitFor(exec), probeJobs(ctx, options.jobsBox), owner)) as never
       },
     }),
   )

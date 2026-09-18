@@ -60,7 +60,8 @@ export type GradientSpec = {
   angle?: number
   fromRadius?: number
   toRadius?: number
-  stops: Array<{ offset: number; color: string }>
+  /** 渐变 stops：[offset(0~1), color] 元组，如 [[0, "#1B3A5C"], [1, "#4C9AFF"]]。 */
+  stops: Array<[number, string]>
 }
 
 /* ---------------------------------------------------------------- 关键帧 */
@@ -149,10 +150,14 @@ export interface LayerProps {
   fontFamily?: string
   fontWeight?: number
   lineHeight?: number
-  /** 文本最大宽度（像素）：超宽自动折行（MC Layout 的 maxWidth 信号）。 */
+  /** 文本最大宽度（像素）：超宽自动折行（MC Layout 的 maxWidth 信号，
+   * 需配合 textWrap: true 才生效；渲染端会同步落到 width 作为折行边界）。 */
   maxWidth?: number
-  /** 折行模式：'pre' 按空白与 \n 折行（长段落文本推荐）；缺省不折行。 */
-  textWrap?: 'pre'
+  /**
+   * 折行模式（直接映射 CSS white-space）：true = 正常折行（配 maxWidth 用，
+   * 长段落首选）；'pre' = 只认显式 \n 不自动折行（字幕条/手工排版用）。
+   * 缺省 nowrap。 */
+  textWrap?: boolean | 'pre'
   /** 逐字打字机进度 0~1（text 图层轨道专用目标：props.reveal，渲染端
    * 生成按进度裁剪文本的 signal，实现逐字浮现）。静态 props 里不需要写。 */
   reveal?: number

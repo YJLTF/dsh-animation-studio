@@ -2230,6 +2230,17 @@ await checkA('previewClipFastPath: 单幕命中回 clip，跨幕/无 atMs/无段
   }
   const clamped = previewClipFastPath(spec, lastSceneRenderer, { specId: 'x', atMs: [spec.scenes[0]!.durationMs + 100_000] })
   assert.equal(clamped?.sceneIndex, spec.scenes.length - 1, '越界钳到末幕')
+  // displayMs 透传（TTS 渲染的查段口径与渲染一致，§5.3）
+  let gotDisplayMs: number[] | undefined
+  const spyRenderer: AnimRenderer = {
+    ...renderer,
+    findSceneSegment: (sp, i, sc, dm) => {
+      gotDisplayMs = dm
+      return { path: segPath, durationMs: 800 }
+    },
+  }
+  previewClipFastPath(spec, spyRenderer, { specId: 'x', atMs: [100] }, [4250])
+  assert.deepEqual(gotDisplayMs, [4250], 'displayMs 应透传给 findSceneSegment')
 })
 
 await checkA('codegen: 渐变 fill / reveal 打字机 / in-inOut 缓动 / video 图层全部落进生成物（§4）', async () => {

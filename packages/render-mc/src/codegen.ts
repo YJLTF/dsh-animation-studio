@@ -50,8 +50,11 @@ export interface GenerateResult {
  * 底条随行数增高——同输入下字幕段输出变了，旧段必须失效。
  * v4（0.5.0）：text maxWidth/textWrap、lineDash、fill 渐变、reveal 打字机、
  * video 图层、缓动 in/inOut 变体——生成语义整体扩面，旧段自然失效。
+ * v5：text 的 maxWidth 同步落 width 并放行 width 静态属性（独立 Txt 只有
+ * maxWidth 不触发折行 reflow，真机验收抓到；width 初版被白名单丢弃），
+ * 同输入下段落文本段的输出变了，旧段必须失效。
  */
-export const CODEGEN_VERSION = 4
+export const CODEGEN_VERSION = 5
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -72,8 +75,10 @@ const LAYOUT_PROPS = ['x', 'y', 'scale', 'rotation', 'opacity', 'size', 'width',
 export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   // textAlign 是 MC Layout 基类的原生 signal（Txt 继承），直通即可生效；
   // maxWidth + textWrap 支持正文长段落自动折行（0.5.0 §4.1，与字幕折行同一
-  // 语义坑：\n 要 textWrap:'pre' 才生效、lineHeight 数字是 px）
-  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign', maxWidth: 'maxWidth', textWrap: 'textWrap' },
+  // 语义坑：\n 要 textWrap:'pre' 才生效、lineHeight 数字是 px）；
+  // width 是折行的边界（normalize 会把 maxWidth 同步到 width，真机验证抓到
+  // 「只给 maxWidth 不参与布局就不 reflow」），必须进白名单否则被「不支持」丢弃
+  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign', maxWidth: 'maxWidth', textWrap: 'textWrap', width: 'width' },
   // lineDash 是 Shape 基类 signal（number[]，虚线样式）——line/arrow/rect 通用
   rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius', lineDash: 'lineDash' },
   // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
@@ -367,6 +372,14 @@ function normalizeLayerProps(
     if (out.size === undefined && out.width === undefined && out.height === undefined) {
       out.size = 100
       warnings.push('circle 图层未指定尺寸（size/width/height/radius），已按 size=100 兜底')
+    }
+  }
+  if (type === 'text') {
+    // maxWidth 折行的 MC 语义（0.5.0 §4.1 真机验证发现）：折行发生在 Layout
+    // 的有界宽度上，独立 Txt 只给 maxWidth 不参与布局就不 reflow——把
+    // maxWidth 同时落到 width（未显式给 width 时），折行边界与最大宽一致
+    if (out.maxWidth !== undefined && out.width === undefined && out.size === undefined) {
+      out.width = out.maxWidth
     }
   }
   if (type === 'line' || type === 'arrow') {

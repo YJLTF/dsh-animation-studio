@@ -29,6 +29,8 @@ assert.ok(!source.includes('from "@dsh-anim/'), 'bundle 不应引用工作区包
 
 const plugin = await import(new URL('../lib/index.js', import.meta.url))
 assert.equal(plugin.name, 'dsh-anim-studio')
+// 0.5.0 §2.1：jobs 走「捕获子插件」而非主插件 inject——宿主缺失 jobs 时若写进
+// inject，cordis 会把挂载延迟到永远（真机结论）；inject 必须保持只有 tools
 assert.deepEqual(plugin.inject, ['tools'])
 assert.equal(typeof plugin.apply, 'function')
 

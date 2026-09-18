@@ -23,7 +23,10 @@ import { MediaIndex, mountAnimWebRoutes, RenderTracker } from './web.ts'
 
 export const name = 'dsh-anim-studio'
 
-/** 只依赖工具注册表；渲染后端由 provider 按需挂进来（见 apply 末尾）。 */
+/** 只依赖工具注册表；渲染后端由 provider 按需挂进来（见 apply 末尾）。
+ * 注意：不能为了探测把 jobs/session 写进 inject——cordis 对缺失的声明服务
+ * 会**延迟挂载直到可用**（真机：裸 cordis 上插件永不启动，冒烟 0.6 抓到），
+ * 可选服务只能走 getRootCtx 的反射读取（见 ctx-probe.ts）。 */
 export const inject = ['tools'] as const
 
 export interface Config {
@@ -203,17 +206,63 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   // 配音服务（0.5.0 §5）：配置了 tts.command 才可用；未配置时旁白只出字幕
   const tts = config.tts?.command && config.tts.command.length > 0 ? createTtsService(config.tts as TtsConfig) : undefined
   const deps: AnimDeps = { store, renderers: registry, outputDir, ...(tts ? { tts } : {}) }
+  // jobs 服务捕获（0.5.0 §2.1 真机调查结论）：cordis 4 按 inject 声明**许可**
+  // 服务属性访问（未声明=抛错），而把 jobs 写进本插件的 inject 会在宿主缺失
+  // 该服务时把挂载**延迟到永远**（冒烟实证：裸 cordis 上插件不再启动）。
+  // 解法：挂一个只依赖 jobs 的子插件——宿主有 jobs（alpha.2+ 的 dsh-base
+  // bundle 自带）时子插件启动并把服务捕进 box，渲染/预览自动后台化；
+  // 宿主没有 jobs 时子插件静默不启动，主插件照常挂载、渲染维持同步回退。
+  const jobsBox: { value?: unknown } = {}
+  captureOptionalService(ctx, ['jobs'], jobsBox)
   const hydrate = makeSessionHydrator(store, { sessionsDir })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给
   // ctx.effect——那会被当成 effect body 立即调用，等于注册完马上注销。
-  ctx.effect(() =>
-    registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media }),
-  )
+  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media, jobsBox }))
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
   // /dsh-anim 路由：宿主有 webServer（dsh web）才挂得上，headless 形态整段不存在
   mountAnimWebRoutes(ctx, { store, tracker, media, outputDir })
+}
+
+/**
+ * 可选服务捕获：挂一个声明了 `names` 的子插件，服务就绪时把读取结果存进 box。
+ * 子插件在服务缺失时静默不启动（cordis 对 inject 的可用性门控恰好被我们用作
+ * 「可选依赖」）——主插件的启动不受影响。捕获时机可能晚于 apply 返回（宿主
+ * 服务陆续就绪），消费方按引用读 box。
+ */
+function captureOptionalService(ctx: Context, names: string[], box: { value?: unknown }): void {
+  const apply = (serviceCtx: Context): void => {
+    for (const name of names) {
+      const value = probe(serviceCtx, name)
+      if (value !== undefined) box.value = value
+    }
+    // 挂本插件署名的 job controller（0.5.0 §2.1 真机发现）：jobs.start 的
+    // servesOwner 门控要求「有 controller serve 该 owner」，而 dsh-tool-jobs
+    // 的 controller 挂在它自己的组合 scope 里，对我们的 owner/无主任务不可见
+    // → start 恒抛、后台化永远退同步。从捕获 ctx（与 tool-jobs 同层）再挂一个
+    // controller 让后台发布通过门控；job 的收集/终止仍由 tool-jobs 的
+    // job_output / job_kill 完成（owner 隔离不受影响）。
+    const jobs = box.value as { attachController?: (name: string) => unknown } | undefined
+    try {
+      jobs?.attachController?.('dsh-anim-studio')
+    } catch {
+      /* attach 失败则维持同步回退 */
+    }
+  }
+  try {
+    const c = ctx as unknown as {
+      plugin?: (p: { inject: string[]; apply: (c: Context) => void; name: string }) => unknown
+      registry?: { inject?: (i: string[], cb: (c: Context) => void) => unknown }
+    }
+    if (typeof c.plugin === 'function') {
+      c.plugin({ inject: names, apply, name: `dsh-anim-capture-${names.join('-')}` })
+    } else if (typeof c.registry?.inject === 'function') {
+      c.registry.inject(names, apply)
+    }
+  } catch {
+    /* 捕获失败等价于「服务不可用」，走同步回退 */
+  }
 }
 
 /**

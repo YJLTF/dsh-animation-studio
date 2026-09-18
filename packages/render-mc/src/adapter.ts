@@ -111,10 +111,13 @@ export class MotionCanvasRenderer implements AnimRenderer {
    * 缩放与段不匹配时再按全分辨率（渲染默认值）查一次——段内容与抽帧预览
    * 的缩放无关地正确，预览宁可用成片分辨率的现成段，也不多渲一遍。
    */
-  findSceneSegment(spec: AnimationSpec, sceneIndex: number, scale?: number): { path: string; durationMs: number } | null {
+  findSceneSegment(spec: AnimationSpec, sceneIndex: number, scale?: number, displayMs?: number[]): { path: string; durationMs: number } | null {
     for (const candidate of [...new Set([scale, undefined])]) {
       const resolutionScale = resolveResolutionScale(candidate)
-      const { scenes } = expandNarration(spec).spec
+      // 展开口径必须与 #renderIncremental 的指纹输入一致：配音渲染传了
+      // displayMs（字幕跟随语音时长），场景 JSON 因此不同、指纹不同——
+      // 查段时也要带上同一份 displayMs 才能命中（真机 E2E 抓到的失配）
+      const { scenes } = expandNarration(spec, { displayMs }).spec
       const scene = scenes[sceneIndex]
       if (!scene) return null
       const hash = sceneFingerprint(scene, {
