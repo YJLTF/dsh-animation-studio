@@ -201,4 +201,4 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 ## 文档
 
 - [`docs/设计草案.md`](docs/设计草案.md)：dsh 平台事实、AnimationSpec IR 设计、事件模型、选型与踩坑
-- [`docs/0.2.0-规划.md`](docs/0.2.0-规划.md) / [`docs/0.3.0-规划.md`](docs/0.3.0-规划.md) / [`docs/0.3.x-优化清单.md`](docs/0.3.x-优化清单.md) / [`docs/0.4.0-规划.md`](docs/0.4.0-规划.md)：各版本的范围、验收与迭代记录
+- [`docs/0.2.0-规划.md`](docs/0.2.0-规划.md) / [`docs/0.3.0-规划.md`](docs/0.3.0-规划.md) / [`docs/0.3.x-优化清单.md`](docs/0.3.x-优化清单.md) / [`docs/0.4.0-规划.md`](docs/0.4.0-规划.md) / [`docs/0.5.0-规划.md`](docs/0.5.0-规划.md)：各版本的范围、验收与迭代记录
