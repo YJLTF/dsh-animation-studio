@@ -47,10 +47,24 @@
       - 全片 BGM：第一幕放 audio 图层，loop:true + stop:"specEnd"，volume 0.2~0.4 垫底；
       - 高亮强调框：rect 不写 fill、只写 stroke，scale 轨道做 1→1.06→1 呼吸两拍；
       - 强调星弹出：star + 缓动 {"kind":"back"}（或 bounce/elastic）弹入；
-      - 手写线/划重点：line 的 props.end 轨道 0→1 逐段画出；
+      - 手写线/划重点：line 的 props.end 轨道 0→1 逐段画出；line/arrow 可写
+        lineDash 做虚线辅助线；
       - 代码演化讲解：code 图层 props.code 轨道写多个字符串关键帧，自动逐词 morph；
+      - 文本长段落：text 图层写 maxWidth + textWrap:"pre"，超宽自动折行成多行
+        （lineHeight 传字符串倍数如 "140"，数字语义是 px）；
+      - 逐字浮现旁白：text 图层 props.reveal 轨道 0→1，按进度逐字显现；
       - 结构模板：片头标题幕（text + fade）→ 展开 2~4 幕 → 片尾总结幕，anim_plan
         阶段就排进大纲；幕尾需要收束感时给 scene.exit 配 fade。
+
+      高频手误对照表（以下错形工具会自动纠正或告警退回；直接照右列写省一个来回）：
+      | 高频手误 | 规范写法 |
+      | ease 写字符串 "easeOut" | 对象 {"kind":"easeOut"} |
+      | type 大小写飘（"Text"/"RECT"） | 全小写：text/rect/circle/ellipse/image/line/arrow/polygon/star/svg/code/math/group/audio |
+      | 描边宽度 strokeWidth | lineWidth（会被换算，但规范名落库才干净） |
+      | 填充色 color | fill |
+      | 文本对齐漏写或写进子对象 | text 图层 props.textAlign："left"/"center"/"right" |
+      | durationMs 写成秒（3） | 一律毫秒（3000）；narration 的 atMs 是全片绝对毫秒 |
+      | 正文 y 落进底部字幕带 | 关键内容放中上部，避开字幕保留区（720p 约底部 110px） |
 
       面板指令（用户在动画卡片的按钮上点击产生，务必直接执行，不要反问确认）：
       以「[anim-studio 面板指令]」开头的用户消息是面板按钮发来的结构化指令，

@@ -38,6 +38,26 @@ export interface PreviewResult {
    * 「渲染不报错、看片才发现」的产出偏差由此堵住（0.4.0 规划 N4）。
    */
   warnings?: string[]
+  /**
+   * 单幕直放（0.5.0 规划 §3.2）：与 host 包 render.ts 的 PreviewResult
+   * 成对改。MC 适配器的预览不产 clip（直放在 host 侧 findSceneSegment
+   * 快路径完成），字段在此存在只为结构对齐。
+   */
+  clip?: PreviewClip
+}
+
+/** 单幕段视频直放的信息。段文件在 outputDir 内，媒体路由天然可服务。 */
+export interface PreviewClip {
+  path: string
+  sceneId: string
+  sceneIndex: number
+  durationMs: number
+}
+
+/** 旁白配音载荷（0.5.0 规划 §5）。与 host 包 render.ts 成对改。 */
+export interface SpeechPayload {
+  tracks: Array<{ source: string; startMs: number; durationMs: number; volume: number }>
+  displayMs?: number[]
 }
 
 export interface RenderRequest {
@@ -50,6 +70,9 @@ export interface RenderRequest {
    * 上次渲染的段。显式传 false 强制全量渲染（排查缓存疑点时的保底开关）。
    */
   cache?: boolean
+  /** 旁白配音（0.5.0 规划 §5）：mux 音轨 + 字幕显示时长跟随实测音频。
+   * 允许传 Promise：后台渲染时合成发生在 job 内，不占模型回合。 */
+  speech?: SpeechPayload | Promise<SpeechPayload>
   onProgress?: (done: number, total: number) => void
 }
 
@@ -81,6 +104,12 @@ export interface RenderResult {
    * 音轨在编码/拼接之后从现行 spec 重新混入，不参与段缓存。
    */
   audioTracks?: string[]
+  /** 混入成片的旁白配音条数（0.5.0 规划 §5）。与 host 包成对改。 */
+  speechTracks?: number
+  /** 旁白音画对账清单（0.5.0 §5.3）。与 host 包成对改。 */
+  speechNotes?: Array<{ index: number; text: string; atMs: number; audioMs: number; overflowMs: number }>
+  /** 全片关键帧拼贴图（0.5.0 规划 §3.3）；生成失败缺省。与 host 包成对改。 */
+  contactSheet?: string
 }
 
 export interface AnimRenderer {
@@ -88,4 +117,8 @@ export interface AnimRenderer {
   diagnose(): Promise<RenderDiagnostics>
   preview(request: PreviewRequest, signal: AbortSignal): Promise<PreviewResult>
   render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult>
+  /**
+   * 单幕段缓存查找（0.5.0 规划 §3.2，可选能力）。与 host 包 render.ts 成对改。
+   */
+  findSceneSegment?(spec: AnimationSpec, sceneIndex: number, scale?: number): { path: string; durationMs: number } | null
 }

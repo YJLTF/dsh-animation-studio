@@ -93,6 +93,10 @@ export interface AnimRenderFinishedData {
   }
   /** 混入成片的音轨（0.4.0 规划 §4.1，audio 图层 assetId 列表），无声成片缺省。 */
   audioTracks?: string[]
+  /** 旁白音画对账清单（0.5.0 规划 §5.3）：报告而非自动改时间线。 */
+  speechNotes?: Array<{ index: number; text: string; atMs: number; audioMs: number; overflowMs: number }>
+  /** 全片关键帧拼贴图（0.5.0 规划 §3.3，jpg 绝对路径），生成失败时缺省。 */
+  contactSheet?: string
 }
 
 /**
@@ -110,6 +114,8 @@ export interface AnimPreviewFinishedData {
   specId: string
   jobId: string
   frames?: Array<{ atMs: number; path: string }>
+  /** 单幕直放（0.5.0 规划 §3.2）：段缓存命中时回放段视频，frames 为空数组。 */
+  clip?: { path: string; sceneId: string; sceneIndex: number; durationMs: number }
   status?: 'killed' | 'failed'
   /** status 为 failed 时的人类可读原因。 */
   error?: string

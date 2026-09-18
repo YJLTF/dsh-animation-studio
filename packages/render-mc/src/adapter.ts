@@ -20,7 +20,7 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, extname, join, resolve } from 'node:path'
+import { basename, dirname, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 import type { AnimationSpec, Asset, Scene } from '@dsh-anim/spec'
@@ -103,6 +103,33 @@ export class MotionCanvasRenderer implements AnimRenderer {
     await this.#runtime.dispose?.()
   }
 
+  /**
+   * 单幕段缓存查找（0.5.0 规划 §3.2）：目标幕的段文件存在且指纹命中时返回
+   * 段路径与时长，否则 null。纯读操作——不渲染、不进串行闸。指纹与
+   * #renderIncremental 同一套口径（展开字幕后的场景 JSON + fps/缩放/分辨率
+   * + CODEGEN_VERSION），anim_render 留下的有效段这里必然命中；调用方给的
+   * 缩放与段不匹配时再按全分辨率（渲染默认值）查一次——段内容与抽帧预览
+   * 的缩放无关地正确，预览宁可用成片分辨率的现成段，也不多渲一遍。
+   */
+  findSceneSegment(spec: AnimationSpec, sceneIndex: number, scale?: number): { path: string; durationMs: number } | null {
+    for (const candidate of [...new Set([scale, undefined])]) {
+      const resolutionScale = resolveResolutionScale(candidate)
+      const { scenes } = expandNarration(spec).spec
+      const scene = scenes[sceneIndex]
+      if (!scene) return null
+      const hash = sceneFingerprint(scene, {
+        fps: spec.meta.fps,
+        resolutionScale,
+        width: spec.meta.size.width,
+        height: spec.meta.size.height,
+        codegenVersion: CODEGEN_VERSION,
+      })
+      const path = join(this.#specWorkDir(spec), 'segments', `seg-${String(sceneIndex).padStart(2, '0')}-r2-${hash}.mp4`)
+      if (existsSync(path)) return { path, durationMs: sceneDurationMs(scene) }
+    }
+    return null
+  }
+
   async preview(request: PreviewRequest, signal: AbortSignal): Promise<PreviewResult> {
     // 预览 = 只渲染抽样帧。Motion Canvas 没有「只渲某几帧」的入口，所以
     // 做法是：把时间线截短到最晚的抽帧点（其后的场景不渲），低分辨率出帧后
@@ -137,12 +164,15 @@ export class MotionCanvasRenderer implements AnimRenderer {
   }
 
   async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
+    // 旁白配音载荷可能是 Promise（后台渲染时合成发生在 job 内，不占模型回合）
+    const speech = await request.speech
     const resolutionScale = resolveResolutionScale(request.scale)
     // scenes 抽查：切片后的 spec 同时决定渲染内容与时长/帧数的报告口径。
     // 此参数曾只进契约不进实现（模型传了 scenes 却渲出整片），见优化清单 O1。
     // 旁白字幕在切片之后展开（§4.3）：展开产物挂在各幕 scene.subtitles 上
     // （场景内本地毫秒），solo 切片与场景指纹因此天然携带字幕。
-    const spec = expandNarration(pickScenes(request.spec, request.scenes)).spec
+    // 配音渲染（0.5.0 §5）传 displayMs：字幕显示时长跟随实测语音时长。
+    const spec = expandNarration(pickScenes(request.spec, request.scenes), { displayMs: speech?.displayMs }).spec
     const rawOutputPath = request.outputPath || this.#defaultOutputPath
     if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
     // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
@@ -165,7 +195,8 @@ export class MotionCanvasRenderer implements AnimRenderer {
     if (request.cache !== false && spec.scenes.length > 0 && expected > 0) {
       try {
         const incremental = await this.#renderIncremental({ spec, outputPath, fps, expected, resolutionScale, signal, onProgress: request.onProgress })
-        const audio = await this.#finishAudio(spec, outputPath, expected, fps)
+        const audio = await this.#finishAudio(spec, outputPath, expected, fps, speech)
+        const { path: contactSheet, warnings: sheetWarnings } = await this.#buildContactSheet(outputPath, durationMs)
         return {
           outputPath,
           frameCount: expected,
@@ -178,7 +209,11 @@ export class MotionCanvasRenderer implements AnimRenderer {
             scenesReused: spec.scenes.length - incremental.rendered,
           },
           ...(audio.tracks.length > 0 ? { audioTracks: audio.tracks } : {}),
-          ...(audio.warnings.length > 0 ? { warnings: dedupeWarnings(audio.warnings) } : {}),
+          ...(audio.speechCount > 0 && speech ? { speechTracks: audio.speechCount } : {}),
+          ...(contactSheet !== undefined ? { contactSheet } : {}),
+          ...(audio.warnings.length + sheetWarnings.length > 0
+            ? { warnings: dedupeWarnings([...audio.warnings, ...sheetWarnings]) }
+            : {}),
         }
       } catch (err) {
         if (signal.aborted) throw err
@@ -190,8 +225,9 @@ export class MotionCanvasRenderer implements AnimRenderer {
 
     const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
     await encodeFrames(result.frameDir, result.expected, fps, outputPath)
-    const audio = await this.#finishAudio(spec, outputPath, expected, fps)
-    const warnings = [fallbackNote, ...result.warnings, ...audio.warnings].filter((w): w is string => w !== undefined)
+    const audio = await this.#finishAudio(spec, outputPath, expected, fps, speech)
+    const { path: contactSheet, warnings: sheetWarnings } = await this.#buildContactSheet(outputPath, durationMs)
+    const warnings = [fallbackNote, ...result.warnings, ...audio.warnings, ...sheetWarnings].filter((w): w is string => w !== undefined)
     return {
       outputPath,
       frameCount: result.frameCount,
@@ -202,28 +238,69 @@ export class MotionCanvasRenderer implements AnimRenderer {
       ...(fallbackNote === undefined ? {} : { incremental: { scenesTotal: spec.scenes.length, scenesReused: 0, fallback: true } }),
       ...(warnings.length > 0 ? { warnings: dedupeWarnings(warnings) } : {}),
       ...(audio.tracks.length > 0 ? { audioTracks: audio.tracks } : {}),
+      ...(audio.speechCount > 0 && speech ? { speechTracks: audio.speechCount } : {}),
+      ...(contactSheet !== undefined ? { contactSheet } : {}),
     }
   }
 
   /**
-   * 音轨收尾（§4.1）：按现行 spec 收集音轨清单并 mux 进成片。混音失败只
-   * 降级警告（成片保留无声视频版本），绝不让已完成的画面渲染整单报废。
+   * 全片关键帧拼贴图（0.5.0 规划 §3.3）：从成片均匀抽 4×2 = 8 帧拼一张
+   * contact sheet（jpg，与成片同目录同名 + `.contact.jpg`——重渲自然覆盖，
+   * 不堆积）。模型在回执里看到成片结构是否对，用户在面板一键看全片概览。
+   * 生成失败只降级警告（warnings 进回执）——拼贴图是锦上添花，绝不让
+   * 已完成的渲染报废。
+   */
+  async #buildContactSheet(outputPath: string, durationMs: number): Promise<{ path?: string; warnings: string[] }> {
+    try {
+      const COLS = 4
+      const ROWS = 2
+      const sheetPath = join(dirname(outputPath), `${basename(outputPath, extname(outputPath))}.contact.jpg`)
+      // fps=帧数/总秒数 → 在全片时长上均匀采样 8 帧；scale -2 保证高度为偶数
+      const rate = (COLS * ROWS) / Math.max(durationMs / 1000, 0.001)
+      await exec('ffmpeg', [
+        '-y', '-i', outputPath,
+        '-vf', `fps=${num(rate)},scale=320:-2,tile=${COLS}x${ROWS}`,
+        '-frames:v', '1', '-update', '1', '-q:v', '3',
+        sheetPath,
+      ])
+      return { path: sheetPath, warnings: [] }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { warnings: [`拼贴图生成失败（不影响成片）：${message}`] }
+    }
+  }
+
+  /**
+   * 音轨收尾（§4.1）：按现行 spec 收集音轨清单并 mux 进成片。旁白配音
+   * （0.5.0 §5）的已合成轨道在此并入同一 mux 管线（adelay 对齐 + amix）。
+   * 混音失败只降级警告（成片保留无声视频版本），绝不让已完成的画面渲染
+   * 整单报废。
    */
   async #finishAudio(
     spec: AnimationSpec,
     outputPath: string,
     expectedFrames: number,
     fps: number,
-  ): Promise<{ tracks: string[]; warnings: string[] }> {
+    speech?: { tracks: Array<{ source: string; startMs: number; durationMs: number; volume: number }>; displayMs?: number[] },
+  ): Promise<{ tracks: string[]; speechCount: number; warnings: string[] }> {
     const { cues, warnings } = collectAudioTracks(spec)
-    if (cues.length === 0) return { tracks: [], warnings }
+    const speechCues = (speech?.tracks ?? []).map((t, i) => ({
+      assetId: `speech-${i + 1}`,
+      source: t.source,
+      startMs: t.startMs,
+      durationMs: t.durationMs,
+      volume: t.volume,
+      loop: false,
+    }))
+    const all = [...cues, ...speechCues]
+    if (all.length === 0) return { tracks: [], speechCount: 0, warnings }
     try {
-      await muxAudioTracks(outputPath, cues, expectedFrames / fps)
-      return { tracks: cues.map(c => c.assetId), warnings }
+      await muxAudioTracks(outputPath, all, expectedFrames / fps)
+      return { tracks: all.map(c => c.assetId), speechCount: speechCues.length, warnings }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.warn(`[render-mc] 音轨合成失败，成片保留无声版本：${message}`)
-      return { tracks: [], warnings: [...warnings, `音轨合成失败，成片为无声版本：${message}`] }
+      return { tracks: [], speechCount: 0, warnings: [...warnings, `音轨合成失败，成片为无声版本：${message}`] }
     }
   }
 

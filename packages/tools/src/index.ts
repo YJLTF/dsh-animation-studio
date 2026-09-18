@@ -18,6 +18,7 @@ import type { AnimDeps } from './ops.ts'
 import { registerAnimTools, resolveEventSink } from './register.ts'
 import type { AnimRenderer } from './render.ts'
 import { AnimRendererRegistry } from './render.ts'
+import { createTtsService, type TtsConfig } from './tts.ts'
 import { MediaIndex, mountAnimWebRoutes, RenderTracker } from './web.ts'
 
 export const name = 'dsh-anim-studio'
@@ -28,10 +29,24 @@ export const inject = ['tools'] as const
 export interface Config {
   /** 渲染产物与中间工作目录的根目录。 */
   outputDir: string
+  /** 配音（TTS）配置（0.5.0 规划 §5）：不配置则旁白只出字幕、不发声。 */
+  tts?: TtsConfig
 }
 
 export const Config: Schema<Config> = Schema.object({
   outputDir: Schema.string().default('./.dsh/anim').description('渲染产物与中间工作目录的根目录'),
+  tts: Schema.object({
+    command: Schema.array(String).role('table').description(
+      'TTS 命令模板（数组，逐项替换占位符后直接执行，不经 shell）。占位符：{text} {outFile} {voice} {rate} {stdin}。'
+      + 'edge-tts 示例：["edge-tts","--voice","{voice}","--rate","{rate}","--text","{text}","--write-media","{outFile}"]。'
+      + '注意：TTS 会把旁白文本送进这条命令（可能出网），离线环境请用 piper 等本地引擎',
+    ),
+    voice: Schema.string().description('默认声音（cue.voice 缺省时用），如 zh-CN-XiaoxiaoNeural'),
+    voices: Schema.dict(String).description('声音映射表：cue.voice 名 → 引擎声音标识'),
+    rate: Schema.string().description('默认语速占位值（edge-tts 形如 "+0%"，引擎语义各异）'),
+    volume: Schema.number().description('旁白音量 0~1，默认 1'),
+    timeoutMs: Schema.number().description('单条合成超时（毫秒），默认 120000'),
+  }).description('配音配置：留空 = 旁白只出字幕不发声'),
 })
 
 const DEFAULT_OUTPUT_DIR = './.dsh/anim'
@@ -185,7 +200,9 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   restoreFromSession(ctx, store)
 
   const registry = new AnimRendererRegistry()
-  const deps: AnimDeps = { store, renderers: registry, outputDir }
+  // 配音服务（0.5.0 §5）：配置了 tts.command 才可用；未配置时旁白只出字幕
+  const tts = config.tts?.command && config.tts.command.length > 0 ? createTtsService(config.tts as TtsConfig) : undefined
+  const deps: AnimDeps = { store, renderers: registry, outputDir, ...(tts ? { tts } : {}) }
   const hydrate = makeSessionHydrator(store, { sessionsDir })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))

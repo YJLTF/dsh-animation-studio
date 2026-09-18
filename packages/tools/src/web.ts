@@ -63,8 +63,14 @@ export interface RenderStatusView {
   }
   /** 混入成片的音轨（§4.1），无声成片缺省。 */
   audioTracks?: string[]
+  /** 全片关键帧拼贴图（0.5.0 规划 §3.3），生成失败缺省。 */
+  contactSheet?: string
+  /** 旁白音画对账清单（0.5.0 规划 §5.3），纯字幕模式缺省。 */
+  speechNotes?: Array<{ index: number; text: string; atMs: number; audioMs: number; overflowMs: number }>
   /** 后台预览的帧清单（§5.3），预览完成卡片由此重建缩略图。 */
   frames?: Array<{ atMs: number; path: string }>
+  /** 单幕直放（0.5.0 规划 §3.2）：段缓存命中的预览，卡片回放段视频而非缩略图。 */
+  clip?: { path: string; sceneId: string; sceneIndex: number; durationMs: number }
 }
 
 /**
@@ -112,6 +118,8 @@ export class RenderTracker {
       if (d.warnings !== undefined) job.warnings = d.warnings
       if (d.incremental !== undefined) job.incremental = d.incremental
       if (d.audioTracks !== undefined) job.audioTracks = d.audioTracks
+      if (d.contactSheet !== undefined) job.contactSheet = d.contactSheet
+      if (d.speechNotes !== undefined) job.speechNotes = d.speechNotes
       return
     }
     // 预览任务与渲染同簿（§5.3）：条目小得多，没有进度，完成时带帧清单
@@ -138,6 +146,7 @@ export class RenderTracker {
       if (d.frames !== undefined) job.frames = d.frames
       if (d.error !== undefined) job.error = d.error
       if (d.warnings !== undefined) job.warnings = d.warnings
+      if (d.clip !== undefined) job.clip = d.clip
     }
   }
 
@@ -209,6 +218,12 @@ const MEDIA_TYPES: Record<string, string> = {
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
+  // audio 资产（0.5.0 §2.2）：资产卡试听与音频产物的面板回放
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.m4a': 'audio/mp4',
+  '.flac': 'audio/flac',
 }
 
 function json(status: number, value: unknown): KernelResponse {

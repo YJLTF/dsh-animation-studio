@@ -48,8 +48,10 @@ export interface GenerateResult {
  * code 缺 fill 兜底主题色、project.meta 背景兜底主题底色、字幕条/退场新增。
  * v3：字幕字号改按画布高度比例（不再跟 theme.font.size），超宽自动折行、
  * 底条随行数增高——同输入下字幕段输出变了，旧段必须失效。
+ * v4（0.5.0）：text maxWidth/textWrap、lineDash、fill 渐变、reveal 打字机、
+ * video 图层、缓动 in/inOut 变体——生成语义整体扩面，旧段自然失效。
  */
-export const CODEGEN_VERSION = 3
+export const CODEGEN_VERSION = 4
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -68,9 +70,12 @@ const LAYOUT_PROPS = ['x', 'y', 'scale', 'rotation', 'opacity', 'size', 'width',
  * 类型报错；导出是给冒烟的「枚举一致性断言」用的（0.3.x 优化清单 O14）。
  */
 export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
-  // textAlign 是 MC Layout 基类的原生 signal（Txt 继承），直通即可生效
-  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign' },
-  rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius' },
+  // textAlign 是 MC Layout 基类的原生 signal（Txt 继承），直通即可生效；
+  // maxWidth + textWrap 支持正文长段落自动折行（0.5.0 §4.1，与字幕折行同一
+  // 语义坑：\n 要 textWrap:'pre' 才生效、lineHeight 数字是 px）
+  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign', maxWidth: 'maxWidth', textWrap: 'textWrap' },
+  // lineDash 是 Shape 基类 signal（number[]，虚线样式）——line/arrow/rect 通用
+  rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius', lineDash: 'lineDash' },
   // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
   // 由 normalizeLayerProps 换算成 size；见 0.3.0 规划 §1.4（圆形画不出来的修复）。
   circle: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
@@ -78,8 +83,8 @@ export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   // 成员经 children 引用，由 genSceneFile 组合成 Node 容器；静态属性只有变换。
   group: {},
   // Line 的 start/end（0~1 画线进度）与 endArrow/arrowSize 都是 Curve 内建 signal
-  line: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
-  arrow: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize' },
+  line: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize', lineDash: 'lineDash' },
+  arrow: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize', lineDash: 'lineDash' },
   // MC 没有独立的 Ellipse 节点：椭圆 = Circle + width/height（官方用法）
   ellipse: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
   // MC Polygon 是正多边形（sides 边数 + radius 角圆角）；star 用 Path + codegen 内置星形 path
@@ -92,6 +97,9 @@ export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   code: { code: 'code', fontSize: 'fontSize', fontFamily: 'fontFamily', fill: 'fill' },
   // Latex 组件（SVGNode）：tex 是 SVG 源，fill/fontSize 由 MC 的 Shape 信号提供
   math: { tex: 'tex', fontSize: 'fontSize', fill: 'fill' },
+  // video 图层（0.5.0 §4.4）：MC Video extends Rect；play 固定注入（见 emitNode），
+  // volume 无对应 signal（MC 按节点调音量不可行），写了会被「不支持」告警降级
+  video: { src: 'src', width: 'width', height: 'height', loop: 'loop', time: 'time', playbackRate: 'playbackRate' },
   // audio 不进 MC 画面生成（genSceneFile 在 emitNode 之前跳过），此表只为
   // Record<LayerType, …> 的完整性存在
   audio: {},
@@ -125,6 +133,7 @@ export const COMPONENT: Record<LayerType, string> = {
   svg: 'SVG',
   code: 'Code',
   math: 'Latex',
+  video: 'Video', // 实拍片段嵌入（0.5.0 §4.4）；headless 帧同步经真机 gate 验证
   audio: 'Node', // audio 永不 emitNode（不进画面），此处仅满足 Record 完整性
 }
 
@@ -313,6 +322,23 @@ function normalizeLayerProps(
       delete out[alias]
     }
   }
+  // 渐变 fill 的形态守门（0.5.0 §4.2）：描述对象非法（type 拼错 / stops 不足
+  // 或条目坏）时告警摘除——渲染端宁可用无 fill 兜底，也不静默生成坏渐变
+  if (out.fill !== undefined && typeof out.fill === 'object' && !Array.isArray(out.fill)) {
+    const g = out.fill as { type?: JsonValue; stops?: JsonValue; from?: JsonValue; to?: JsonValue; angle?: JsonValue }
+    const stops = Array.isArray(g.stops) ? g.stops.filter(s => Array.isArray(s) && s.length === 2 && typeof s[0] === 'number' && typeof s[1] === 'string') : []
+    const okType = g.type === 'linear' || g.type === 'radial' || g.type === 'conic'
+    if (!okType || stops.length < 2) {
+      warnings.push(`图层（${type}）的 fill 渐变描述无效（type 应为 linear/radial/conic，stops 需要 >= 2 个 [offset, color]），已忽略渐变`)
+      delete out.fill
+    } else {
+      const cleaned: Record<string, JsonValue> = { type: g.type as JsonValue, stops: stops as JsonValue }
+      if (g.from !== undefined) cleaned.from = g.from
+      if (g.to !== undefined) cleaned.to = g.to
+      if (g.angle !== undefined) cleaned.angle = g.angle
+      out.fill = cleaned
+    }
+  }
   if (type === 'group') {
     // children 是组合引用，由 genSceneFile 消费，不是节点属性
     delete out.children
@@ -372,17 +398,19 @@ function normalizeLayerProps(
     }
     out.data = starPath(size, sides)
   }
-  if (type === 'image' && typeof out.src === 'string' && out.src.startsWith('asset:')) {
+  if ((type === 'image' || type === 'video') && typeof out.src === 'string' && out.src.startsWith('asset:')) {
     const assetId = out.src.slice('asset:'.length)
     const asset = assets[assetId]
     if (!asset) {
-      warnings.push(`image 图层引用了未登记的资产 ${assetId}（用 anim_asset_import 登记后再引用）`)
+      warnings.push(`${type} 图层引用了未登记的资产 ${assetId}（用 anim_asset_import 登记后再引用）`)
     } else if (/^https?:\/\//.test(asset.src)) {
       out.src = asset.src // http URL 资产原样透传，浏览器直接加载
     } else {
       const ext = extname(asset.src)
       out.src = `/assets/${safeName(assetId)}${ext}`
-      warnings.push(`image 图层引用资产 ${assetId}，已解析为 /assets/${safeName(assetId)}${ext}`)
+      if (type === 'image') {
+        warnings.push(`image 图层引用资产 ${assetId}，已解析为 /assets/${safeName(assetId)}${ext}`)
+      }
     }
   }
   return out
@@ -390,6 +418,50 @@ function normalizeLayerProps(
 
 function num(v: number): string {
   return String(Number(v.toFixed(6)))
+}
+
+/**
+ * 渐变描述 → MC Gradient 的几何参数片段（0.5.0 §4.2）。
+ * linear 用 from/to（本地坐标，中心原点契约）或 angle；radial 用
+ * fromRadius/toRadius。缺省项直接省略，交给 MC 的默认值。
+ */
+function gradientShapeArgs(g: {
+  from?: unknown
+  to?: unknown
+  angle?: unknown
+  fromRadius?: unknown
+  toRadius?: unknown
+}): string {
+  const pair = (v: unknown): string | undefined => {
+    if (Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) {
+      return `[${num(v[0] as number)}, ${num(v[1] as number)}]`
+    }
+    return undefined
+  }
+  const parts: string[] = []
+  const from = pair(g.from)
+  if (from) parts.push(`from: ${from}`)
+  const to = pair(g.to)
+  if (to) parts.push(`to: ${to}`)
+  if (typeof g.angle === 'number' && Number.isFinite(g.angle)) parts.push(`angle: ${num(g.angle)}`)
+  if (typeof g.fromRadius === 'number' && Number.isFinite(g.fromRadius)) parts.push(`fromRadius: ${num(g.fromRadius)}`)
+  if (typeof g.toRadius === 'number' && Number.isFinite(g.toRadius)) parts.push(`toRadius: ${num(g.toRadius)}`)
+  return parts.length > 0 ? `${parts.join(', ')}, ` : ''
+}
+
+/** 渐变 stops → MC GradientStop 数组字面量（形态已由 normalizeLayerProps 保证）。 */
+function gradientStopsArg(stops: unknown): string {
+  const items: string[] = []
+  if (Array.isArray(stops)) {
+    for (const st of stops) {
+      if (Array.isArray(st) && st.length === 2 && typeof st[0] === 'number' && typeof st[1] === 'string') {
+        items.push(`{ offset: ${num(st[0])}, color: ${JSON.stringify(st[1])} }`)
+      } else if (Array.isArray(st) && st.length === 2 && typeof st[0] === 'number' && typeof st[1] === 'string') {
+        continue
+      }
+    }
+  }
+  return `[${items.join(', ')}]`
 }
 
 /** 毫秒 → 秒（MC 的时间单位是秒）。 */
@@ -486,6 +558,24 @@ function easeExpr(
     case 'back':
       imports.core.add('easeOutBack')
       return 'easeOutBack'
+    case 'bounceIn':
+      imports.core.add('easeInBounce')
+      return 'easeInBounce'
+    case 'bounceInOut':
+      imports.core.add('easeInOutBounce')
+      return 'easeInOutBounce'
+    case 'elasticIn':
+      imports.core.add('easeInElastic')
+      return 'easeInElastic'
+    case 'elasticInOut':
+      imports.core.add('easeInOutElastic')
+      return 'easeInOutElastic'
+    case 'backIn':
+      imports.core.add('easeInBack')
+      return 'easeInBack'
+    case 'backInOut':
+      imports.core.add('easeInOutBack')
+      return 'easeInOutBack'
   }
 }
 
@@ -577,13 +667,35 @@ function genSceneFile(
     const allowed: Record<string, string> = { ...STATIC_PROPS[layer.type] }
     for (const key of COMMON_PROPS) allowed[key] = key
     const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings, assets)
+    // reveal 打字机（0.5.0 §4.3）：text 图层带 props.reveal 轨道时，静态 text
+    // 不直接上节点——改由 revealSignal 逐字裁剪（见下方与 emitTracks 的特判）
+    const revealTrack = layer.type === 'text' ? layer.tracks.find(t => t.target === 'props.reveal') : undefined
+    const revealSignal = revealTrack ? `${name}_reveal` : undefined
+    if (revealSignal) {
+      const first = [...revealTrack!.keys].sort((a, b) => a.atMs - b.atMs)[0]
+      const startVal = typeof first?.value === 'number' && Number.isFinite(first.value) ? first.value : 0
+      setup.push(`const ${revealSignal} = createSignal(${num(startVal)});`)
+      coreImports.add('createSignal')
+      const fullText = typeof layer.props.text === 'string' ? layer.props.text : ''
+      const fullLit = JSON.stringify(fullText)
+      attrs.push(`text={() => ${fullLit}.slice(0, Math.round(${revealSignal}() * ${fullText.length}))}`)
+    }
     for (const [rawProp, value] of Object.entries(normalized)) {
+      if (revealSignal && rawProp === 'text') continue // 文本已被 reveal signal 接管
       // 别名归一已在 normalizeLayerProps 完成（先于兜底判断）；走到这里的
       // 别名键都是「规范名已给出」或「本类型不支持规范名」的冗余形态，
       // 白名单查不到自然落到下方「不支持」告警——规范名优先，不静默覆盖
       const mapped = allowed[rawProp]
       if (!mapped) {
         warnings.push(`图层 ${layer.id} 的属性 ${rawProp} 不被 ${layer.type} 支持，已忽略`)
+        continue
+      }
+      // 渐变 fill（0.5.0 §4.2）：描述对象 → new Gradient({...})，颜色/尺寸等
+      // 其余形态照旧走字面量。无效形态在 normalizeLayerProps 阶段已告警摘除
+      if (rawProp === 'fill' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const g = value as { type?: unknown; from?: unknown; to?: unknown; angle?: unknown; fromRadius?: unknown; toRadius?: unknown; stops?: unknown }
+        attrs.push(`${mapped}={new Gradient({ type: ${JSON.stringify(g.type ?? 'linear')}, ${gradientShapeArgs(g)}stops: ${gradientStopsArg(g.stops)} })}`)
+        components.add('Gradient')
         continue
       }
       attrs.push(`${mapped}={${litProp(value)}}`)
@@ -593,6 +705,11 @@ function genSceneFile(
     // code 的默认色在自带的深色底上同样不可见，真机 M2 验收抓到后一并纳入）
     if ((layer.type === 'text' || layer.type === 'math' || layer.type === 'code') && normalized.fill === undefined) {
       attrs.push(`fill={${JSON.stringify(defaultTextFill)}}`)
+    }
+    // video 图层（0.5.0 §4.4）：headless 导出下不 play 则 time 永远停在起点
+    //（整段画面都是首帧）——固定注入 play，起点与速率由 time/playbackRate 表达
+    if (layer.type === 'video') {
+      attrs.push('play={true}')
     }
     // code 图层写了 language：挂上对应高亮器（带语言的 code 图层才触发 code-highlight 模块生成）
     if (layer.type === 'code') {
@@ -619,6 +736,22 @@ function genSceneFile(
     const animatable = ANIMATABLE_BY_TYPE[layer.type]
     for (const track of layer.tracks) {
       let prop = track.target.replace(/^props\./, '')
+      // reveal 打字机特判（0.5.0 §4.3）：0~1 进度轨道 → 补间 reveal signal，
+      // 文本由节点上的裁剪函数按 signal 值逐字显现（emitNode 侧接线）
+      if (prop === 'reveal' && layer.type === 'text') {
+        const sig = `${name}_reveal`
+        for (const t of tweensOf(track)) {
+          const ease = easeExpr(t.ease, imports)
+          const easeArg = ease ? `, ${ease}` : ''
+          const to = typeof t.to === 'number' && Number.isFinite(t.to) ? t.to : 1
+          if (t.durationMs <= 0) {
+            tasks.push(`delay(${sec(t.startMs)}, () => ${sig}(${num(to)})),`)
+          } else {
+            tasks.push(`delay(${sec(t.startMs)}, ${sig}(${num(to)}, ${sec(t.durationMs)}${easeArg})),`)
+          }
+        }
+        continue
+      }
       // 轨道目标走同一张别名表（@dsh-anim/spec）：存量 spec 里已落库的
       // props.strokeWidth 轨道由此一并复活（0.3.x O21 的延续，表驱动化）
       const alias = PROP_ALIASES[prop]
@@ -1038,18 +1171,22 @@ export interface SubtitleCue {
  * 的缺陷即来源于此：在切片后的 spec 上现场换算全局时间，第二幕的字幕整条
  * 丢失且不触发重渲。
  *
- * 规则：cue 缺省时长按中文语速估（≈4 字/秒，下限 1200ms）；跨幕 cue 每幕各
- * 出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；超 80 字
- * 软警告（渲染端自动折行，不再截断——过长字幕画面偏挤，建议拆 cue）；起点
- * 越出全片时长给软警告。原 spec 不被修改。
+ * 规则：cue 缺省时长按中文语速估（≈4 字/秒，下限 1200ms）；配音渲染传
+ * options.displayMs（与 cues 对齐的实测音频时长，0.5.0 §5）时显示时长取
+ * 「估算与实测的较大者」——宁可字比声先消失，不让「声还在字没了」；跨幕 cue
+ * 每幕各出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；
+ * 超 80 字软警告（渲染端自动折行，不再截断——过长字幕画面偏挤，建议拆 cue）；
+ * 起点越出全片时长给软警告。原 spec 不被修改。
  */
-export function expandNarration(spec: AnimationSpec): { spec: AnimationSpec; warnings: string[] } {
+export function expandNarration(spec: AnimationSpec, options: { displayMs?: number[] } = {}): { spec: AnimationSpec; warnings: string[] } {
   const warnings: string[] = []
   const cues = spec.narration?.cues ?? []
   if (cues.length === 0) return { spec, warnings }
   const totalMs = specDurationMs(spec.scenes)
   const expanded = cues.map((cue, i) => {
-    const durationMs = cue.durationMs ?? Math.max(1200, Math.round((cue.text.length / 4) * 1000))
+    const spokenMs = options.displayMs?.[i] ?? 0
+    const estimated = cue.durationMs ?? Math.max(1200, Math.round((cue.text.length / 4) * 1000))
+    const durationMs = Math.max(estimated, spokenMs)
     if (cue.atMs >= totalMs) {
       warnings.push(`旁白 cue ${i}（${cue.atMs}ms）起于全片时长（${totalMs}ms）之外，不会出现`)
     }
@@ -1109,7 +1246,7 @@ export function generateFontsCss(assets: Record<string, Asset>): GeneratedFile |
 /** 把一份 spec 编译成可直接交给 Motion Canvas 构建的项目文件。 */
 export function generateProject(
   spec: AnimationSpec,
-  options: { resolutionScale?: number } = {},
+  options: { resolutionScale?: number; displayMs?: number[] } = {},
 ): GenerateResult {
   const warnings: string[] = []
   const background = spec.meta.background ?? spec.theme.colors.background ?? '#000000'
@@ -1119,7 +1256,7 @@ export function generateProject(
 
   // 旁白 cues → 各幕 subtitles（§4.3）：字幕变成场景数据的一部分，
   // 场景级增量渲染的切片与指纹因此天然正确（见 expandNarration 注释）
-  const expanded = expandNarration(spec)
+  const expanded = expandNarration(spec, { displayMs: options.displayMs })
   warnings.push(...expanded.warnings)
   spec = expanded.spec
 

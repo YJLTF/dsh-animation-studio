@@ -7,8 +7,19 @@ import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 
 import { fetchRenderStatus, isSettled, readArgs, readReceipt, str, strings, type Receipt, type RenderStatus, type ToolViewProps } from '../protocol.ts'
-import { Card, Fallback, IncrementalNotes, Notes, ProgressBar, RenderWarnings, VideoPanel } from './primitives.tsx'
+import { Card, ContactSheet, Fallback, IncrementalNotes, Notes, ProgressBar, RenderWarnings, VideoPanel } from './primitives.tsx'
 import { errorText, muted, row } from './styles.ts'
+
+/** 旁白配音对账清单（0.5.0 §5.3）→ 中性信息行。 */
+function speechNoteLines(notes: Array<{ index?: unknown; text?: unknown; atMs?: unknown; audioMs?: unknown; overflowMs?: unknown }>): string[] {
+  return notes.map(n => {
+    const at = typeof n.atMs === 'number' ? n.atMs : 0
+    const audio = typeof n.audioMs === 'number' ? n.audioMs : 0
+    const over = typeof n.overflowMs === 'number' ? n.overflowMs : 0
+    const text = typeof n.text === 'string' && n.text.length > 12 ? `${n.text.slice(0, 12)}…` : n.text ?? ''
+    return `#${(typeof n.index === 'number' ? n.index : 0) + 1} 「${text}」 @${at}ms 语音 ${audio}ms${over > 300 ? `（超出 ${over}ms，建议挪时间轴）` : ''}`
+  })
+}
 
 /** anim_render 的后台票据：轮询 /dsh-anim/api/state 直到出片。 */
 function BackgroundTicket(props: { receipt: Receipt; openFile?: ToolViewProps['openFile'] }): ReactNode {
@@ -65,10 +76,14 @@ function BackgroundTicket(props: { receipt: Receipt; openFile?: ToolViewProps['o
   const title = `渲染${specId ? `：${specId}` : ''}`
   if (status !== null && status.status === 'completed') {
     const statusReceipt = status as unknown as Receipt
+    const contactSheet = str(statusReceipt, 'contactSheet')
+    const notes = statusReceipt.speechNotes as Array<{ index?: unknown; text?: unknown; atMs?: unknown; audioMs?: unknown; overflowMs?: unknown }> | undefined
     return (
       <Card title={`渲染完成${specId ? `：${specId}` : ''}`}>
         <VideoPanel path={status.outputPath || outputPath} meta={statusReceipt} openFile={props.openFile} />
+        {contactSheet !== undefined && <ContactSheet path={contactSheet} />}
         <IncrementalNotes receipt={statusReceipt} />
+        {notes !== undefined && notes.length > 0 && <Notes title="旁白配音：" items={speechNoteLines(notes)} />}
         <RenderWarnings items={strings(statusReceipt, 'warnings')} />
       </Card>
     )
@@ -123,11 +138,15 @@ export function RenderCard(props: ToolViewProps): ReactNode {
   }
   const path = str(receipt, 'outputPath')
   if (!path) return <Fallback {...props} running="渲染" />
+  const contactSheet = str(receipt, 'contactSheet')
+  const notes = receipt.speechNotes as Array<{ index?: unknown; text?: unknown; atMs?: unknown; audioMs?: unknown; overflowMs?: unknown }> | undefined
   return (
     <Card title={`渲染完成${str(receipt, 'specId') ? `：${str(receipt, 'specId')}` : ''}`}>
       <VideoPanel path={path} meta={receipt} openFile={props.openFile} />
+      {contactSheet !== undefined && <ContactSheet path={contactSheet} />}
       <Notes title="大纲对账：" items={strings(receipt, 'outlineNotes')} />
       <IncrementalNotes receipt={receipt} />
+      {notes !== undefined && notes.length > 0 && <Notes title="旁白配音：" items={speechNoteLines(notes)} />}
       <RenderWarnings items={strings(receipt, 'warnings')} />
     </Card>
   )

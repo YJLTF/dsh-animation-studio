@@ -35,6 +35,33 @@ export type EaseSpec =
   | { kind: 'elastic' }
   /** 回勾起手（easeOutBack）：先反向一点再冲到位，卡片/星标弹出常用。 */
   | { kind: 'back' }
+  /** bounce 的入场形（easeInBounce）与双边形（easeInOutBounce）。 */
+  | { kind: 'bounceIn' }
+  | { kind: 'bounceInOut' }
+  /** elastic 的入场形（easeInElastic）与双边形（easeInOutElastic）。 */
+  | { kind: 'elasticIn' }
+  | { kind: 'elasticInOut' }
+  /** back 的入场形（easeInBack）与双边形（easeInOutBack）。 */
+  | { kind: 'backIn' }
+  | { kind: 'backInOut' }
+
+/**
+ * 渐变填充描述（0.5.0 规划 §4.2）：fill 支持的另一种形态。
+ * `from`/`to` 是图层本地坐标（与 x/y 同一契约，中心原点）；`stops` 的
+ * offset 是 0~1。linear 用 from/to 或 angle，radial 用 fromRadius/toRadius。
+ * 用 type alias 而非 interface：JSON 索引签名（LayerProps）的可赋值性依赖
+ * 对象类型字面量的隐式索引签名，interface 拿不到。
+ */
+export type GradientSpec = {
+  type: 'linear' | 'radial' | 'conic'
+  from?: [number, number]
+  to?: [number, number]
+  /** 线性渐变的方向角（度）。给出 angle 时忽略 to。 */
+  angle?: number
+  fromRadius?: number
+  toRadius?: number
+  stops: Array<{ offset: number; color: string }>
+}
 
 /* ---------------------------------------------------------------- 关键帧 */
 
@@ -78,6 +105,7 @@ export const LAYER_TYPES = [
   'code', 'math',
   'group',
   'audio',
+  'video',
 ] as const
 
 export type LayerType = (typeof LAYER_TYPES)[number]
@@ -109,15 +137,25 @@ export interface LayerProps {
   size?: number
   radius?: number
   // 样式
-  fill?: string
+  /** 纯色填充，或渐变描述对象（GradientSpec，渲染端生成 MC Gradient）。 */
+  fill?: string | GradientSpec
   stroke?: string
   lineWidth?: number
+  /** 描边虚线样式（像素间隔数组），如 [8, 6] = 画 8px 空 6px。 */
+  lineDash?: number[]
   // 文本
   text?: string
   fontSize?: number
   fontFamily?: string
   fontWeight?: number
   lineHeight?: number
+  /** 文本最大宽度（像素）：超宽自动折行（MC Layout 的 maxWidth 信号）。 */
+  maxWidth?: number
+  /** 折行模式：'pre' 按空白与 \n 折行（长段落文本推荐）；缺省不折行。 */
+  textWrap?: 'pre'
+  /** 逐字打字机进度 0~1（text 图层轨道专用目标：props.reveal，渲染端
+   * 生成按进度裁剪文本的 signal，实现逐字浮现）。静态 props 里不需要写。 */
+  reveal?: number
   // 图片
   src?: string
   // 线条 / 箭头（line / arrow）
@@ -161,6 +199,11 @@ export interface LayerProps {
   stop?: 'sceneEnd' | 'specEnd'
   /** 相对本幕开头的起始偏移（毫秒），默认 0（随幕起点开始）。 */
   atMs?: number
+  // 视频（video 图层；实拍片段嵌入动画，src 引用 video 资产）
+  /** 视频起点偏移（秒）：从源视频的该时刻开始播。 */
+  time?: number
+  /** 播放速率倍数，默认 1。 */
+  playbackRate?: number
   [key: string]: JsonValue | undefined
 }
 
@@ -224,7 +267,7 @@ export interface ThemeToken {
 }
 
 export interface Asset {
-  kind: 'image' | 'audio' | 'font' | 'svg'
+  kind: 'image' | 'audio' | 'font' | 'svg' | 'video'
   /**
    * 资产文件的绝对/相对路径，或 http(s) URL。
    * 图层 props 里用 `asset:<AssetId>` 引用（如 image.src = "asset:ball"），
@@ -257,11 +300,13 @@ export interface AnimationSpec {
    * `durationMs` 缺省按中文语速估算（≈4 字/秒，下限 1200ms）。
    * 字幕字号按画布高度约 4% 自适应（与正文字号解耦），超宽自动折行、底条
    * 随行数增高；底部字幕带是保留区，正文图层的 y 应避开（渲染时会提示重叠）。
-   * TTS 语音合成推迟到 0.5——届时 cues 从「显示」升级为「发声 + 显示」，
-   * IR 不再改。
+   * 配音（0.5.0 §5）：配置 `tts` 且宿主可用时，cue 从「显示」升级为
+   * 「发声 + 显示」——合成产物按 atMs 混入成片，字幕显示时长跟随实测音频。
    */
   narration?: {
     cues: Array<{ atMs: number; text: string; durationMs?: number; voice?: string }>
+    /** 配音默认值：cue.voice 未写时用 tts.voice；rate/volume 同理可被覆盖。 */
+    tts?: { voice?: string; rate?: string; volume?: number }
   }
   /** MVP 预留：字幕轨道。 */
   subtitles?: Array<{ sceneId: SceneId; atMs: number; text: string }>
