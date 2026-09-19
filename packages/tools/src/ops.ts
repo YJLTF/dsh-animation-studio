@@ -579,6 +579,42 @@ export interface PreviewBackgroundTicket {
  * jobId，帧清单以 preview-finished 事件与 job_output 到达，面板卡片轮询
  * /api/state 重建缩略图。宿主没有 jobs 服务或发布失败时维持同步回退。
  */
+/* --------------------------------------------------------- 重复发起护栏 */
+
+/**
+ * 同参重复发起护栏（真机 turn 17 教训）：模型把「等待后台任务」误作反复发
+ * 同一预览/渲染（wait_agent 是等 Agent Team 队友的工具，对后台任务会立即
+ * 空转返回 no-progress，形成 preview→wait_agent→preview 死循环）。同一签名
+ * 短期内第 3 次起，在票据/回执里给出纠正指引——任务照常执行不拒绝，只把
+ * 正确姿势递到模型眼前。
+ */
+const repeatGuardByDeps = new WeakMap<object, Map<string, { count: number; firstAt: number }>>()
+const REPEAT_GUARD_WINDOW_MS = 10 * 60_000
+
+/** 护栏状态按 deps（= 插件实例）隔离：冒烟多夹具与多插件互不串计数。 */
+export function repeatGuardNote(owner: object, scope: string, key: string): string | undefined {
+  const now = Date.now()
+  let repeatGuard = repeatGuardByDeps.get(owner)
+  if (!repeatGuard) {
+    repeatGuard = new Map()
+    repeatGuardByDeps.set(owner, repeatGuard)
+  }
+  if (repeatGuard.size > 500) {
+    for (const [k, v] of repeatGuard) {
+      if (now - v.firstAt > REPEAT_GUARD_WINDOW_MS) repeatGuard.delete(k)
+    }
+  }
+  const sig = `${scope}|${key}`
+  const entry = repeatGuard.get(sig)
+  if (!entry || now - entry.firstAt > REPEAT_GUARD_WINDOW_MS) {
+    repeatGuard.set(sig, { count: 1, firstAt: now })
+    return undefined
+  }
+  entry.count += 1
+  if (entry.count < 3) return undefined
+  return `同一参数的${scope}已连续发起 ${entry.count} 次：后台任务不会因重复发起而变快或提前完成，请改用 job_output 查询既有任务的结果（jobId 见此前回执）；wait_agent 只用于等待团队成员，对本工具的后台任务会立即空转返回。`
+}
+
 export async function opPreview(
   deps: AnimDeps,
   args: PreviewArgs,
@@ -589,6 +625,8 @@ export async function opPreview(
 ): Promise<PreviewResultView | PreviewBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
+  // 重复发起护栏（真机 turn 17 教训）：同参反复发起时在回执里递上正确姿势
+  const guardNote = repeatGuardNote(deps, '预览', `${args.specId}|atMs=${JSON.stringify(args.atMs ?? [])}|scale=${args.scale ?? ''}`)
   // 单幕直放快路径（0.5.0 §3.2）：零渲染开销，无「后台」可言，命中即同步返回。
   // 配音 spec 先按缓存口径还原 displayMs（渲染后命中缓存近零开销），
   // 保证查段指纹与 anim_render 完全同口径。
@@ -598,28 +636,30 @@ export async function opPreview(
     if (clip) {
       emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
       emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
-      return { specId: args.specId, renderer: renderer.name, frames: [], clip }
+      return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(guardNote ? { warnings: [guardNote] } : {}) }
     }
   }
   const clip = previewClipFastPath(spec, renderer, args)
   if (clip) {
     emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
     emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
-    return { specId: args.specId, renderer: renderer.name, frames: [], clip }
+    return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(guardNote ? { warnings: [guardNote] } : {}) }
   }
   if (jobs) {
     // 与 opRender 同一降级链：先带 owner，失败退无主，再失败退同步
     let lastError: unknown
     for (const ownerCandidate of [owner, undefined]) {
       try {
-        return await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
+        const ticket = await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
+        return guardNote ? { ...ticket, next: `${ticket.next} ⚠️${guardNote}` } : ticket
       } catch (err) {
         lastError = err
       }
     }
     console.warn(`[dsh-anim-studio] 后台预览发布失败（owner 与无主两档均被拒），退回同步抽帧：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
-  return await previewSync(args, { spec, renderer }, signal, emit)
+  const view = await previewSync(args, { spec, renderer }, signal, emit)
+  return guardNote ? { ...view, warnings: [...(view.warnings ?? []), guardNote] } : view
 }
 
 async function startBackgroundPreview(
@@ -686,7 +726,7 @@ async function startBackgroundPreview(
     kind: 'background',
     jobId: id,
     specId,
-    next: '预览已在后台进行。用 job_output 收集帧清单；需要终止时用 job_kill。',
+    next: `预览已在后台进行（jobId: ${id}）。用 job_output 收集帧清单；需要终止时用 job_kill。不要用 wait_agent 等待本任务，也不要重复发起同一预览。`,
   }
 }
 
@@ -881,6 +921,12 @@ export async function opRender(
       ?? (args.scenes?.length ? `${deps.outputDir}/${args.specId}-solo-${args.scenes.join('-')}.mp4` : `${deps.outputDir}/${args.specId}.mp4`),
   )
   if (signal.aborted) throw new AnimOpError('渲染已取消')
+  // 重复发起护栏（真机 turn 17 教训）：同参反复发起时在票据/回执里递上正确姿势
+  const guardNote = repeatGuardNote(
+    deps,
+    '渲染',
+    `${args.specId}|scenes=${JSON.stringify(args.scenes ?? [])}|out=${args.outputPath ?? ''}|cache=${args.cache ?? ''}`,
+  )
   // 渲染前对账（0.4.0 规划 N3）：大纲与实际场景对不上时，此刻说比渲完说便宜
   const outline = deps.store.record(args.specId).outline
   const outlineNotes = outline !== undefined && outline.length > 0 ? reconcileOutline(outline, spec.scenes) : []
@@ -904,14 +950,16 @@ export async function opRender(
     let lastError: unknown
     for (const ownerCandidate of [owner, undefined]) {
       try {
-        return await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes, speech }, emit, jobs, ownerCandidate)
+        const ticket = await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes, speech }, emit, jobs, ownerCandidate)
+        return guardNote ? { ...ticket, next: `${ticket.next} ⚠️${guardNote}` } : ticket
       } catch (err) {
         lastError = err
       }
     }
     console.warn(`[dsh-anim-studio] 后台渲染发布失败（owner 与无主两档均被拒），退回同步渲染：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
-  return await renderSync(args, { spec, renderer, outputPath, outlineNotes, speech }, signal, emit)
+  const view = await renderSync(args, { spec, renderer, outputPath, outlineNotes, speech }, signal, emit)
+  return guardNote ? { ...view, warnings: [...(view.warnings ?? []), guardNote] } : view
 }
 
 /**
@@ -1050,7 +1098,7 @@ async function startBackgroundRender(
     jobId: id,
     specId,
     outputPath,
-    next: '渲染已在后台进行。用 job_output 收集进度与结果；需要终止时用 job_kill。',
+    next: `渲染已在后台进行（jobId: ${id}）。用 job_output 查询进度与收集结果；需要终止时用 job_kill。不要用 wait_agent 等待本任务，也不要重复发起同一渲染。`,
     ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
   }
 }

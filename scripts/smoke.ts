@@ -1061,6 +1061,31 @@ await checkA('sliceSpeechForScenes: 语音轨按选中幕过滤并平移到切�
   assert.equal(cross.tracks[0]?.durationMs, 2500, '尾巴裁到窗口右缘（4000 − 1500）')
 })
 
+await checkA('opPreview: 同参重复发起护栏——第 3 次起票据给纠正指引（真机 turn 17 回归）', async () => {
+  const previewImpl: AnimRenderer['preview'] = async () => ({
+    frames: [{ atMs: 700, path: 'f.png', width: 1, height: 1 }],
+    renderer: 'fake',
+  })
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT, previewImpl)
+  deps.store.create('guard-spec', demoSpec())
+  const jobs: AnimJobsService = {
+    start(spec) {
+      spec.run()
+      return 'anim-preview-guard'
+    },
+  }
+  const call = () => opPreview(deps, { specId: 'guard-spec', atMs: [700] }, new AbortController().signal, emit, jobs)
+  const t1 = (await call()) as { kind: string; next: string }
+  const t2 = (await call()) as { kind: string; next: string }
+  const t3 = (await call()) as { kind: string; next: string }
+  assert.equal(t1.kind, 'background')
+  assert.ok(!t1.next.includes('连续发起') && !t2.next.includes('连续发起'), '前两次不打扰')
+  assert.match(t3.next, /连续发起 3 次/, '第三次起给出纠正指引')
+  assert.match(t3.next, /job_output/, '指引指向正确姿势')
+  const t4 = (await opPreview(deps, { specId: 'guard-spec', atMs: [999] }, new AbortController().signal, emit, jobs)) as { next: string }
+  assert.ok(!t4.next.includes('连续发起'), '不同参数独立计数')
+})
+
 await checkA('opRender: 进度 done 超过预估 total 时 percent 钳在 100（真机实测 92/90 → 102%）', async () => {
   const { deps, emitted, emit } = renderFixture(async request => {
     // 尾帧缓冲：实际帧数超出预估 total 是常态而非异常
