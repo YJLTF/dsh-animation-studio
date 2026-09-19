@@ -145,20 +145,33 @@ export class MotionCanvasRenderer implements AnimRenderer {
     const truncated = cutMs > 0 && cutMs < totalMs ? truncateSpecAtMs(request.spec, cutMs) : request.spec
     // 旁白 cues → 各幕 subtitles（§4.3）：字幕随场景数据走，截短后的本地时段才正确
     const spec = expandNarration(truncated).spec
-    const result = await this.#renderFrames(spec, signal, resolutionScale)
-    const frames = at
-      .map(atMs => {
-        const index = Math.min(
-          result.frameCount - 1,
+    // 抽帧与取样拷贝同闸：共享帧目录在下一次管线进闸时会被 resetDir 清空，
+    // 抽样帧必须趁闸还握着拷进稳定的 preview/ 目录，卡片稍后按路径取图才有着落
+    const { result, frames } = await this.#serialized(async () => {
+      const r = await this.#renderFramesInternal(spec, signal, resolutionScale)
+      const previewDir = join(this.#specWorkDir(request.spec), 'preview')
+      mkdirSync(previewDir, { recursive: true })
+      const picked = at.map(atMs => ({
+        atMs,
+        index: Math.min(
+          r.frameCount - 1,
           Math.max(0, Math.round((atMs / 1000) * request.spec.meta.fps)),
-        )
-        return {
-          atMs,
-          path: join(result.frameDir, `${String(index).padStart(6, '0')}.png`),
+        ),
+      }))
+      for (const { index } of picked) {
+        const src = join(r.frameDir, `${String(index).padStart(6, '0')}.png`)
+        if (existsSync(src)) copyFileSync(src, join(previewDir, `frame-${String(index).padStart(6, '0')}.png`))
+      }
+      return {
+        result: r,
+        frames: picked.map(f => ({
+          atMs: f.atMs,
+          path: join(previewDir, `frame-${String(f.index).padStart(6, '0')}.png`),
           width: Math.round(request.spec.meta.size.width * resolutionScale),
           height: Math.round(request.spec.meta.size.height * resolutionScale),
-        }
-      })
+        })),
+      }
+    })
     return {
       frames,
       renderer: this.name,
@@ -226,8 +239,14 @@ export class MotionCanvasRenderer implements AnimRenderer {
       }
     }
 
-    const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
-    await encodeFrames(result.frameDir, result.expected, fps, outputPath)
+    // 全量路径：抽帧与编码必须同闸（真机 anim-render-2 的教训）——编码若在
+    // 闸外，排队中的下一个管线一进闸就 resetDir 清帧目录，ffmpeg 起来时只剩
+    // 空目录。内部走 #renderFramesInternal，避免闸嵌套死锁。
+    const result = await this.#serialized(async () => {
+      const r = await this.#renderFramesInternal(spec, signal, resolutionScale, request.onProgress)
+      await encodeFrames(r.frameDir, r.expected, fps, outputPath)
+      return r
+    })
     const audio = await this.#finishAudio(spec, outputPath, expected, fps, speech)
     const { path: contactSheet, warnings: sheetWarnings } = await this.#buildContactSheet(outputPath, durationMs)
     const warnings = [fallbackNote, ...result.warnings, ...audio.warnings, ...sheetWarnings].filter((w): w is string => w !== undefined)
@@ -308,15 +327,6 @@ export class MotionCanvasRenderer implements AnimRenderer {
   }
 
   /* ---------------------------------------------------------------- 内部 */
-
-  async #renderFrames(
-    spec: AnimationSpec,
-    signal: AbortSignal,
-    resolutionScale: number,
-    onProgress?: (done: number, total: number) => void,
-  ): Promise<{ frameDir: string; frameCount: number; expected: number; warnings: string[] }> {
-    return this.#serialized(() => this.#renderFramesInternal(spec, signal, resolutionScale, onProgress))
-  }
 
   async #renderFramesInternal(
     spec: AnimationSpec,
@@ -474,6 +484,18 @@ export function dedupeWarnings(warnings: string[]): string[] {
 }
 
 /**
+ * ffmpeg 的 image2 探测不到起始帧时报「Could find no file or sequence」，
+ * 与真因（抽帧阶段没产出，或产物被清）相距十万八千里——起编码前先验首帧，
+ * 把这类失败翻译成人话。
+ */
+function assertFirstFrame(frameDir: string, index: number): void {
+  const first = join(frameDir, `${String(index).padStart(6, '0')}.png`)
+  if (!existsSync(first)) {
+    throw new Error(`帧目录缺少首帧 ${first}：抽帧阶段没有产出（浏览器崩溃或页面报错），或帧被并发管线清空`)
+  }
+}
+
+/**
  * 把帧序列合成 MP4。
  *
  * - 有 libx264 用 CRF 质量；没有则退到 libopenh264（部分发行版的 ffmpeg）；
@@ -485,6 +507,7 @@ export async function encodeFrames(
   fps: number,
   outputPath: string,
 ): Promise<void> {
+  assertFirstFrame(frameDir, 0)
   const pattern = join(frameDir, '%06d.png')
   mkdirSync(dirname(resolve(outputPath)), { recursive: true })
   const codec = await pickVideoCodec()
@@ -523,6 +546,7 @@ export async function encodeFrameRange(
   outputPath: string,
   codec?: string,
 ): Promise<void> {
+  assertFirstFrame(frameDir, startFrame)
   const pattern = join(frameDir, '%06d.png')
   mkdirSync(dirname(resolve(outputPath)), { recursive: true })
   const c = codec ?? (await pickVideoCodec())

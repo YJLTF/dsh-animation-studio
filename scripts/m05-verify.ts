@@ -10,7 +10,7 @@
  * video 图层的 headless 帧同步是 0.5.0 M2 的真机 gate：本脚本 A 步即判定。
  */
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -276,5 +276,56 @@ const ttsServiceBad = { ...badTts }
 const buildE2 = await synthesizeNarration(specE, ttsServiceBad, join(OUT, 'work', 'm05-accept', 'tts-bad'))
 await timed('E2. full render with failed tts', specE, outE, buildE2.tracks.length > 0 ? { tracks: buildE2.tracks, displayMs: buildE2.displayMs } : undefined)
 console.log('[v05] probe E2（无声也合法）:', await probe(outE))
+
+/* ------------------------------------------ F. 并发串行闸（真机 anim-render-2 教训） */
+
+console.log('[v05] ===== F. 并发串行闸（渲染/预览排队不互踩） =====')
+// 假 runtime 复刻真管线的危险语义：每次进闸先 resetDir 再产帧。历史 bug 就出
+// 在闸外窗口——上一个任务抽完帧放闸，下一个任务进闸清帧，而它的 ffmpeg 还没
+// 跑。修复后「抽帧+编码」同闸、预览抽样帧拷进稳定目录，断言：
+// ① 并发的渲染与预览都成功（旧代码下渲染会被并发的 resetDir 清帧打失败）；
+// ② 第三个任务清掉共享帧目录后，预览帧在自己稳定的路径下依然存在。
+{
+  const flockDir = join(OUT, 'work', 'flock')
+  rmSync(flockDir, { recursive: true, force: true })
+  mkdirSync(flockDir, { recursive: true })
+  const framePng = join(flockDir, 'frame-src.png')
+  await exec('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=steelblue:s=64x36', '-frames:v', '1', framePng])
+  const events: string[] = []
+  let flockCall = 0
+  const fakeRuntime = {
+    async materialize(): Promise<void> {},
+    async probe() {
+      return { renderer: 'fake-serial', ok: true, issues: [] }
+    },
+    async renderProject({ workDir, expectedFrames }: { workDir: string; expectedFrames: number }) {
+      const tag = String.fromCharCode(65 + flockCall++) // 闸内串行，调用序 = 排队序
+      const frameDir = join(workDir, 'output', 'project')
+      events.push(`${tag}:reset`)
+      rmSync(frameDir, { recursive: true, force: true })
+      mkdirSync(frameDir, { recursive: true })
+      for (let i = 0; i < expectedFrames; i++) {
+        copyFileSync(framePng, join(frameDir, `${String(i).padStart(6, '0')}.png`))
+        if (i % 10 === 0) await new Promise(resolve => setTimeout(resolve, 5))
+      }
+      events.push(`${tag}:frames`)
+      return { frameDir, frameCount: expectedFrames }
+    },
+  }
+  const flockRenderer = new MotionCanvasRenderer({ runtime: fakeRuntime, workDir: flockDir })
+  const flockSpec = buildSpec()
+  const [, rb] = await Promise.all([
+    flockRenderer.render({ spec: flockSpec, outputPath: join(flockDir, 'a.mp4'), cache: false }, new AbortController().signal),
+    flockRenderer.preview({ spec: flockSpec, atMs: [300, 600] }, new AbortController().signal),
+  ])
+  if (!existsSync(join(flockDir, 'a.mp4'))) throw new Error('F 步：并发排队下渲染 A 未出片（帧被排队的任务清掉了？）')
+  // 第三个任务进闸清共享帧目录；预览的抽样帧必须因「拷贝进稳定目录」而幸存
+  await flockRenderer.render({ spec: flockSpec, outputPath: join(flockDir, 'c.mp4'), cache: false }, new AbortController().signal)
+  for (const f of rb.frames) {
+    if (!existsSync(f.path)) throw new Error(`F 步：预览帧被后续管线清掉：${f.path}`)
+  }
+  console.log('[v05] 事件顺序:', events.join(' → '))
+  console.log('[v05] ✔ 并发串行：排队不互踩成片，预览帧路径稳定幸存')
+}
 
 console.log('\n[v05] 全部验收通过。产物在', OUT)
