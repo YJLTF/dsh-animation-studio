@@ -870,10 +870,16 @@ export async function opRender(
 ): Promise<RenderResultView | RenderBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
+  // 切片渲染（scenes 选幕）不默认写正片路径：solo 出片与整片是两种产物，
+  // 覆盖正片是真实事故（真机：8s 第一幕 solo 覆盖了 64.5s 成片，用户点开
+  // 只见第一幕）。显式传了 outputPath 的调用者自己决定落点。
   // 相对路径在这里解析成绝对路径：ffmpeg 把相对路径按宿主进程 cwd 落盘，
   // 回执必须给出文件的真实位置——真机教训：回显 "x.mp4" 让模型在会话目录
   // 找不到文件，全盘搜索无果后只能重渲一遍。
-  const outputPath = resolve(args.outputPath ?? `${deps.outputDir}/${args.specId}.mp4`)
+  const outputPath = resolve(
+    args.outputPath
+      ?? (args.scenes?.length ? `${deps.outputDir}/${args.specId}-solo-${args.scenes.join('-')}.mp4` : `${deps.outputDir}/${args.specId}.mp4`),
+  )
   if (signal.aborted) throw new AnimOpError('渲染已取消')
   // 渲染前对账（0.4.0 规划 N3）：大纲与实际场景对不上时，此刻说比渲完说便宜
   const outline = deps.store.record(args.specId).outline
@@ -882,7 +888,14 @@ export async function opRender(
   // 旁白配音（0.5.0 §5）：spec 带 cues 且配置了 TTS 才合成（纯字幕模式是
   // 缺省）。合成立即开跑但只在渲染内部被 await——后台渲染时合成发生在
   // job 内，不占模型回合；缓存命中（同 text/voice/rate）时近乎免费。
-  const speech = buildSpeech(spec, deps)
+  const speechBase = buildSpeech(spec, deps)
+  // 切片渲染的语音对齐：语音 atMs 是全片绝对毫秒，solo/选幕渲的窗口却从 0
+  // 重新计轴——不裁剪的话，窗口内 cue 带着原时轴延迟（错位到切片外），窗口
+  // 外 cue 被 mux 的 -t 截在片尾。按选中幕的原始时段过滤并平移到切片时轴。
+  const sliceScenes = args.scenes?.length ? args.scenes : undefined
+  const speech = sliceScenes
+    ? speechBase.then(build => (build ? sliceSpeechForScenes(build, spec, sliceScenes) : build))
+    : speechBase
 
   if (jobs) {
     // 先带 owner（结果可归属、job_output/job_kill 的访问控制按 owner 走）；
@@ -915,6 +928,33 @@ function buildSpeech(spec: AnimationSpec, deps: AnimDeps): Promise<SpeechBuildRe
     const message = err instanceof Error ? err.message : String(err)
     return { tracks: [], displayMs: [], notes: [], warnings: [`旁白配音整体失败，本片为纯字幕：${message}`] }
   })
+}
+
+/**
+ * 切片渲染的语音对齐：把全片时轴的语音轨过滤并平移到选中幕的切片窗口上。
+ * notes 一并按窗口过滤（对账只报窗内 cue，atMs 保持全片绝对口径）；displayMs
+ * 按 cue 下标与 narration 对齐，保持全量不动。
+ */
+export function sliceSpeechForScenes(build: SpeechBuildResult, spec: AnimationSpec, scenes: number[]): SpeechBuildResult {
+  const picked = [...new Set(scenes)]
+    .filter(i => Number.isInteger(i) && i >= 0 && i < spec.scenes.length)
+    .sort((a, b) => a - b)
+  if (picked.length === 0) return build
+  const leadMs = spec.scenes.slice(0, picked[0]!).reduce((sum, s) => sum + sceneDurationMs(s), 0)
+  const windowMs = picked.reduce((sum, i) => sum + sceneDurationMs(spec.scenes[i]!), 0)
+  const windowEnd = leadMs + windowMs
+  const inWindow = (start: number, duration: number): boolean => start < windowEnd && start + duration > leadMs
+  return {
+    ...build,
+    tracks: build.tracks
+      .filter(t => inWindow(t.startMs, t.durationMs))
+      .map(t => ({
+        ...t,
+        startMs: Math.max(0, t.startMs - leadMs),
+        durationMs: Math.min(t.durationMs, windowEnd - t.startMs),
+      })),
+    notes: build.notes.filter(n => inWindow(n.atMs, n.audioMs)),
+  }
 }
 
 async function startBackgroundRender(

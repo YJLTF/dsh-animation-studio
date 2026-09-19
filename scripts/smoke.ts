@@ -51,7 +51,7 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache } from '../packages/tools/src/ops.ts'
+import { coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
@@ -1014,6 +1014,51 @@ await checkA('opRender: 无 jobs 或 start 抛错都退回同步路径，行为�
     assert.equal((finished.data as { status?: string }).status, 'failed')
     assert.match((finished.data as { error?: string }).error ?? '', /ffmpeg/)
   }
+})
+
+await checkA('opRender: scenes 切片默认落 solo 路径，绝不覆盖正片（真机事故回归）', async () => {
+  const paths: string[] = []
+  const { deps, emit } = renderFixture(async request => {
+    paths.push(request.outputPath)
+    return { ...RENDER_RESULT, outputPath: request.outputPath }
+  })
+  const sliced = await opRender(deps, { specId: 'gd', scenes: [0] }, new AbortController().signal, emit)
+  assert.match(sliced.outputPath, /gd-solo-0\.mp4$/, '切片渲染默认落 solo 路径')
+  assert.ok(!sliced.outputPath.endsWith('gd.mp4'), '不得写正片路径')
+  const explicit = await opRender(deps, { specId: 'gd', scenes: [1], outputPath: '.tmp/xyz.mp4' }, new AbortController().signal, emit)
+  assert.match(explicit.outputPath, /xyz\.mp4$/, '显式 outputPath 由调用者决定')
+  assert.deepEqual(paths, [sliced.outputPath, explicit.outputPath], '渲染器拿到的就是解析后的路径')
+})
+
+await checkA('sliceSpeechForScenes: 语音轨按选中幕过滤并平移到切片时轴', async () => {
+  const spec = demoSpec()
+  spec.scenes.push({ ...spec.scenes[0]!, id: 's2', name: '第二幕' })
+  const build = {
+    tracks: [
+      { source: 'a.mp3', startMs: 500, durationMs: 1000, volume: 1 },
+      { source: 'b.mp3', startMs: 2500, durationMs: 1000, volume: 1 },
+    ],
+    displayMs: [1000, 1000],
+    notes: [
+      { index: 0, text: '一', atMs: 500, audioMs: 1000, overflowMs: 0 },
+      { index: 1, text: '二', atMs: 2500, audioMs: 1000, overflowMs: 0 },
+    ],
+    warnings: [],
+  }
+  const sliced = sliceSpeechForScenes(build, spec, [1])
+  assert.equal(sliced.tracks.length, 1, '窗外 cue（第一幕的 500ms）被滤掉')
+  assert.equal(sliced.tracks[0]?.source, 'b.mp3')
+  assert.equal(sliced.tracks[0]?.startMs, 500, '2500ms − leadMs 2000 → 平移到切片时轴')
+  assert.equal(sliced.notes.length, 1, '对账只报窗内 cue')
+  assert.equal(sliced.displayMs.length, 2, 'displayMs 保持与 narration 全量对齐')
+  // 跨窗 cue：头在窗外、尾伸进窗——起点钳 0、尾裁到窗口右缘
+  const cross = sliceSpeechForScenes(
+    { ...build, tracks: [{ source: 'd.mp3', startMs: 1500, durationMs: 4000, volume: 1 }] },
+    spec,
+    [1],
+  )
+  assert.equal(cross.tracks[0]?.startMs, 0, '1500 − 2000 → 钳到 0')
+  assert.equal(cross.tracks[0]?.durationMs, 2500, '尾巴裁到窗口右缘（4000 − 1500）')
 })
 
 await checkA('opRender: 进度 done 超过预估 total 时 percent 钳在 100（真机实测 92/90 → 102%）', async () => {

@@ -14,7 +14,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, wri
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
-import { MotionCanvasRenderer, createDefaultRuntime } from '../packages/render-mc/src/index.ts'
+import { MotionCanvasRenderer, createDefaultRuntime, muxAudioTracks } from '../packages/render-mc/src/index.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
 import { createTtsService, synthesizeNarration, probeAudioDurationMs, type TtsSynthesizer } from '../packages/tools/src/tts.ts'
 import { validateSpec } from '../packages/spec/src/index.ts'
@@ -326,6 +326,38 @@ console.log('[v05] ===== F. 并发串行闸（渲染/预览排队不互踩） ==
   }
   console.log('[v05] 事件顺序:', events.join(' → '))
   console.log('[v05] ✔ 并发串行：排队不互踩成片，预览帧路径稳定幸存')
+}
+
+/* ------------------------------------------ G. 多轨 mux 逐轨可听（adelay/atrim 时序回归） */
+
+console.log('[v05] ===== G. 多轨 mux 逐轨可听 =====')
+// 真机事故回归：旧链「adelay → atrim」钳住的是含前导静音的开头，第二条
+// 延迟轨起人声全被裁掉（成片只有第一句有配音）。修复后「atrim → asetpts →
+// adelay」，这里用真 ffmpeg 对三条错峰音轨逐窗实测响度——每一条都必须听得见。
+{
+  const gDir = join(OUT, 'work', 'mux-g')
+  rmSync(gDir, { recursive: true, force: true })
+  mkdirSync(gDir, { recursive: true })
+  const gVideo = join(gDir, 'v.mp4')
+  await exec('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=gray:s=64x36:d=11', '-r', '10', '-pix_fmt', 'yuv420p', gVideo])
+  const gCues = [200, 3500, 6800].map((startMs, i) => {
+    const source = join(gDir, `s${i}.wav`)
+    makeWav(source, 2000, 440 + i * 160)
+    return { assetId: `g-speech-${i + 1}`, source, startMs, durationMs: 2000, volume: 1, loop: false }
+  })
+  await muxAudioTracks(gVideo, gCues, 11)
+  for (const cue of gCues) {
+    const win = await exec('ffmpeg', [
+      '-ss', String((cue.startMs + 200) / 1000), '-t', '1.2', '-i', gVideo,
+      '-af', 'volumedetect', '-f', 'null', '-',
+    ])
+    const mean = /mean_volume:\s*(-?[\d.]+) dB/.exec(win.stderr)?.[1]
+    if (mean === undefined || Number(mean) < -50) {
+      throw new Error(`G 步：音轨 ${cue.assetId}（起点 ${cue.startMs}ms）在成片里听不到（mean=${mean ?? '无音频帧'}dB）`)
+    }
+    console.log(`[v05]   ${cue.assetId} @${cue.startMs}ms mean=${mean}dB`)
+  }
+  console.log('[v05] ✔ 三条延迟音轨逐窗实测有声（修复前第二条起全是静音）')
 }
 
 console.log('\n[v05] 全部验收通过。产物在', OUT)

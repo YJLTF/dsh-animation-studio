@@ -607,9 +607,13 @@ export async function muxAudioTracks(
     if (cue.loop) args.push('-stream_loop', '-1')
     args.push('-i', cue.source)
     const f: string[] = []
-    if (cue.startMs > 0) f.push(`adelay=${num(cue.startMs)}:all=1`)
-    if (cue.volume !== 1) f.push(`volume=${num(cue.volume)}`)
+    // 先钳长、归零，再位移：atrim 的时钟是滤镜链当前时间轴——若先 adelay，
+    // atrim 数的是「含前导静音」的开头一段，保留下来的恰好是静音、人声被整
+    // 段裁掉（真机「只有第一句有配音」的根因；0.4 的 audio 图层时代已埋着，
+    // TTS 让延迟轨成为常态才炸出来）。
     f.push(`atrim=0:${num(cue.durationMs / 1000)}`, 'asetpts=PTS-STARTPTS')
+    if (cue.volume !== 1) f.push(`volume=${num(cue.volume)}`)
+    if (cue.startMs > 0) f.push(`adelay=${num(cue.startMs)}:all=1`)
     const label = `[a${i}]`
     chains.push(`[${i + 1}:a]${f.join(',')}${label}`)
     labels.push(label)
