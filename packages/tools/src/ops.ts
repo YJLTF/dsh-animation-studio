@@ -12,19 +12,23 @@
 import { copyFileSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 
-import type { AnimationSpec, JsonValue, PatchOp, Scene, ThemeToken } from '@dsh-anim/spec'
-import { LAYER_TYPES, PROP_ALIASES, readAt, safeName, sceneDurationMs, specDurationMs, validateSpec } from '@dsh-anim/spec'
+import type { AnimationSpec, JsonValue, PatchOp, Scene, SpecSummary, ThemeToken } from '@dsh-anim/spec'
+import { LAYER_TYPES, PROP_ALIASES, readAt, safeName, sceneDurationMs, specDurationMs, summarizeSpec, validateSpec } from '@dsh-anim/spec'
 import type { OutlineItem } from '@dsh-anim/store'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
 import type { AnimRenderer, AnimRendererRegistry, IncrementalInfo } from './render.ts'
+import type { SpeechNote, TtsService } from './tts.ts'
+import { synthesizeNarration, type SpeechBuildResult } from './tts.ts'
 
 export interface AnimDeps {
   store: SpecStore
   renderers: AnimRendererRegistry
   /** 渲染产物的默认落盘目录。 */
   outputDir: string
+  /** 配音服务（0.5.0 §5）：宿主配置了 tts.command 时存在，否则旁白只出字幕。 */
+  tts?: TtsService
 }
 
 export type Emit = (event: AnimEvent) => void
@@ -166,10 +170,44 @@ export interface GetArgs {
   specId: string
   /** JSON Pointer（`/scenes/1/layers/0`）；空或省略返回整份。 */
   path?: string
+  /** 批量读取（0.5.0 §3.1）：一次取多段，与单数 `path` 并存（单数形式向后兼容）。 */
+  paths?: string[]
+  /** `'summary'` 返回时间线摘要（幕起止/图层/资产引用），不返回 spec 片段。
+   * 宿主 schema 的字符串推断较宽，运行时按值等于 'summary' 判断。 */
+  view?: string
 }
 
-export function opGet(deps: AnimDeps, args: GetArgs): { specId: string; path: string; value: unknown; durationMs: number } {
+export interface GetSegment {
+  path: string
+  value?: unknown
+  error?: string
+}
+
+export type GetResultView = {
+  specId: string
+  durationMs: number
+} & (
+  | { view: 'summary'; summary: SpecSummary }
+  | { path: string; value: unknown }
+  | { segments: GetSegment[] }
+)
+
+export function opGet(deps: AnimDeps, args: GetArgs): GetResultView {
   const spec = deps.store.get(args.specId)
+  const durationMs = specDurationMs(spec.scenes)
+  if (args.view === 'summary') {
+    return { specId: args.specId, durationMs, view: 'summary', summary: summarizeSpec(spec) }
+  }
+  if (args.paths !== undefined) {
+    const segments: GetSegment[] = args.paths.map(path => {
+      try {
+        return { path, value: readAt(spec, path) }
+      } catch (err) {
+        return { path, error: err instanceof Error ? err.message : String(err) }
+      }
+    })
+    return { specId: args.specId, durationMs, segments }
+  }
   const path = args.path ?? ''
   let value: unknown = spec
   if (path !== '') {
@@ -179,7 +217,7 @@ export function opGet(deps: AnimDeps, args: GetArgs): { specId: string; path: st
       throw new AnimOpError(err instanceof Error ? err.message : String(err))
     }
   }
-  return { specId: args.specId, path: path || '(整份)', value, durationMs: specDurationMs(spec.scenes) }
+  return { specId: args.specId, durationMs, path: path || '(整份)', value }
 }
 
 /* --------------------------------------------------------------- 写 spec */
@@ -475,6 +513,57 @@ export interface PreviewResultView {
   renderer: string
   frames: PreviewFrame[]
   warnings?: string[]
+  /** 单幕直放（0.5.0 规划 §3.2）：段缓存命中时回放段视频，frames 为空数组。 */
+  clip?: PreviewClipInfo
+}
+
+export interface PreviewClipInfo {
+  path: string
+  sceneId: string
+  sceneIndex: number
+  durationMs: number
+}
+
+/**
+ * 单幕直放快路径（0.5.0 规划 §3.2）：抽帧点全部落在同一幕、且后端的段缓存
+ * 命中该幕时，直接回放段视频——原画质、带音频、零渲染开销。段缓存是
+ * anim_render 的副产品，这里只是把它送到面板；未命中返回 undefined，走正常
+ * 抽帧路径（预期管理不变：抽帧无音频）。
+ * `displayMs` 是配音渲染时传给指纹的实测语音时长——查段口径必须与渲染一致，
+ * 否则 TTS spec 的段永远不命中（真机 E2E 抓到的失配）。
+ */
+export function previewClipFastPath(
+  spec: AnimationSpec,
+  renderer: AnimRenderer,
+  args: PreviewArgs,
+  displayMs?: number[],
+): PreviewClipInfo | undefined {
+  const find = renderer.findSceneSegment?.bind(renderer)
+  if (!find) return undefined
+  const at = args.atMs ?? []
+  if (at.length === 0) return undefined // 缺省抽帧点按全片自动采样，通常跨幕，不适用
+  let sceneIndex = -1
+  for (const atMs of at) {
+    const idx = sceneIndexAtMs(spec, atMs)
+    if (idx === -1) return undefined
+    if (sceneIndex !== -1 && sceneIndex !== idx) return undefined
+    sceneIndex = idx
+  }
+  if (sceneIndex === -1) return undefined
+  const segment = find(spec, sceneIndex, args.scale, displayMs)
+  if (!segment) return undefined
+  return { path: segment.path, sceneId: spec.scenes[sceneIndex]!.id, sceneIndex, durationMs: segment.durationMs }
+}
+
+/** atMs 落在哪一幕（场景内绝对毫秒，与渲染同口径的累计实际时长）。越界钳到末幕。 */
+function sceneIndexAtMs(spec: AnimationSpec, atMs: number): number {
+  let cursor = 0
+  for (let i = 0; i < spec.scenes.length; i++) {
+    const duration = sceneDurationMs(spec.scenes[i]!)
+    if (atMs < cursor + duration || i === spec.scenes.length - 1) return i
+    cursor += duration
+  }
+  return -1
 }
 
 /** 后台模式下预览的即时回执：帧清单经 preview-finished 事件与 job_output 到达。 */
@@ -490,6 +579,42 @@ export interface PreviewBackgroundTicket {
  * jobId，帧清单以 preview-finished 事件与 job_output 到达，面板卡片轮询
  * /api/state 重建缩略图。宿主没有 jobs 服务或发布失败时维持同步回退。
  */
+/* --------------------------------------------------------- 重复发起护栏 */
+
+/**
+ * 同参重复发起护栏（真机 turn 17 教训）：模型把「等待后台任务」误作反复发
+ * 同一预览/渲染（wait_agent 是等 Agent Team 队友的工具，对后台任务会立即
+ * 空转返回 no-progress，形成 preview→wait_agent→preview 死循环）。同一签名
+ * 短期内第 3 次起，在票据/回执里给出纠正指引——任务照常执行不拒绝，只把
+ * 正确姿势递到模型眼前。
+ */
+const repeatGuardByDeps = new WeakMap<object, Map<string, { count: number; firstAt: number }>>()
+const REPEAT_GUARD_WINDOW_MS = 10 * 60_000
+
+/** 护栏状态按 deps（= 插件实例）隔离：冒烟多夹具与多插件互不串计数。 */
+export function repeatGuardNote(owner: object, scope: string, key: string): string | undefined {
+  const now = Date.now()
+  let repeatGuard = repeatGuardByDeps.get(owner)
+  if (!repeatGuard) {
+    repeatGuard = new Map()
+    repeatGuardByDeps.set(owner, repeatGuard)
+  }
+  if (repeatGuard.size > 500) {
+    for (const [k, v] of repeatGuard) {
+      if (now - v.firstAt > REPEAT_GUARD_WINDOW_MS) repeatGuard.delete(k)
+    }
+  }
+  const sig = `${scope}|${key}`
+  const entry = repeatGuard.get(sig)
+  if (!entry || now - entry.firstAt > REPEAT_GUARD_WINDOW_MS) {
+    repeatGuard.set(sig, { count: 1, firstAt: now })
+    return undefined
+  }
+  entry.count += 1
+  if (entry.count < 3) return undefined
+  return `同一参数的${scope}已连续发起 ${entry.count} 次：后台任务不会因重复发起而变快或提前完成，请改用 job_output 查询既有任务的结果（jobId 见此前回执）；wait_agent 只用于等待团队成员，对本工具的后台任务会立即空转返回。`
+}
+
 export async function opPreview(
   deps: AnimDeps,
   args: PreviewArgs,
@@ -500,17 +625,41 @@ export async function opPreview(
 ): Promise<PreviewResultView | PreviewBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
-  if (jobs) {
-    // 与 opRender 同一降级链：先带 owner，失败退无主，再失败退同步
-    for (const ownerCandidate of [owner, undefined]) {
-      try {
-        return await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
-      } catch {
-        /* 发布失败，尝试下一档 */
-      }
+  // 重复发起护栏（真机 turn 17 教训）：同参反复发起时在回执里递上正确姿势
+  const guardNote = repeatGuardNote(deps, '预览', `${args.specId}|atMs=${JSON.stringify(args.atMs ?? [])}|scale=${args.scale ?? ''}`)
+  // 单幕直放快路径（0.5.0 §3.2）：零渲染开销，无「后台」可言，命中即同步返回。
+  // 配音 spec 先按缓存口径还原 displayMs（渲染后命中缓存近零开销），
+  // 保证查段指纹与 anim_render 完全同口径。
+  if (deps.tts && (spec.narration?.cues.length ?? 0) > 0) {
+    const speechBuild = await buildSpeech(spec, deps)
+    const clip = previewClipFastPath(spec, renderer, args, speechBuild?.displayMs)
+    if (clip) {
+      emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
+      emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
+      return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(guardNote ? { warnings: [guardNote] } : {}) }
     }
   }
-  return await previewSync(args, { spec, renderer }, signal, emit)
+  const clip = previewClipFastPath(spec, renderer, args)
+  if (clip) {
+    emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
+    emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
+    return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(guardNote ? { warnings: [guardNote] } : {}) }
+  }
+  if (jobs) {
+    // 与 opRender 同一降级链：先带 owner，失败退无主，再失败退同步
+    let lastError: unknown
+    for (const ownerCandidate of [owner, undefined]) {
+      try {
+        const ticket = await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
+        return guardNote ? { ...ticket, next: `${ticket.next} ⚠️${guardNote}` } : ticket
+      } catch (err) {
+        lastError = err
+      }
+    }
+    console.warn(`[dsh-anim-studio] 后台预览发布失败（owner 与无主两档均被拒），退回同步抽帧：${lastError instanceof Error ? lastError.message : String(lastError)}`)
+  }
+  const view = await previewSync(args, { spec, renderer }, signal, emit)
+  return guardNote ? { ...view, warnings: [...(view.warnings ?? []), guardNote] } : view
 }
 
 async function startBackgroundPreview(
@@ -577,7 +726,7 @@ async function startBackgroundPreview(
     kind: 'background',
     jobId: id,
     specId,
-    next: '预览已在后台进行。用 job_output 收集帧清单；需要终止时用 job_kill。',
+    next: `预览已在后台进行（jobId: ${id}）。用 job_output 收集帧清单；需要终止时用 job_kill。不要用 wait_agent 等待本任务，也不要重复发起同一预览。`,
   }
 }
 
@@ -659,6 +808,12 @@ export interface RenderResultView {
   incremental?: IncrementalInfo
   /** 混入成片的音轨（§4.1，audio 图层 assetId 列表），无声成片缺省。 */
   audioTracks?: string[]
+  /** 混入成片的旁白配音条数（0.5.0 §5），纯字幕模式缺省。 */
+  speechTracks?: number
+  /** 旁白音画对账清单（0.5.0 §5.3）：报告而非自动改时间线。 */
+  speechNotes?: SpeechNote[]
+  /** 全片关键帧拼贴图（0.5.0 规划 §3.3，jpg 绝对路径），生成失败时缺省。 */
+  contactSheet?: string
 }
 
 /** 后台模式下工具的即时回执：真正的渲染结果经 job_output / 完成通知到达。 */
@@ -755,37 +910,109 @@ export async function opRender(
 ): Promise<RenderResultView | RenderBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
+  // 切片渲染（scenes 选幕）不默认写正片路径：solo 出片与整片是两种产物，
+  // 覆盖正片是真实事故（真机：8s 第一幕 solo 覆盖了 64.5s 成片，用户点开
+  // 只见第一幕）。显式传了 outputPath 的调用者自己决定落点。
   // 相对路径在这里解析成绝对路径：ffmpeg 把相对路径按宿主进程 cwd 落盘，
   // 回执必须给出文件的真实位置——真机教训：回显 "x.mp4" 让模型在会话目录
   // 找不到文件，全盘搜索无果后只能重渲一遍。
-  const outputPath = resolve(args.outputPath ?? `${deps.outputDir}/${args.specId}.mp4`)
+  const outputPath = resolve(
+    args.outputPath
+      ?? (args.scenes?.length ? `${deps.outputDir}/${args.specId}-solo-${args.scenes.join('-')}.mp4` : `${deps.outputDir}/${args.specId}.mp4`),
+  )
   if (signal.aborted) throw new AnimOpError('渲染已取消')
+  // 重复发起护栏（真机 turn 17 教训）：同参反复发起时在票据/回执里递上正确姿势
+  const guardNote = repeatGuardNote(
+    deps,
+    '渲染',
+    `${args.specId}|scenes=${JSON.stringify(args.scenes ?? [])}|out=${args.outputPath ?? ''}|cache=${args.cache ?? ''}`,
+  )
   // 渲染前对账（0.4.0 规划 N3）：大纲与实际场景对不上时，此刻说比渲完说便宜
   const outline = deps.store.record(args.specId).outline
   const outlineNotes = outline !== undefined && outline.length > 0 ? reconcileOutline(outline, spec.scenes) : []
 
+  // 旁白配音（0.5.0 §5）：spec 带 cues 且配置了 TTS 才合成（纯字幕模式是
+  // 缺省）。合成立即开跑但只在渲染内部被 await——后台渲染时合成发生在
+  // job 内，不占模型回合；缓存命中（同 text/voice/rate）时近乎免费。
+  const speechBase = buildSpeech(spec, deps)
+  // 切片渲染的语音对齐：语音 atMs 是全片绝对毫秒，solo/选幕渲的窗口却从 0
+  // 重新计轴——不裁剪的话，窗口内 cue 带着原时轴延迟（错位到切片外），窗口
+  // 外 cue 被 mux 的 -t 截在片尾。按选中幕的原始时段过滤并平移到切片时轴。
+  const sliceScenes = args.scenes?.length ? args.scenes : undefined
+  const speech = sliceScenes
+    ? speechBase.then(build => (build ? sliceSpeechForScenes(build, spec, sliceScenes) : build))
+    : speechBase
+
   if (jobs) {
     // 先带 owner（结果可归属、job_output/job_kill 的访问控制按 owner 走）；
     // owner 没有附加 job controller 时退到无主任务；再不行退同步渲染。
+    // 失败原因落宿主日志——「jobs 在但 start 拒绝」的门控问题要能被看见。
+    let lastError: unknown
     for (const ownerCandidate of [owner, undefined]) {
       try {
-        return await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes }, emit, jobs, ownerCandidate)
-      } catch {
-        /* 发布失败，尝试下一档 */
+        const ticket = await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes, speech }, emit, jobs, ownerCandidate)
+        return guardNote ? { ...ticket, next: `${ticket.next} ⚠️${guardNote}` } : ticket
+      } catch (err) {
+        lastError = err
       }
     }
+    console.warn(`[dsh-anim-studio] 后台渲染发布失败（owner 与无主两档均被拒），退回同步渲染：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
-  return await renderSync(args, { spec, renderer, outputPath, outlineNotes }, signal, emit)
+  const view = await renderSync(args, { spec, renderer, outputPath, outlineNotes, speech }, signal, emit)
+  return guardNote ? { ...view, warnings: [...(view.warnings ?? []), guardNote] } : view
+}
+
+/**
+ * 旁白配音载荷构建（0.5.0 §5）：spec 带 narration.cues 且配置了 TTS 时，
+ * 逐 cue 合成语音（按 text/voice/rate 缓存于 work/<specId>/tts/——与适配器
+ * 的 specWorkDir 布局契约一致，键用 spec.meta.id）。任何构建期失败都降级为
+ * 「带警告的无配音」，绝不阻塞渲染。
+ */
+function buildSpeech(spec: AnimationSpec, deps: AnimDeps): Promise<SpeechBuildResult | undefined> {
+  const cues = spec.narration?.cues ?? []
+  if (!deps.tts || cues.length === 0) return Promise.resolve(undefined)
+  const cacheDir = join(deps.outputDir, 'work', safeName(spec.meta.id), 'tts')
+  return synthesizeNarration(spec, deps.tts, cacheDir).catch(err => {
+    const message = err instanceof Error ? err.message : String(err)
+    return { tracks: [], displayMs: [], notes: [], warnings: [`旁白配音整体失败，本片为纯字幕：${message}`] }
+  })
+}
+
+/**
+ * 切片渲染的语音对齐：把全片时轴的语音轨过滤并平移到选中幕的切片窗口上。
+ * notes 一并按窗口过滤（对账只报窗内 cue，atMs 保持全片绝对口径）；displayMs
+ * 按 cue 下标与 narration 对齐，保持全量不动。
+ */
+export function sliceSpeechForScenes(build: SpeechBuildResult, spec: AnimationSpec, scenes: number[]): SpeechBuildResult {
+  const picked = [...new Set(scenes)]
+    .filter(i => Number.isInteger(i) && i >= 0 && i < spec.scenes.length)
+    .sort((a, b) => a - b)
+  if (picked.length === 0) return build
+  const leadMs = spec.scenes.slice(0, picked[0]!).reduce((sum, s) => sum + sceneDurationMs(s), 0)
+  const windowMs = picked.reduce((sum, i) => sum + sceneDurationMs(spec.scenes[i]!), 0)
+  const windowEnd = leadMs + windowMs
+  const inWindow = (start: number, duration: number): boolean => start < windowEnd && start + duration > leadMs
+  return {
+    ...build,
+    tracks: build.tracks
+      .filter(t => inWindow(t.startMs, t.durationMs))
+      .map(t => ({
+        ...t,
+        startMs: Math.max(0, t.startMs - leadMs),
+        durationMs: Math.min(t.durationMs, windowEnd - t.startMs),
+      })),
+    notes: build.notes.filter(n => inWindow(n.atMs, n.audioMs)),
+  }
 }
 
 async function startBackgroundRender(
   args: RenderArgs,
-  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[] },
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[]; speech: Promise<SpeechBuildResult | undefined> },
   emit: Emit,
   jobs: AnimJobsService,
   owner: unknown,
 ): Promise<RenderBackgroundTicket> {
-  const { spec, renderer, outputPath, outlineNotes } = resolved
+  const { spec, renderer, outputPath, outlineNotes, speech } = resolved
   const specId = args.specId
   const controller = new AbortController()
   const jobIdBox: { value: string | null } = { value: null }
@@ -797,13 +1024,24 @@ async function startBackgroundRender(
     cancel: (reason?: unknown) => {
       controller.abort(reason instanceof Error ? reason : new Error(reason ? String(reason) : '渲染任务被终止'))
     },
-    done: renderer
-      .render(
-        { spec, outputPath, scenes: args.scenes, scale: args.scale, cache: args.cache, onProgress: progress },
+    done: (async () => {
+      // 配音合成在 job 内 await：合成耗时（首次每条数秒）不占模型回合
+      const speechBuild = await speech
+      // 合成期间可能已被 cancel：信号已中止时不能再进渲染（监听器注册不上
+      // 会永不落定），直接走 killed 路径——与「同步在 run() 里调 render」的
+      // 旧时序等价
+      if (controller.signal.aborted) throw new Error('渲染已取消')
+      return renderer.render(
+        {
+          spec, outputPath, scenes: args.scenes, scale: args.scale, cache: args.cache, onProgress: progress,
+          ...(speechBuild ? { speech: { tracks: speechBuild.tracks, displayMs: speechBuild.displayMs } } : {}),
+        },
         controller.signal,
       )
+    })()
       .then(
-        result => {
+        async result => {
+          const speechBuild = await speech
           gate.pass(() => ({
             type: 'anim/render-finished',
             data: {
@@ -814,9 +1052,13 @@ async function startBackgroundRender(
               durationMs: result.durationMs,
               width: result.width,
               height: result.height,
-              ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+              ...((speechBuild?.warnings.length ?? 0) + (result.warnings?.length ?? 0) > 0
+                ? { warnings: [...(speechBuild?.warnings ?? []), ...(result.warnings ?? [])] }
+                : {}),
               ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
               ...(result.audioTracks !== undefined && result.audioTracks.length > 0 ? { audioTracks: result.audioTracks } : {}),
+              ...(result.contactSheet !== undefined ? { contactSheet: result.contactSheet } : {}),
+              ...(speechBuild !== undefined && speechBuild.notes.length > 0 ? { speechNotes: speechBuild.notes } : {}),
             },
           }))
           return { status: 'completed' as const, output: result }
@@ -856,28 +1098,33 @@ async function startBackgroundRender(
     jobId: id,
     specId,
     outputPath,
-    next: '渲染已在后台进行。用 job_output 收集进度与结果；需要终止时用 job_kill。',
+    next: `渲染已在后台进行（jobId: ${id}）。用 job_output 查询进度与收集结果；需要终止时用 job_kill。不要用 wait_agent 等待本任务，也不要重复发起同一渲染。`,
     ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
   }
 }
 
 async function renderSync(
   args: RenderArgs,
-  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[] },
+  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[]; speech: Promise<SpeechBuildResult | undefined> },
   signal: AbortSignal,
   emit: Emit,
 ): Promise<RenderResultView> {
-  const { spec, renderer, outputPath, outlineNotes } = resolved
+  const { spec, renderer, outputPath, outlineNotes, speech } = resolved
   const specId = args.specId
   const jobIdBox: { value: string | null } = { value: 'sync' }
   const gate = createRenderEventGate(emit, jobIdBox)
   const progress = createProgressReporter(specId, jobIdBox, gate.pass)
   emitRenderStart(emit, specId, 'sync', outputPath, args)
   try {
+    const speechBuild = await speech
     const result = await renderer.render(
-      { spec, outputPath, scenes: args.scenes, scale: args.scale, cache: args.cache, onProgress: progress },
+      {
+        spec, outputPath, scenes: args.scenes, scale: args.scale, cache: args.cache, onProgress: progress,
+        ...(speechBuild ? { speech: { tracks: speechBuild.tracks, displayMs: speechBuild.displayMs } } : {}),
+      },
       signal,
     )
+    const warnings = [...(speechBuild?.warnings ?? []), ...(result.warnings ?? [])]
     emit({
       type: 'anim/render-finished',
       data: {
@@ -888,14 +1135,18 @@ async function renderSync(
         durationMs: result.durationMs,
         width: result.width,
         height: result.height,
-        ...(result.warnings !== undefined && result.warnings.length > 0 ? { warnings: result.warnings } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
         ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
         ...(result.audioTracks !== undefined && result.audioTracks.length > 0 ? { audioTracks: result.audioTracks } : {}),
+        ...(result.contactSheet !== undefined ? { contactSheet: result.contactSheet } : {}),
+        ...(speechBuild !== undefined && speechBuild.notes.length > 0 ? { speechNotes: speechBuild.notes } : {}),
       },
     })
     return {
       ...result,
       kind: 'sync' as const,
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(speechBuild !== undefined && speechBuild.notes.length > 0 ? { speechNotes: speechBuild.notes } : {}),
       ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
     }
   } catch (err) {
@@ -910,7 +1161,7 @@ async function renderSync(
 
 /* ------------------------------------------------------------------ 资产导入 */
 
-export const ASSET_KINDS = ['image', 'svg', 'audio', 'font'] as const
+export const ASSET_KINDS = ['image', 'svg', 'audio', 'font', 'video'] as const
 export type AssetKind = (typeof ASSET_KINDS)[number]
 
 /** 资产类型 → 可接受的扩展名（不含点）。 */
@@ -919,6 +1170,7 @@ const ASSET_EXT: Record<AssetKind, string[]> = {
   svg: ['svg'],
   audio: ['mp3', 'wav', 'm4a', 'ogg', 'aac'],
   font: ['ttf', 'otf', 'woff', 'woff2'],
+  video: ['mp4', 'webm', 'mov'],
 }
 
 export interface AssetImportArgs {
@@ -1054,6 +1306,8 @@ export async function opDiagnose(
   issues: string[]
   /** 段缓存占用（§3.4 配套），没有任何缓存时缺省。 */
   cache?: { specs: CacheUsageEntry[]; totalBytes: number }
+  /** 配音能力状态（0.5.0 §5）：未配置 = 纯字幕模式（设计内形态）。 */
+  tts?: { configured: boolean; sessionId?: string }
 }> {
   const renderer = deps.renderers.get(args.renderer)
   const d = await renderer.diagnose()
@@ -1063,5 +1317,6 @@ export async function opDiagnose(
     ok: d.ok,
     issues: d.issues,
     ...(cache.specs.length > 0 ? { cache } : {}),
+    tts: { configured: deps.tts !== undefined },
   }
 }

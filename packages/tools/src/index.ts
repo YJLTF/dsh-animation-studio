@@ -18,20 +18,39 @@ import type { AnimDeps } from './ops.ts'
 import { registerAnimTools, resolveEventSink } from './register.ts'
 import type { AnimRenderer } from './render.ts'
 import { AnimRendererRegistry } from './render.ts'
+import { createTtsService, type TtsConfig } from './tts.ts'
 import { MediaIndex, mountAnimWebRoutes, RenderTracker } from './web.ts'
 
 export const name = 'dsh-anim-studio'
 
-/** 只依赖工具注册表；渲染后端由 provider 按需挂进来（见 apply 末尾）。 */
+/** 只依赖工具注册表；渲染后端由 provider 按需挂进来（见 apply 末尾）。
+ * 注意：不能为了探测把 jobs/session 写进 inject——cordis 对缺失的声明服务
+ * 会**延迟挂载直到可用**（真机：裸 cordis 上插件永不启动，冒烟 0.6 抓到），
+ * 可选服务只能走 getRootCtx 的反射读取（见 ctx-probe.ts）。 */
 export const inject = ['tools'] as const
 
 export interface Config {
   /** 渲染产物与中间工作目录的根目录。 */
   outputDir: string
+  /** 配音（TTS）配置（0.5.0 规划 §5）：不配置则旁白只出字幕、不发声。 */
+  tts?: TtsConfig
 }
 
 export const Config: Schema<Config> = Schema.object({
   outputDir: Schema.string().default('./.dsh/anim').description('渲染产物与中间工作目录的根目录'),
+  tts: Schema.object({
+    command: Schema.array(String).role('table').description(
+      'TTS 命令模板（数组，逐项替换占位符后直接执行，不经 shell）。占位符：{text} {outFile} {voice} {rate} {stdin}。'
+      + 'edge-tts 示例：["edge-tts","--voice","{voice}","--rate","{rate}","--text","{text}","--write-media","{outFile}"]。'
+      + '注意：TTS 会把旁白文本送进这条命令（可能出网），离线环境请用 piper 等本地引擎',
+    ),
+    voice: Schema.string().description('默认声音（cue.voice 缺省时用），如 zh-CN-XiaoxiaoNeural'),
+    voices: Schema.dict(String).description('声音映射表：cue.voice 名 → 引擎声音标识'),
+    rate: Schema.string().description('默认语速占位值（edge-tts 形如 "+0%"，引擎语义各异）'),
+    volume: Schema.number().description('旁白音量 0~1，默认 1'),
+    timeoutMs: Schema.number().description('单条合成超时（毫秒），默认 120000'),
+    retries: Schema.number().description('单条失败后的额外重试次数（默认 2，退避 500ms/1500ms；0 关闭）'),
+  }).description('配音配置：留空 = 旁白只出字幕不发声'),
 })
 
 const DEFAULT_OUTPUT_DIR = './.dsh/anim'
@@ -185,18 +204,66 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   restoreFromSession(ctx, store)
 
   const registry = new AnimRendererRegistry()
-  const deps: AnimDeps = { store, renderers: registry, outputDir }
+  // 配音服务（0.5.0 §5）：配置了 tts.command 才可用；未配置时旁白只出字幕
+  const tts = config.tts?.command && config.tts.command.length > 0 ? createTtsService(config.tts as TtsConfig) : undefined
+  const deps: AnimDeps = { store, renderers: registry, outputDir, ...(tts ? { tts } : {}) }
+  // jobs 服务捕获（0.5.0 §2.1 真机调查结论）：cordis 4 按 inject 声明**许可**
+  // 服务属性访问（未声明=抛错），而把 jobs 写进本插件的 inject 会在宿主缺失
+  // 该服务时把挂载**延迟到永远**（冒烟实证：裸 cordis 上插件不再启动）。
+  // 解法：挂一个只依赖 jobs 的子插件——宿主有 jobs（alpha.2+ 的 dsh-base
+  // bundle 自带）时子插件启动并把服务捕进 box，渲染/预览自动后台化；
+  // 宿主没有 jobs 时子插件静默不启动，主插件照常挂载、渲染维持同步回退。
+  const jobsBox: { value?: unknown } = {}
+  captureOptionalService(ctx, ['jobs'], jobsBox)
   const hydrate = makeSessionHydrator(store, { sessionsDir })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给
   // ctx.effect——那会被当成 effect body 立即调用，等于注册完马上注销。
-  ctx.effect(() =>
-    registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media }),
-  )
+  ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media, jobsBox }))
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
   // /dsh-anim 路由：宿主有 webServer（dsh web）才挂得上，headless 形态整段不存在
   mountAnimWebRoutes(ctx, { store, tracker, media, outputDir })
+}
+
+/**
+ * 可选服务捕获：挂一个声明了 `names` 的子插件，服务就绪时把读取结果存进 box。
+ * 子插件在服务缺失时静默不启动（cordis 对 inject 的可用性门控恰好被我们用作
+ * 「可选依赖」）——主插件的启动不受影响。捕获时机可能晚于 apply 返回（宿主
+ * 服务陆续就绪），消费方按引用读 box。
+ */
+function captureOptionalService(ctx: Context, names: string[], box: { value?: unknown }): void {
+  const apply = (serviceCtx: Context): void => {
+    for (const name of names) {
+      const value = probe(serviceCtx, name)
+      if (value !== undefined) box.value = value
+    }
+    // 挂本插件署名的 job controller（0.5.0 §2.1 真机发现）：jobs.start 的
+    // servesOwner 门控要求「有 controller serve 该 owner」，而 dsh-tool-jobs
+    // 的 controller 挂在它自己的组合 scope 里，对我们的 owner/无主任务不可见
+    // → start 恒抛、后台化永远退同步。从捕获 ctx（与 tool-jobs 同层）再挂一个
+    // controller 让后台发布通过门控；job 的收集/终止仍由 tool-jobs 的
+    // job_output / job_kill 完成（owner 隔离不受影响）。
+    const jobs = box.value as { attachController?: (name: string) => unknown } | undefined
+    try {
+      jobs?.attachController?.('dsh-anim-studio')
+    } catch {
+      /* attach 失败则维持同步回退 */
+    }
+  }
+  try {
+    const c = ctx as unknown as {
+      plugin?: (p: { inject: string[]; apply: (c: Context) => void; name: string }) => unknown
+      registry?: { inject?: (i: string[], cb: (c: Context) => void) => unknown }
+    }
+    if (typeof c.plugin === 'function') {
+      c.plugin({ inject: names, apply, name: `dsh-anim-capture-${names.join('-')}` })
+    } else if (typeof c.registry?.inject === 'function') {
+      c.registry.inject(names, apply)
+    }
+  } catch {
+    /* 捕获失败等价于「服务不可用」，走同步回退 */
+  }
 }
 
 /**

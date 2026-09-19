@@ -108,6 +108,26 @@ export function IncrementalNotes(props: { receipt: Receipt }): ReactNode {
   return <Notes title="渲染提速：" items={[label]} />
 }
 
+/**
+ * 全片关键帧拼贴图（0.5.0 规划 §3.3）：渲染回执自带的 contact sheet，
+ * 用户一键看全片概览；点图在新标签看原分辨率。加载失败整块隐藏。
+ */
+export function ContactSheet(props: { path: string }): ReactNode {
+  return (
+    <a href={mediaUrl(props.path)} target="_blank" rel="noreferrer" title="查看拼贴原图">
+      <img
+        style={{ width: '100%', borderRadius: 4, display: 'block' }}
+        src={mediaUrl(props.path)}
+        alt="全片关键帧拼贴"
+        loading="lazy"
+        onError={event => {
+          ;(event.currentTarget as HTMLImageElement).style.display = 'none'
+        }}
+      />
+    </a>
+  )
+}
+
 /** 成片播放器 + 元信息 + 打开方式。 */
 export function VideoPanel(props: { path: string; meta: Receipt; openFile?: ToolViewProps['openFile'] }): ReactNode {
   const meta = props.meta

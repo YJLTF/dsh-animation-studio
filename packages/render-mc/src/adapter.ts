@@ -20,7 +20,7 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, extname, join, resolve } from 'node:path'
+import { basename, dirname, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 import type { AnimationSpec, Asset, Scene } from '@dsh-anim/spec'
@@ -103,6 +103,36 @@ export class MotionCanvasRenderer implements AnimRenderer {
     await this.#runtime.dispose?.()
   }
 
+  /**
+   * 单幕段缓存查找（0.5.0 规划 §3.2）：目标幕的段文件存在且指纹命中时返回
+   * 段路径与时长，否则 null。纯读操作——不渲染、不进串行闸。指纹与
+   * #renderIncremental 同一套口径（展开字幕后的场景 JSON + fps/缩放/分辨率
+   * + CODEGEN_VERSION），anim_render 留下的有效段这里必然命中；调用方给的
+   * 缩放与段不匹配时再按全分辨率（渲染默认值）查一次——段内容与抽帧预览
+   * 的缩放无关地正确，预览宁可用成片分辨率的现成段，也不多渲一遍。
+   */
+  findSceneSegment(spec: AnimationSpec, sceneIndex: number, scale?: number, displayMs?: number[]): { path: string; durationMs: number } | null {
+    for (const candidate of [...new Set([scale, undefined])]) {
+      const resolutionScale = resolveResolutionScale(candidate)
+      // 展开口径必须与 #renderIncremental 的指纹输入一致：配音渲染传了
+      // displayMs（字幕跟随语音时长），场景 JSON 因此不同、指纹不同——
+      // 查段时也要带上同一份 displayMs 才能命中（真机 E2E 抓到的失配）
+      const { scenes } = expandNarration(spec, { displayMs }).spec
+      const scene = scenes[sceneIndex]
+      if (!scene) return null
+      const hash = sceneFingerprint(scene, {
+        fps: spec.meta.fps,
+        resolutionScale,
+        width: spec.meta.size.width,
+        height: spec.meta.size.height,
+        codegenVersion: CODEGEN_VERSION,
+      })
+      const path = join(this.#specWorkDir(spec), 'segments', `seg-${String(sceneIndex).padStart(2, '0')}-r2-${hash}.mp4`)
+      if (existsSync(path)) return { path, durationMs: sceneDurationMs(scene) }
+    }
+    return null
+  }
+
   async preview(request: PreviewRequest, signal: AbortSignal): Promise<PreviewResult> {
     // 预览 = 只渲染抽样帧。Motion Canvas 没有「只渲某几帧」的入口，所以
     // 做法是：把时间线截短到最晚的抽帧点（其后的场景不渲），低分辨率出帧后
@@ -115,20 +145,33 @@ export class MotionCanvasRenderer implements AnimRenderer {
     const truncated = cutMs > 0 && cutMs < totalMs ? truncateSpecAtMs(request.spec, cutMs) : request.spec
     // 旁白 cues → 各幕 subtitles（§4.3）：字幕随场景数据走，截短后的本地时段才正确
     const spec = expandNarration(truncated).spec
-    const result = await this.#renderFrames(spec, signal, resolutionScale)
-    const frames = at
-      .map(atMs => {
-        const index = Math.min(
-          result.frameCount - 1,
+    // 抽帧与取样拷贝同闸：共享帧目录在下一次管线进闸时会被 resetDir 清空，
+    // 抽样帧必须趁闸还握着拷进稳定的 preview/ 目录，卡片稍后按路径取图才有着落
+    const { result, frames } = await this.#serialized(async () => {
+      const r = await this.#renderFramesInternal(spec, signal, resolutionScale)
+      const previewDir = join(this.#specWorkDir(request.spec), 'preview')
+      mkdirSync(previewDir, { recursive: true })
+      const picked = at.map(atMs => ({
+        atMs,
+        index: Math.min(
+          r.frameCount - 1,
           Math.max(0, Math.round((atMs / 1000) * request.spec.meta.fps)),
-        )
-        return {
-          atMs,
-          path: join(result.frameDir, `${String(index).padStart(6, '0')}.png`),
+        ),
+      }))
+      for (const { index } of picked) {
+        const src = join(r.frameDir, `${String(index).padStart(6, '0')}.png`)
+        if (existsSync(src)) copyFileSync(src, join(previewDir, `frame-${String(index).padStart(6, '0')}.png`))
+      }
+      return {
+        result: r,
+        frames: picked.map(f => ({
+          atMs: f.atMs,
+          path: join(previewDir, `frame-${String(f.index).padStart(6, '0')}.png`),
           width: Math.round(request.spec.meta.size.width * resolutionScale),
           height: Math.round(request.spec.meta.size.height * resolutionScale),
-        }
-      })
+        })),
+      }
+    })
     return {
       frames,
       renderer: this.name,
@@ -137,12 +180,15 @@ export class MotionCanvasRenderer implements AnimRenderer {
   }
 
   async render(request: RenderRequest, signal: AbortSignal): Promise<RenderResult> {
+    // 旁白配音载荷可能是 Promise（后台渲染时合成发生在 job 内，不占模型回合）
+    const speech = await request.speech
     const resolutionScale = resolveResolutionScale(request.scale)
     // scenes 抽查：切片后的 spec 同时决定渲染内容与时长/帧数的报告口径。
     // 此参数曾只进契约不进实现（模型传了 scenes 却渲出整片），见优化清单 O1。
     // 旁白字幕在切片之后展开（§4.3）：展开产物挂在各幕 scene.subtitles 上
     // （场景内本地毫秒），solo 切片与场景指纹因此天然携带字幕。
-    const spec = expandNarration(pickScenes(request.spec, request.scenes)).spec
+    // 配音渲染（0.5.0 §5）传 displayMs：字幕显示时长跟随实测语音时长。
+    const spec = expandNarration(pickScenes(request.spec, request.scenes), { displayMs: speech?.displayMs }).spec
     const rawOutputPath = request.outputPath || this.#defaultOutputPath
     if (!rawOutputPath) throw new Error('未指定输出路径，且适配器没有默认路径')
     // 相对路径按宿主进程 cwd 解析（ffmpeg 落盘的同一基准），回执给出绝对路径
@@ -165,7 +211,8 @@ export class MotionCanvasRenderer implements AnimRenderer {
     if (request.cache !== false && spec.scenes.length > 0 && expected > 0) {
       try {
         const incremental = await this.#renderIncremental({ spec, outputPath, fps, expected, resolutionScale, signal, onProgress: request.onProgress })
-        const audio = await this.#finishAudio(spec, outputPath, expected, fps)
+        const audio = await this.#finishAudio(spec, outputPath, expected, fps, speech)
+        const { path: contactSheet, warnings: sheetWarnings } = await this.#buildContactSheet(outputPath, durationMs)
         return {
           outputPath,
           frameCount: expected,
@@ -178,7 +225,11 @@ export class MotionCanvasRenderer implements AnimRenderer {
             scenesReused: spec.scenes.length - incremental.rendered,
           },
           ...(audio.tracks.length > 0 ? { audioTracks: audio.tracks } : {}),
-          ...(audio.warnings.length > 0 ? { warnings: dedupeWarnings(audio.warnings) } : {}),
+          ...(audio.speechCount > 0 && speech ? { speechTracks: audio.speechCount } : {}),
+          ...(contactSheet !== undefined ? { contactSheet } : {}),
+          ...(audio.warnings.length + sheetWarnings.length > 0
+            ? { warnings: dedupeWarnings([...audio.warnings, ...sheetWarnings]) }
+            : {}),
         }
       } catch (err) {
         if (signal.aborted) throw err
@@ -188,10 +239,17 @@ export class MotionCanvasRenderer implements AnimRenderer {
       }
     }
 
-    const result = await this.#renderFrames(spec, signal, resolutionScale, request.onProgress)
-    await encodeFrames(result.frameDir, result.expected, fps, outputPath)
-    const audio = await this.#finishAudio(spec, outputPath, expected, fps)
-    const warnings = [fallbackNote, ...result.warnings, ...audio.warnings].filter((w): w is string => w !== undefined)
+    // 全量路径：抽帧与编码必须同闸（真机 anim-render-2 的教训）——编码若在
+    // 闸外，排队中的下一个管线一进闸就 resetDir 清帧目录，ffmpeg 起来时只剩
+    // 空目录。内部走 #renderFramesInternal，避免闸嵌套死锁。
+    const result = await this.#serialized(async () => {
+      const r = await this.#renderFramesInternal(spec, signal, resolutionScale, request.onProgress)
+      await encodeFrames(r.frameDir, r.expected, fps, outputPath)
+      return r
+    })
+    const audio = await this.#finishAudio(spec, outputPath, expected, fps, speech)
+    const { path: contactSheet, warnings: sheetWarnings } = await this.#buildContactSheet(outputPath, durationMs)
+    const warnings = [fallbackNote, ...result.warnings, ...audio.warnings, ...sheetWarnings].filter((w): w is string => w !== undefined)
     return {
       outputPath,
       frameCount: result.frameCount,
@@ -202,41 +260,73 @@ export class MotionCanvasRenderer implements AnimRenderer {
       ...(fallbackNote === undefined ? {} : { incremental: { scenesTotal: spec.scenes.length, scenesReused: 0, fallback: true } }),
       ...(warnings.length > 0 ? { warnings: dedupeWarnings(warnings) } : {}),
       ...(audio.tracks.length > 0 ? { audioTracks: audio.tracks } : {}),
+      ...(audio.speechCount > 0 && speech ? { speechTracks: audio.speechCount } : {}),
+      ...(contactSheet !== undefined ? { contactSheet } : {}),
     }
   }
 
   /**
-   * 音轨收尾（§4.1）：按现行 spec 收集音轨清单并 mux 进成片。混音失败只
-   * 降级警告（成片保留无声视频版本），绝不让已完成的画面渲染整单报废。
+   * 全片关键帧拼贴图（0.5.0 规划 §3.3）：从成片均匀抽 4×2 = 8 帧拼一张
+   * contact sheet（jpg，与成片同目录同名 + `.contact.jpg`——重渲自然覆盖，
+   * 不堆积）。模型在回执里看到成片结构是否对，用户在面板一键看全片概览。
+   * 生成失败只降级警告（warnings 进回执）——拼贴图是锦上添花，绝不让
+   * 已完成的渲染报废。
+   */
+  async #buildContactSheet(outputPath: string, durationMs: number): Promise<{ path?: string; warnings: string[] }> {
+    try {
+      const COLS = 4
+      const ROWS = 2
+      const sheetPath = join(dirname(outputPath), `${basename(outputPath, extname(outputPath))}.contact.jpg`)
+      // fps=帧数/总秒数 → 在全片时长上均匀采样 8 帧；scale -2 保证高度为偶数
+      const rate = (COLS * ROWS) / Math.max(durationMs / 1000, 0.001)
+      await exec('ffmpeg', [
+        '-y', '-i', outputPath,
+        '-vf', `fps=${num(rate)},scale=320:-2,tile=${COLS}x${ROWS}`,
+        '-frames:v', '1', '-update', '1', '-q:v', '3',
+        sheetPath,
+      ])
+      return { path: sheetPath, warnings: [] }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { warnings: [`拼贴图生成失败（不影响成片）：${message}`] }
+    }
+  }
+
+  /**
+   * 音轨收尾（§4.1）：按现行 spec 收集音轨清单并 mux 进成片。旁白配音
+   * （0.5.0 §5）的已合成轨道在此并入同一 mux 管线（adelay 对齐 + amix）。
+   * 混音失败只降级警告（成片保留无声视频版本），绝不让已完成的画面渲染
+   * 整单报废。
    */
   async #finishAudio(
     spec: AnimationSpec,
     outputPath: string,
     expectedFrames: number,
     fps: number,
-  ): Promise<{ tracks: string[]; warnings: string[] }> {
+    speech?: { tracks: Array<{ source: string; startMs: number; durationMs: number; volume: number }>; displayMs?: number[] },
+  ): Promise<{ tracks: string[]; speechCount: number; warnings: string[] }> {
     const { cues, warnings } = collectAudioTracks(spec)
-    if (cues.length === 0) return { tracks: [], warnings }
+    const speechCues = (speech?.tracks ?? []).map((t, i) => ({
+      assetId: `speech-${i + 1}`,
+      source: t.source,
+      startMs: t.startMs,
+      durationMs: t.durationMs,
+      volume: t.volume,
+      loop: false,
+    }))
+    const all = [...cues, ...speechCues]
+    if (all.length === 0) return { tracks: [], speechCount: 0, warnings }
     try {
-      await muxAudioTracks(outputPath, cues, expectedFrames / fps)
-      return { tracks: cues.map(c => c.assetId), warnings }
+      await muxAudioTracks(outputPath, all, expectedFrames / fps)
+      return { tracks: all.map(c => c.assetId), speechCount: speechCues.length, warnings }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.warn(`[render-mc] 音轨合成失败，成片保留无声版本：${message}`)
-      return { tracks: [], warnings: [...warnings, `音轨合成失败，成片为无声版本：${message}`] }
+      return { tracks: [], speechCount: 0, warnings: [...warnings, `音轨合成失败，成片为无声版本：${message}`] }
     }
   }
 
   /* ---------------------------------------------------------------- 内部 */
-
-  async #renderFrames(
-    spec: AnimationSpec,
-    signal: AbortSignal,
-    resolutionScale: number,
-    onProgress?: (done: number, total: number) => void,
-  ): Promise<{ frameDir: string; frameCount: number; expected: number; warnings: string[] }> {
-    return this.#serialized(() => this.#renderFramesInternal(spec, signal, resolutionScale, onProgress))
-  }
 
   async #renderFramesInternal(
     spec: AnimationSpec,
@@ -394,6 +484,18 @@ export function dedupeWarnings(warnings: string[]): string[] {
 }
 
 /**
+ * ffmpeg 的 image2 探测不到起始帧时报「Could find no file or sequence」，
+ * 与真因（抽帧阶段没产出，或产物被清）相距十万八千里——起编码前先验首帧，
+ * 把这类失败翻译成人话。
+ */
+function assertFirstFrame(frameDir: string, index: number): void {
+  const first = join(frameDir, `${String(index).padStart(6, '0')}.png`)
+  if (!existsSync(first)) {
+    throw new Error(`帧目录缺少首帧 ${first}：抽帧阶段没有产出（浏览器崩溃或页面报错），或帧被并发管线清空`)
+  }
+}
+
+/**
  * 把帧序列合成 MP4。
  *
  * - 有 libx264 用 CRF 质量；没有则退到 libopenh264（部分发行版的 ffmpeg）；
@@ -405,6 +507,7 @@ export async function encodeFrames(
   fps: number,
   outputPath: string,
 ): Promise<void> {
+  assertFirstFrame(frameDir, 0)
   const pattern = join(frameDir, '%06d.png')
   mkdirSync(dirname(resolve(outputPath)), { recursive: true })
   const codec = await pickVideoCodec()
@@ -443,6 +546,7 @@ export async function encodeFrameRange(
   outputPath: string,
   codec?: string,
 ): Promise<void> {
+  assertFirstFrame(frameDir, startFrame)
   const pattern = join(frameDir, '%06d.png')
   mkdirSync(dirname(resolve(outputPath)), { recursive: true })
   const c = codec ?? (await pickVideoCodec())
@@ -503,9 +607,13 @@ export async function muxAudioTracks(
     if (cue.loop) args.push('-stream_loop', '-1')
     args.push('-i', cue.source)
     const f: string[] = []
-    if (cue.startMs > 0) f.push(`adelay=${num(cue.startMs)}:all=1`)
-    if (cue.volume !== 1) f.push(`volume=${num(cue.volume)}`)
+    // 先钳长、归零，再位移：atrim 的时钟是滤镜链当前时间轴——若先 adelay，
+    // atrim 数的是「含前导静音」的开头一段，保留下来的恰好是静音、人声被整
+    // 段裁掉（真机「只有第一句有配音」的根因；0.4 的 audio 图层时代已埋着，
+    // TTS 让延迟轨成为常态才炸出来）。
     f.push(`atrim=0:${num(cue.durationMs / 1000)}`, 'asetpts=PTS-STARTPTS')
+    if (cue.volume !== 1) f.push(`volume=${num(cue.volume)}`)
+    if (cue.startMs > 0) f.push(`adelay=${num(cue.startMs)}:all=1`)
     const label = `[a${i}]`
     chains.push(`[${i + 1}:a]${f.join(',')}${label}`)
     labels.push(label)

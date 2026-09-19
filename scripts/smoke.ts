@@ -51,9 +51,11 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache } from '../packages/tools/src/ops.ts'
+import { coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
+import { previewClipFastPath } from '../packages/tools/src/ops.ts'
+import { runWithRetries, synthesizeNarration, type TtsService } from '../packages/tools/src/tts.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
 import type { KernelResponse } from '../packages/tools/src/web.ts'
 
@@ -1014,6 +1016,76 @@ await checkA('opRender: 无 jobs 或 start 抛错都退回同步路径，行为�
   }
 })
 
+await checkA('opRender: scenes 切片默认落 solo 路径，绝不覆盖正片（真机事故回归）', async () => {
+  const paths: string[] = []
+  const { deps, emit } = renderFixture(async request => {
+    paths.push(request.outputPath)
+    return { ...RENDER_RESULT, outputPath: request.outputPath }
+  })
+  const sliced = await opRender(deps, { specId: 'gd', scenes: [0] }, new AbortController().signal, emit)
+  assert.match(sliced.outputPath, /gd-solo-0\.mp4$/, '切片渲染默认落 solo 路径')
+  assert.ok(!sliced.outputPath.endsWith('gd.mp4'), '不得写正片路径')
+  const explicit = await opRender(deps, { specId: 'gd', scenes: [1], outputPath: '.tmp/xyz.mp4' }, new AbortController().signal, emit)
+  assert.match(explicit.outputPath, /xyz\.mp4$/, '显式 outputPath 由调用者决定')
+  assert.deepEqual(paths, [sliced.outputPath, explicit.outputPath], '渲染器拿到的就是解析后的路径')
+})
+
+await checkA('sliceSpeechForScenes: 语音轨按选中幕过滤并平移到切片时轴', async () => {
+  const spec = demoSpec()
+  spec.scenes.push({ ...spec.scenes[0]!, id: 's2', name: '第二幕' })
+  const build = {
+    tracks: [
+      { source: 'a.mp3', startMs: 500, durationMs: 1000, volume: 1 },
+      { source: 'b.mp3', startMs: 2500, durationMs: 1000, volume: 1 },
+    ],
+    displayMs: [1000, 1000],
+    notes: [
+      { index: 0, text: '一', atMs: 500, audioMs: 1000, overflowMs: 0 },
+      { index: 1, text: '二', atMs: 2500, audioMs: 1000, overflowMs: 0 },
+    ],
+    warnings: [],
+  }
+  const sliced = sliceSpeechForScenes(build, spec, [1])
+  assert.equal(sliced.tracks.length, 1, '窗外 cue（第一幕的 500ms）被滤掉')
+  assert.equal(sliced.tracks[0]?.source, 'b.mp3')
+  assert.equal(sliced.tracks[0]?.startMs, 500, '2500ms − leadMs 2000 → 平移到切片时轴')
+  assert.equal(sliced.notes.length, 1, '对账只报窗内 cue')
+  assert.equal(sliced.displayMs.length, 2, 'displayMs 保持与 narration 全量对齐')
+  // 跨窗 cue：头在窗外、尾伸进窗——起点钳 0、尾裁到窗口右缘
+  const cross = sliceSpeechForScenes(
+    { ...build, tracks: [{ source: 'd.mp3', startMs: 1500, durationMs: 4000, volume: 1 }] },
+    spec,
+    [1],
+  )
+  assert.equal(cross.tracks[0]?.startMs, 0, '1500 − 2000 → 钳到 0')
+  assert.equal(cross.tracks[0]?.durationMs, 2500, '尾巴裁到窗口右缘（4000 − 1500）')
+})
+
+await checkA('opPreview: 同参重复发起护栏——第 3 次起票据给纠正指引（真机 turn 17 回归）', async () => {
+  const previewImpl: AnimRenderer['preview'] = async () => ({
+    frames: [{ atMs: 700, path: 'f.png', width: 1, height: 1 }],
+    renderer: 'fake',
+  })
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT, previewImpl)
+  deps.store.create('guard-spec', demoSpec())
+  const jobs: AnimJobsService = {
+    start(spec) {
+      spec.run()
+      return 'anim-preview-guard'
+    },
+  }
+  const call = () => opPreview(deps, { specId: 'guard-spec', atMs: [700] }, new AbortController().signal, emit, jobs)
+  const t1 = (await call()) as { kind: string; next: string }
+  const t2 = (await call()) as { kind: string; next: string }
+  const t3 = (await call()) as { kind: string; next: string }
+  assert.equal(t1.kind, 'background')
+  assert.ok(!t1.next.includes('连续发起') && !t2.next.includes('连续发起'), '前两次不打扰')
+  assert.match(t3.next, /连续发起 3 次/, '第三次起给出纠正指引')
+  assert.match(t3.next, /job_output/, '指引指向正确姿势')
+  const t4 = (await opPreview(deps, { specId: 'guard-spec', atMs: [999] }, new AbortController().signal, emit, jobs)) as { next: string }
+  assert.ok(!t4.next.includes('连续发起'), '不同参数独立计数')
+})
+
 await checkA('opRender: 进度 done 超过预估 total 时 percent 钳在 100（真机实测 92/90 → 102%）', async () => {
   const { deps, emitted, emit } = renderFixture(async request => {
     // 尾帧缓冲：实际帧数超出预估 total 是常态而非异常
@@ -1263,6 +1335,22 @@ await checkA('/dsh-anim 内核：渲染任务簿 + 状态 API + 媒体放行', a
   const etag = full.headers.etag
   assert.equal((await media(insideMp4, { 'if-none-match': etag })).status, 304)
   assert.equal((await media(insideMp4, { range: 'bytes=99-' })).status, 416)
+
+  // audio 资产可服务（0.5.0 §2.2）：五类音频扩展进白名单，Content-Type 正确
+  const audioTypes: Array<[string, string]> = [
+    ['.mp3', 'audio/mpeg'],
+    ['.wav', 'audio/wav'],
+    ['.ogg', 'audio/ogg'],
+    ['.m4a', 'audio/mp4'],
+    ['.flac', 'audio/flac'],
+  ]
+  for (const [ext, mime] of audioTypes) {
+    const p = join(outputDir, `narration${ext}`)
+    writeFileSync(p, 'x')
+    const res = await media(p)
+    assert.equal(res.status, 200, `音频扩展 ${ext} 可服务`)
+    assert.equal(res.headers['content-type'], mime, `音频扩展 ${ext} 的 Content-Type`)
+  }
 
   // 放行边界：目录穿越、outputDir 外未登记、非媒体扩展名一律 404
   assert.equal((await media(join(tmpRoot, '..', 'outside-of-scope.mp4'))).status, 404)
@@ -2137,6 +2225,248 @@ await checkA('MotionCanvasRenderer.render: audio 图层端到端——增量路�
   if (streams !== null) assert.ok(streams.includes('audio'), `成片应有音频流：${streams}`)
   rmSync(dir, { recursive: true, force: true })
   rmSync(workDir, { recursive: true, force: true })
+})
+
+/* ---------------------------------------------------------------- 0.5.0 */
+
+await checkA('opGet summary 视图：幕起止/图层规模/音频/资产引用计数，口径与时间线求值同源（§3.1）', async () => {
+  const store = new SpecStore()
+  store.create('sum', demoSpec())
+  store.patch('sum', [
+    { op: 'add', path: '/assets/pic', value: { kind: 'image', src: '/tmp/pic.png' } },
+  ], '资产')
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: tmpdir() }
+  const r = opGet(deps, { specId: 'sum', view: 'summary' })
+  assert.equal(r.view, 'summary')
+  if (r.view !== 'summary') return
+  const s = r.summary
+  const spec = demoSpec()
+  assert.equal(s.sceneCount, spec.scenes.length)
+  assert.equal(s.scenes[0]?.index, 0)
+  assert.equal(s.scenes[0]?.startMs, 0)
+  assert.ok((s.scenes[0]?.durationMs ?? 0) > 0)
+  assert.equal(s.totalMs, specDurationMs(spec.scenes), '累计起点与 specDurationMs 同口径')
+  assert.equal(s.narrationCues, 0, '未写旁白时为 0')
+  assert.deepEqual(s.assets, [{ id: 'pic', kind: 'image', refs: 0 }])
+})
+
+await checkA('opGet 批量 paths：多段一次返回，坏 path 只在该段报 error 不影响其余（§3.1）', async () => {
+  const store = new SpecStore()
+  store.create('batch', demoSpec())
+  const deps: AnimDeps = { store, renderers: new AnimRendererRegistry(), outputDir: tmpdir() }
+  const r = opGet(deps, { specId: 'batch', paths: ['/meta/title', '/scenes/0/durationMs', '/scenes/99'] })
+  assert.equal('segments' in r, true)
+  if (!('segments' in r)) return
+  assert.equal(r.segments.length, 3)
+  assert.equal(r.segments[0]?.value, '冒烟样片')
+  assert.equal(typeof r.segments[1]?.value, 'number')
+  assert.match(String(r.segments[2]?.error), /99|不存在|无法|pointer/i)
+})
+
+await checkA('validateSpec: durationMs 秒-毫秒量级混淆给软警告（§3.4），正常毫秒不误报', async () => {
+  const bad = demoSpec()
+  bad.scenes[0]!.durationMs = 8
+  const r = validateSpec(bad)
+  assert.ok(r.ok, '亚帧时长是合法中间态，只是警告')
+  assert.ok(r.warnings.some(w => w.includes('疑似把秒写成了毫秒')), `应有秒毫秒混淆警告：${JSON.stringify(r.warnings)}`)
+  assert.equal(validateSpec(demoSpec()).warnings.some(w => w.includes('疑似把秒')), false)
+})
+
+await checkA('previewClipFastPath: 单幕命中回 clip，跨幕/无 atMs/无段缓存都回退抽帧（§3.2）', async () => {
+  const spec = demoSpec()
+  // 跨幕场景需要 ≥2 幕：补一幕 800ms 的收尾
+  spec.scenes = [...spec.scenes, { id: 'outro', name: '收尾', durationMs: 800, layers: [], tracks: [] }]
+  const segPath = join(tmpdir(), 'seg-00-r2-deadbeef.mp4')
+  const renderer: AnimRenderer = {
+    name: 'fake',
+    async diagnose() { return { renderer: 'fake', ok: true, issues: [] } },
+    async preview() { throw new Error('不应走到抽帧') },
+    async render() { throw new Error('不应走到渲染') },
+    findSceneSegment: (sp, i) =>
+      i === 0 ? { path: segPath, durationMs: sp.scenes[0]!.durationMs } : null,
+  }
+  const clip = previewClipFastPath(spec, renderer, { specId: 'x', atMs: [100, 200] })
+  assert.ok(clip, '同一幕内的抽帧点应命中')
+  assert.equal(clip?.sceneIndex, 0)
+  assert.equal(clip?.sceneId, spec.scenes[0]!.id)
+  assert.equal(previewClipFastPath(spec, renderer, { specId: 'x', atMs: [100, spec.scenes[0]!.durationMs + 500] }), undefined, '跨幕不命中')
+  assert.equal(previewClipFastPath(spec, renderer, { specId: 'x' }), undefined, '缺省抽帧点（全片自动采样）不命中')
+  const noFind: AnimRenderer = { ...renderer, findSceneSegment: undefined }
+  assert.equal(previewClipFastPath(spec, noFind, { specId: 'x', atMs: [100] }), undefined, '后端无段缓存能力时回退')
+  // 越界 atMs 钳到末幕：末幕有段缓存即命中（与抽帧下标钳制同语义）
+  const lastSceneRenderer: AnimRenderer = {
+    ...renderer,
+    findSceneSegment: (sp, i) => (i === sp.scenes.length - 1 ? { path: segPath, durationMs: 800 } : null),
+  }
+  const clamped = previewClipFastPath(spec, lastSceneRenderer, { specId: 'x', atMs: [spec.scenes[0]!.durationMs + 100_000] })
+  assert.equal(clamped?.sceneIndex, spec.scenes.length - 1, '越界钳到末幕')
+  // displayMs 透传（TTS 渲染的查段口径与渲染一致，§5.3）
+  let gotDisplayMs: number[] | undefined
+  const spyRenderer: AnimRenderer = {
+    ...renderer,
+    findSceneSegment: (sp, i, sc, dm) => {
+      gotDisplayMs = dm
+      return { path: segPath, durationMs: 800 }
+    },
+  }
+  previewClipFastPath(spec, spyRenderer, { specId: 'x', atMs: [100] }, [4250])
+  assert.deepEqual(gotDisplayMs, [4250], 'displayMs 应透传给 findSceneSegment')
+})
+
+await checkA('codegen: 渐变 fill / reveal 打字机 / in-inOut 缓动 / video 图层全部落进生成物（§4）', async () => {
+  const spec = demoSpec()
+  spec.scenes = [{
+    id: 'g', name: '渐变与打字机', durationMs: 3000,
+    layers: [
+      {
+        id: 'panel', name: '渐变底版', type: 'rect',
+        props: { width: 600, height: 200, fill: { type: 'linear', from: [-300, 0], to: [300, 0], stops: [[0, '#4C9AFF'], [1, '#FFB020']] } },
+        tracks: [],
+      },
+      {
+        id: 'line1', name: '虚线', type: 'line',
+        props: { points: [[-200, 100], [200, 100]], stroke: "#FFB020", lineDash: [8, 6] },
+        tracks: [],
+      },
+      {
+        id: 'say', name: '打字机', type: 'text',
+        props: { text: '梯度下降逐字浮现', x: 0, y: 0 },
+        tracks: [{ id: 'say-reveal', target: 'props.reveal', keys: [{ atMs: 0, value: 0 }, { atMs: 1500, value: 1, ease: { kind: 'easeInOut' } }] }],
+      },
+      {
+        id: 'clip', name: '实拍', type: 'video',
+        props: { src: 'asset:demo-video', width: 320, time: 0.5, playbackRate: 1 },
+        tracks: [],
+      },
+    ],
+    transition: { kind: 'zoomIn', durationMs: 400, ease: { kind: 'backInOut' } },
+  }]
+  spec.assets = { 'demo-video': { kind: 'video', src: 'https://example.com/v.mp4' } }
+  const { files, warnings } = generateProject(spec, { resolutionScale: 1 })
+  const sceneFile = files.find(f => f.path.startsWith('scenes/'))!.content
+  assert.match(sceneFile, /new Gradient\(\{ type: "linear"/, '渐变 fill 生成 Gradient 实例')
+  assert.match(sceneFile, /lineDash=\{\[8,6\]\}/, 'lineDash 直通')
+  assert.match(sceneFile, /const \w+_say_reveal = createSignal\(0\);/, 'reveal signal 初值')
+  assert.match(sceneFile, /\w+_say_reveal\(1, 1\.5, easeInOutCubic\)/, 'reveal 轨道补间 signal')
+  assert.match(sceneFile, /text=\{\(\) => "梯度下降逐字浮现"\.slice\(0, Math\.round\(\w+_say_reveal\(\) \* 8\)\)\}/, '文本按 signal 逐字裁剪')
+  assert.match(sceneFile, /Video/, 'video 组件进 import')
+  assert.match(sceneFile, /play=\{true\}/, 'video 固定注入 play')
+  assert.match(sceneFile, /src=\{"https:\/\/example\.com\/v\.mp4"\}/, 'video http 资产原样透传（字面量带花括号）')
+  assert.match(sceneFile, /easeInOutBack/, '缓动 in/inOut 变体映射')
+  assert.deepEqual(warnings, [], '合法形态应零警告')
+  // 非法渐变：告警摘除，不用坏值生成
+  spec.scenes[0]!.layers[0]!.props.fill = { type: 'linearX', stops: [] } as never
+  const bad = generateProject(spec, { resolutionScale: 1 })
+  assert.ok(bad.warnings.some(w => w.includes('渐变描述无效')), '坏渐变告警摘除')
+})
+
+await checkA('synthesizeNarration: 注入合成器逐 cue 产轨 + 字幕跟随实测 + 溢出对账（§5.3）', async () => {
+  const spec = demoSpec()
+  spec.narration = {
+    cues: [
+      { atMs: 0, text: '第一句旁白' },
+      { atMs: 1500, text: '第二句旁白内容更长一些', durationMs: 1200 },
+    ],
+    tts: { volume: 0.8 },
+  }
+  const calls: Array<{ text: string; voice?: string; rate: string }> = []
+  const tts: TtsService = {
+    rate: '+0%',
+    volume: 1,
+    synthesizer: async req => {
+      calls.push({ text: req.text, voice: req.voice, rate: req.rate })
+      return { filePath: req.outFile, durationMs: 2000 }
+    },
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'anim-tts-'))
+  const r = await synthesizeNarration(spec, tts, dir)
+  assert.equal(r.tracks.length, 2, '两条 cue 各合成一轨')
+  assert.equal(r.tracks[0]?.startMs, 0)
+  assert.equal(r.tracks[1]?.startMs, 1500)
+  assert.equal(r.tracks[0]?.volume, 0.8, 'narration.tts.volume 生效')
+  assert.equal(r.tracks[0]?.durationMs, 2000)
+  assert.ok(r.displayMs[0]! >= 2000, '字幕显示跟随实测音频（比估算长）')
+  assert.equal(r.displayMs[1]!, 2000, '实测与声明的较大者')
+  assert.equal(r.notes.length, 2)
+  assert.ok(r.notes[0]!.overflowMs > 0, '第一句 2000ms 语音撞上第二句 1500ms 起点 → 溢出被记录')
+  assert.ok(r.warnings.some(w => w.includes('超出')), '溢出进警告')
+  assert.equal(calls.length, 2, '注入合成器被逐 cue 调用')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await checkA('synthesizeNarration: 单条合成失败降级纯字幕不拖垮其余 cue；空文本跳过（§5.4）', async () => {
+  const spec = demoSpec()
+  spec.narration = {
+    cues: [
+      { atMs: 0, text: '会失败的一句' },
+      { atMs: 2000, text: '   ' },
+      { atMs: 4000, text: '会成功的一句' },
+    ],
+  }
+  const tts: TtsService = {
+    rate: '+0%',
+    volume: 1,
+    synthesizer: async req => {
+      if (req.text.includes('失败')) throw new Error('引擎超时')
+      return { filePath: req.outFile, durationMs: 1000 }
+    },
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'anim-tts-fail-'))
+  const r = await synthesizeNarration(spec, tts, dir)
+  assert.equal(r.tracks.length, 1, '只有一条成功')
+  assert.equal(r.tracks[0]?.startMs, 4000)
+  assert.ok(r.warnings.some(w => w.includes('降级为纯字幕')), '失败降级警告可见')
+  assert.ok(r.warnings.some(w => w.includes('为空')), '空文本跳过有提示')
+  assert.equal(r.notes.length, 1)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await checkA('synthesizeNarration: 坏缓存自愈——读不出时长的残留文件删掉重合成，不永久降级', async () => {
+  const spec = demoSpec()
+  spec.narration = { cues: [{ atMs: 0, text: '坏缓存里的一句' }] }
+  let calls = 0
+  const tts: TtsService = {
+    rate: '+0%',
+    volume: 1,
+    synthesizer: async req => {
+      calls++
+      // 模拟真实引擎留坑：文件已建出但 0 字节（失败残留的典型形态）
+      writeFileSync(req.outFile, '')
+      return { filePath: req.outFile, durationMs: 1800 }
+    },
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'anim-tts-poison-'))
+  const first = await synthesizeNarration(spec, tts, dir)
+  assert.equal(first.tracks.length, 1)
+  assert.equal(calls, 1)
+  // 第二次：缓存「命中」但 ffprobe 读不出 0 字节文件 → 必须删掉重合成，而不是降级
+  const second = await synthesizeNarration(spec, tts, dir)
+  assert.equal(second.tracks.length, 1, '坏缓存自愈后仍有音轨')
+  assert.equal(second.tracks[0]?.durationMs, 1800)
+  assert.equal(calls, 2, '坏缓存触发了重合成')
+  assert.equal(second.warnings.length, 0, '自愈路径不产生降级警告')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+await checkA('runWithRetries: 前败后成按次数救回；耗尽抛最后一次的错误', async () => {
+  let n = 0
+  const ok = await runWithRetries(async () => {
+    n++
+    if (n < 3) throw new Error(`boom-${n}`)
+    return 'fine'
+  }, 3, 1)
+  assert.equal(ok, 'fine')
+  assert.equal(n, 3)
+  let m = 0
+  await assert.rejects(
+    () => runWithRetries(async () => {
+      m++
+      throw new Error(`always-${m}`)
+    }, 2, 1),
+    /always-2/,
+    '重试耗尽应抛最后一次的错误',
+  )
+  assert.equal(m, 2)
 })
 
 console.log(`\n冒烟通过：${passed} 项`)

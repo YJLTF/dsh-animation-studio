@@ -9,7 +9,7 @@ import { useEffect, useState } from 'react'
 
 import { fetchRenderStatus, formatMs, isSettled, list, mediaUrl, num, readArgs, readReceipt, str, strings, type Receipt, type RenderStatus, type ToolViewProps } from '../protocol.ts'
 import { Card, Fallback, RenderWarnings } from './primitives.tsx'
-import { caption, figure, thumb, thumbs } from './styles.ts'
+import { caption, figure, thumb, thumbs, videoBox } from './styles.ts'
 
 /** 帧清单网格：同步回执与后台票据完成态共用一份 DOM。 */
 function FrameGrid(props: { frames: Receipt[] }): ReactNode {
@@ -35,6 +35,24 @@ function FrameGrid(props: { frames: Receipt[] }): ReactNode {
           </figure>
         )
       })}
+    </div>
+  )
+}
+
+/** 单幕直放（0.5.0 规划 §3.2）：段缓存命中时回放原画质段视频（带音频）。 */
+function ClipPanel(props: { clip: Receipt; specId?: string }): ReactNode {
+  const path = str(props.clip, 'path') ?? ''
+  const sceneIndex = num(props.clip, 'sceneIndex')
+  const durationMs = num(props.clip, 'durationMs')
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <video style={videoBox} controls preload="metadata" src={mediaUrl(path)} />
+      <div style={caption}>
+        单幕直放
+        {sceneIndex !== undefined ? `：第 ${sceneIndex} 幕` : ''}
+        {durationMs !== undefined ? ` · ${formatMs(durationMs)}` : ''}
+        {props.specId ? ` · ${props.specId}` : ''}
+      </div>
     </div>
   )
 }
@@ -91,9 +109,12 @@ function PreviewTicket(props: { receipt: Receipt }): ReactNode {
 
   if (status !== null && status.status === 'completed') {
     const frames = list(status as unknown as Receipt, 'frames')
+    const clipReceipt = (status as unknown as Receipt).clip as Receipt | undefined
     return (
-      <Card title={`预览帧 ×${frames.length}${specId ? `：${specId}` : ''}`}>
-        {frames.length > 0 ? (
+      <Card title={clipReceipt ? `单幕直放${specId ? `：${specId}` : ''}` : `预览帧 ×${frames.length}${specId ? `：${specId}` : ''}`}>
+        {clipReceipt ? (
+          <ClipPanel clip={clipReceipt} specId={specId} />
+        ) : frames.length > 0 ? (
           <FrameGrid frames={frames} />
         ) : (
           <div style={{ ...caption }}>任务已完成但没有帧清单（可能由宿主重启）。可用 job_output 重新收集。</div>
@@ -126,6 +147,16 @@ export function PreviewCard(props: ToolViewProps): ReactNode {
   if (block.isError) return <Card title="抽帧预览失败">{block.error?.reason ?? str(readReceipt(block), 'error')}</Card>
   const receipt = readReceipt(block)
   if (receipt && str(receipt, 'kind') === 'background') return <PreviewTicket receipt={receipt} />
+  const clip = receipt?.clip as Receipt | undefined
+  if (clip && typeof clip.path === 'string') {
+    const specId = str(receipt, 'specId')
+    return (
+      <Card title={`单幕直放${specId ? `：${specId}` : ''}`}>
+        <ClipPanel clip={clip} specId={specId} />
+        <RenderWarnings items={strings(receipt, 'warnings')} />
+      </Card>
+    )
+  }
   const frames = list(receipt, 'frames').filter(f => typeof f.path === 'string')
   if (!receipt || frames.length === 0) return <Fallback {...props} running="抽帧预览" />
   return (

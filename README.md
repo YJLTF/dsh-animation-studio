@@ -20,14 +20,14 @@
 ## 核心特性
 
 - **模型只读写 JSON，不写动画代码**：时间线是一份 AnimationSpec IR——所有时间都是场景内绝对毫秒，可动画属性统一收进轨道关键帧，内置 linear / easeIn/Out/InOut / cubicBezier / spring / bounce / elastic / back 缓动。于是"微调 = 改一个数字"（一条 JSON Patch，而不是重写 800 行代码），换渲染后端不动工具，每一步天然可回放、可撤销、可分叉。
-- **10 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（按 JSON Pointer 精确读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_asset_import`（图片/svg/音频/字体素材登记）、`anim_preview`（降分辨率抽帧）、`anim_render`（整片 MP4）。详见[工具一览](#工具一览)。
+- **10 个面向模型的工具**：`anim_diagnose`（环境自检）、`anim_create_spec`、`anim_plan`（分镜大纲 + 节奏体检）、`anim_draft_scene`（逐幕写入）、`anim_get`（JSON Pointer 精确/批量/摘要读取）、`anim_patch`（结构化补丁，返回 inverse）、`anim_undo`、`anim_asset_import`（图片/svg/音频/字体/视频素材登记）、`anim_preview`（抽帧；段缓存命中时单幕直放）、`anim_render`（整片 MP4）。详见[工具一览](#工具一览)。
 - **写入走 JSON Patch，撤销不用重新推理**：改完整份校验，不通过整批回滚；每次修改同时记录正向 ops 与反向 inverse，`anim_undo` 直接回放 inverse。坏 op 在边界上以可读的报错返回。
 - **事件溯源 + 会话恢复**：spec 的每次变更都是一条自包含事件，`foldEvents` 从事件流还原状态（含撤销历史）。事件按会话写进插件自有 sidecar（`<outputDir>/sessions/<sessionId>.jsonl`），不写宿主会话日志——宿主读回对未知事件类型 fail-closed，写进去会毒化整个会话。宿主重启、会话重开后，旧 spec 照常修改与撤销。
 - **开箱即用的 Motion Canvas 渲染**：自动处理 Motion Canvas 3.17 无官方 CLI、WebGL 上下文、headless 出帧、尾部静止提前停帧等一整串坑；渲染默认 headless 无窗口，超时或中断显式报错，绝不静默产出残片。段缓存默认开启（未变的幕直接复用），长片渲染耗时以分钟计。
 - **渲染与预览自动后台化**：宿主提供 `ctx.jobs` 时立即返回 jobId，进度以事件可见，模型用 `job_output` / `job_kill`（dsh-tool-jobs）收集与终止；宿主没有 jobs 服务时自动退回同步执行（可用 `anim_diagnose` 的 host 报告确认）。渲染过程落 `anim/render-start` / `anim/render-progress` / `anim/render-finished` 事件，面板与回放都能重建进度。
 - **会话内工作台卡片 + 视频预览（dsh Web）**：每个 `anim_*` 工具调用渲染成富卡片；`anim_render` 的成片直接内嵌 `<video>` 播放（Range 拖动、下载、定位文件），`anim_preview` 的抽帧渲染成缩略图墙；转后台的任务卡片自动轮询进度条，出片后原地变成播放器。headless（无 webServer）形态下整条路由不存在，零副作用。
 - **卡片带最简交互按钮**：`anim_plan` 卡「渲染成片」、`anim_draft_scene` 卡「预览这一幕」、`anim_patch` 卡「撤销这步」。点击即把一条结构化指令（稳定前缀 `[anim-studio 面板指令]` + JSON）经宿主 `session/prompt` API 发回会话，agent 空闲则立即执行、运行中则排队；处理契约声明在 anim-studio 预设。详见[工作台面板](#工作台面板dsh-web)。
-- **旁白字幕**：`/narration/cues` 写[{ atMs, text }]（全片绝对毫秒），渲染自动出底部字幕条——字号按画布高度自适应，超宽自动折行、底条随行数增高；底部字幕带是保留区，正文图层压进来时渲染会给软警告。TTS 语音合成规划在 0.5。
+- **旁白字幕与配音**：`/narration/cues` 写[{ atMs, text }]（全片绝对毫秒），渲染自动出底部字幕条——字号按画布高度自适应，超宽自动折行、底条随行数增高；底部字幕带是保留区，正文图层压进来时渲染会给软警告。宿主配置了 TTS 命令时旁白**自动配音**（0.5.0）：逐 cue 合成语音（按内容缓存，重渲零重合成）、在 atMs 处混入成片、字幕时长跟随实测语音；回执 speechNotes 报告每条语音实测时长与溢出，时间线调整由模型用 anim_patch 决策（工具不自动改时间轴）。首发走外部命令通道（edge-tts / piper 配方见[配音配置](#配音tts)），不内置云 SDK。
 - **渲染器可替换**：渲染能力是一个标准 seam（注册表 + `provideRenderer`），想接 Remotion/Manim 就写一个 Provider 顶掉默认项，工具与事件零改动。
 - **离线分发友好**：`dsh.bundle` 声明 + esbuild 单文件构建，工作区内部包用 alias 内联、与包管理器无关，配合 offline-packager 一条命令打成自包含 tgz。
 
@@ -98,7 +98,29 @@ dsh plugin --profile web add ./dsh-animation-studio-<版本>.tgz
   name: dsh-animation-studio
   config:
     outputDir: ./.dsh/anim   # 渲染产物与中间工作目录的根，默认 ./.dsh/anim
+    # 配音（TTS，可选）：不配置则旁白只出字幕、不发声
+    tts:
+      # 命令模板（数组，逐项替换占位符后直接执行，不经 shell）：
+      # 占位符 {text} {outFile} {voice} {rate} {stdin}
+      command: ["edge-tts", "--voice", "{voice}", "--rate", "{rate}", "--text", "{text}", "--write-media", "{outFile}"]
+      voice: zh-CN-XiaoxiaoNeural   # 默认声音（cue 级 voice 可覆盖）
+      rate: "+8%"                   # 语速占位值（引擎语义各异）
+      volume: 1                     # 旁白音量 0~1
+      # voices:                     # 声音映射表：cue.voice 名 → 引擎声音
+      #   narrator: zh-CN-XiaoxiaoNeural
+      #   teacher: zh-CN-YunxiNeural
 ```
+
+#### 配音（TTS）
+
+旁白配音的架构是 Provider seam：首发实现为**外部命令通道**——上面配置的命令模板逐 cue 执行，产物按 (text, voice, rate) 缓存于 `work/<specId>/tts/`（重渲零重合成），ffprobe 实测时长后按 cue 的 `atMs` 混入成片，字幕显示时长跟随实测语音。配方：
+
+- **edge-tts**（免费，需网络）：`pip install edge-tts`，命令模板见上；声音列表 `edge-tts --list-voices | grep zh-CN`；
+- **piper**（完全离线）：`command: ["piper", "--model", "{voice}", "--output_file", "{outFile}"]`，文本走 stdin（模板含 `{stdin}` 占位时自动从 stdin 喂文本）。
+
+注意：**TTS 会把旁白文本送进配置的外部命令（可能出网）**，离线环境请用 piper 类本地引擎；cue 级 `voice` 字段可逐条换声（先经 `voices` 映射表翻译）。单条合成失败只降级为纯字幕并给警告，绝不阻塞出片；失败自动重试（默认 2 次，`tts.retries` 可调），失败/坏缓存残留文件会被清掉，服务恢复后重渲即自愈。渲染回执的 `speechNotes` 列出每条语音的实测时长与溢出毫秒——时间线要不要挪由模型用 `anim_patch` 决策，工具不会自动改时间轴。
+
+**选声音的经验（2026-09 真机教训）**：edge-tts 走的是微软 Edge 的非公开接口，服务端会阶段性掐掉部分声音——`*Multilingual*` 与多数 `en-US-*` 声音出现过整批 `NoAudioReceived`（报错像参数错了，其实声音不可用），而 `zh-CN-XiaoxiaoNeural / XiaoyiNeural / YunxiNeural / YunyangNeural` 等标准中文声音一直稳。配置后先用单条命令试一下声音再上片：`edge-tts --voice zh-CN-XiaoxiaoNeural --text "测试" --write-media test.mp3`，产物 0 字节即该声音被拒。
 
 ### 验证安装
 
@@ -153,16 +175,16 @@ cp -r config/agent-presets/anim-studio ~/.dsh/.agent-presets/anim-studio
 
 | 工具 | 作用 |
 | --- | --- |
-| `anim_diagnose` | 环境自检：后端、ffmpeg、浏览器、中文字体、宿主 jobs 服务 |
+| `anim_diagnose` | 环境自检：后端、ffmpeg、浏览器、中文字体、宿主 jobs 服务、TTS 配置 |
 | `anim_create_spec` | 新建一份时间线文档，返回 specId |
 | `anim_plan` | 记录分镜大纲 + 节奏体检 |
 | `anim_draft_scene` | 逐幕写入图层与关键帧 |
-| `anim_get` | 按 JSON Pointer 精确读取 spec 片段 |
+| `anim_get` | 读 spec：单点 / 批量 `paths` / `view:"summary"` 时间线摘要（幕起止、资产引用计数） |
 | `anim_patch` | 结构化补丁修改（唯一写途径），返回 inverse |
 | `anim_undo` | 撤销上一次修改 |
-| `anim_asset_import` | 素材登记（image/svg/audio/font 四类均接通渲染）：image/svg 用 `src="asset:<id>"` 引用；font 导入后 text/code 的 `fontFamily` 填 assetId；audio 用 audio 图层引用 |
-| `anim_preview` | 低分辨率抽帧检查效果（只渲染到最晚抽帧点，不渲整片；抽帧无音频） |
-| `anim_render` | 渲染成 MP4（段缓存默认开启，回执 `incremental` 报告命中；spec 带 audio 图层时自动混音；宿主支持时转后台任务） |
+| `anim_asset_import` | 素材登记（image/svg/audio/font/video 五类均接通渲染）：image/svg/video 用 `src="asset:<id>"` 引用；font 导入后 text/code 的 `fontFamily` 填 assetId；audio 用 audio 图层引用 |
+| `anim_preview` | 抽帧检查效果（只渲染到最晚抽帧点，抽帧无音频）；抽帧点在同一幕且段缓存命中时升级为**单幕直放**（回执 `clip` 给出原画质段视频，带音频、零渲染等待） |
+| `anim_render` | 渲染成 MP4（段缓存默认开启，回执 `incremental` 报告命中；audio 图层自动混音；配置 TTS 时旁白自动配音，`speechNotes` 报告音画对账；回执附关键帧拼贴图；宿主支持时转后台任务） |
 
 ### 不装 DSH 也能跑：样例工程
 
@@ -188,12 +210,12 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 
 ## 已知限制与说明
 
-- **图层类型**：`text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / code / math / group / audio`。要点：circle/ellipse 用 `size`（`radius` 自动换算）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头；polygon/star 由 `sides`+`size` 生成；svg 内嵌字符串；image `src` 写 `asset:<id>`；code 用 `code`+`language`（自动高亮，`{{片段}}` 着色，`props.code` 多关键帧即代码演化 morph）；math 用 `tex` 写 LaTeX；group 用 `children` 引用成员；audio 引用音频资产（渲染尾步 ffmpeg 混入成片，不进画面）。不支持的属性以警告降级，不失败。
-- **转场与缓动**：`transition.kind` 支持 `none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn`；`scene.exit`（fade/slide 系列）在幕尾整体退场；缓动另有 `bounce/elastic/back`（强调类入场）。
-- **旁白字幕**：无 TTS（规划在 0.5）。字幕字号按画布高度约 4% 自适应（与正文字号解耦），超宽自动折行；底部字幕带是保留区，建议一条 cue ≤40 字、正文图层的 y 避开字幕带（重叠时渲染给软警告）。
+- **图层类型**：`text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / code / math / group / audio / video`（15 种）。要点：circle/ellipse 用 `size`（`radius` 自动换算）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`lineDash` 虚线；polygon/star 由 `sides`+`size` 生成；svg 内嵌字符串；image/video `src` 写 `asset:<id>`；code 用 `code`+`language`（自动高亮，`{{片段}}` 着色，`props.code` 多关键帧即代码演化 morph）；math 用 `tex` 写 LaTeX；group 用 `children` 引用成员；audio 引用音频资产（渲染尾步 ffmpeg 混入成片，不进画面）；video 引用视频资产（`time`/`playbackRate`/`loop` 控制播放）。`fill` 支持渐变对象 `{type:"linear", from, to, stops:[[offset,"#色"]]}`；text 支持 `maxWidth`+`textWrap:true` 自动折行与 `props.reveal` 逐字打字机轨道。不支持的属性以警告降级，不失败。
+- **转场与缓动**：`transition.kind` 支持 `none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn`；`scene.exit`（fade/slide 系列）在幕尾整体退场；缓动另有 `bounce/elastic/back` 及各自 In/InOut 变体（强调类入场优先 out 形态）。
+- **旁白字幕**：字幕字号按画布高度约 4% 自适应（与正文字号解耦），超宽自动折行；底部字幕带是保留区，建议一条 cue ≤40 字、正文图层的 y 避开字幕带（重叠时渲染给软警告）。未配置 TTS 时旁白只出字幕（设计内形态）。
 - **字体**：font 资产导入后 text/code 图层 `fontFamily` 填 assetId 即生效；远端 http(s) 字体 URL 需要目标服务器允许跨源（CORS）。
-- **后台任务**依赖宿主把 jobs 服务暴露给插件上下文；未暴露时 `anim_render` / `anim_preview` 自动走同步路径（设计内行为），`anim_diagnose` 的 host 报告（`jobsOnCtx`）可确认当前部署的形态。
-- **媒体放行**：`/dsh-anim/media` 只放行「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg`）。
+- **后台任务**：dsh 0.1.6-alpha.2+ 的 web profile 自带 jobs 子系统，插件经「捕获子插件」拿到服务并注册署名 controller 后，`anim_render` / `anim_preview` 自动转后台任务（真机已验证）；宿主没有 jobs 或发布失败时自动走同步路径（设计内行为），`anim_diagnose` 的 host 报告（`jobsOnCtx`）可确认当前部署的形态。
+- **媒体放行**：`/dsh-anim/media` 只放行「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg/mp3/wav/ogg/m4a/flac`）。
 - **插件事件不进宿主会话日志**：宿主读回对未知事件类型 fail-closed，而宿主 `session.append` 不提供 ignorable 入口，写 anim/* 事件会毒化整个会话；事件因此只写插件 sidecar。极旧版本写入过 anim/* 事件的宿主日志，用 `python scripts/repair-session-log.py <session.v3.jsonl.zstd>` 补 ignorable 标记后仍可作恢复回退源（自动备份）。完整事故记录见 `docs/`。
 - **渲染环境**：渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI）；Edge 152+ 的新 headless 配合 SwiftShader 可完整出帧；`headless: false` 仅作调试后门（Linux 无显示时需要 Xvfb）。浏览器与 vite dev server 常驻复用（空闲 10 分钟回收）。
 - **Windows 安装**：`dsh plugin add` 在部分 Windows 环境会把 pnpm 转发给 cmd 执行；若 cmd 按 PATH 找不到 pnpm，直接在 profile 目录里 `pnpm add <插件路径>` 并把插件名写进 profile `package.json` 的 `dsh.profile.bundles` 即可。
@@ -201,4 +223,4 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 ## 文档
 
 - [`docs/设计草案.md`](docs/设计草案.md)：dsh 平台事实、AnimationSpec IR 设计、事件模型、选型与踩坑
-- [`docs/0.2.0-规划.md`](docs/0.2.0-规划.md) / [`docs/0.3.0-规划.md`](docs/0.3.0-规划.md) / [`docs/0.3.x-优化清单.md`](docs/0.3.x-优化清单.md) / [`docs/0.4.0-规划.md`](docs/0.4.0-规划.md)：各版本的范围、验收与迭代记录
+- [`docs/0.2.0-规划.md`](docs/0.2.0-规划.md) / [`docs/0.3.0-规划.md`](docs/0.3.0-规划.md) / [`docs/0.3.x-优化清单.md`](docs/0.3.x-优化清单.md) / [`docs/0.4.0-规划.md`](docs/0.4.0-规划.md) / [`docs/0.5.0-规划.md`](docs/0.5.0-规划.md)：各版本的范围、验收与迭代记录

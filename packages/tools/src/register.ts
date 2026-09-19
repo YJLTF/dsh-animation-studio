@@ -87,9 +87,15 @@ function stripUndefined<T>(value: T): T {
  * 探测宿主的 ctx.jobs 服务（结构探测：宿主侧类型不在本包的类型面上）。
  * 没有该服务时渲染类工具自动走同步路径，行为与 0.1.x 一致。
  */
-function probeJobs(ctx: Context): AnimJobsService | undefined {
-  const jobs = probe(ctx, 'jobs') as { start?: unknown } | undefined
-  return jobs && typeof jobs.start === 'function' ? (jobs as AnimJobsService) : undefined
+function probeJobs(ctx: Context, jobsBox?: { value?: unknown }): AnimJobsService | undefined {
+  // 捕获盒优先：cordis 按 inject 许可属性访问，主插件上下文直接读 ctx.jobs
+  // 会因未声明而抛错（吞错后恒 undefined）——真机 jobsOnCtx=false 的根因。
+  const candidates = [jobsBox?.value, probe(ctx, 'jobs')]
+  for (const jobs of candidates) {
+    const j = jobs as { start?: unknown } | undefined
+    if (j && typeof j.start === 'function') return j as AnimJobsService
+  }
+  return undefined
 }
 
 /**
@@ -208,6 +214,7 @@ function hostServiceReport(
   ctx: Context,
   exec: { agent?: unknown },
   sessionsDir: string | undefined,
+  jobsBox?: { value?: unknown },
 ): Record<string, unknown> {
   const read = (obj: unknown, key: string): unknown => {
     try {
@@ -216,7 +223,11 @@ function hostServiceReport(
       return undefined
     }
   }
-  const jobs = read(ctx, 'jobs')
+  // jobs 走捕获盒优先（0.5.0 §2.1）：主插件上下文未经 inject 许可读不到它，
+  // 捕获子插件拿到后在 box 里；两处都探，谁有用谁
+  const jobs = [jobsBox?.value, read(ctx, 'jobs')].find(
+    (j): j is { start?: unknown } => typeof (j as { start?: unknown } | undefined)?.start === 'function',
+  )
   const session = read(ctx, 'session')
   const sessions = read(ctx, 'sessions')
   const agentSession = read(read(exec, 'agent'), 'session') as { id?: unknown }
@@ -227,7 +238,7 @@ function hostServiceReport(
     sessionOnCtx: typeof (session as { append?: unknown } | undefined)?.append === 'function',
     sessionsRegistryOnCtx: typeof (sessions as { get?: unknown } | undefined)?.get === 'function',
     // 后台渲染链路：jobsOnCtx 为 false 时渲染一律走同步回退
-    jobsOnCtx: typeof (jobs as { start?: unknown } | undefined)?.start === 'function',
+    jobsOnCtx: jobs !== undefined,
   }
 }
 
@@ -250,6 +261,11 @@ export interface RegisterOptions {
   tracker?: { observe(event: AnimEvent): void }
   /** 产物媒体索引：工具回执里出现过的文件路径才可被 /dsh-anim/media 服务。 */
   media?: { add(path: string): void }
+  /**
+   * jobs 服务捕获盒（0.5.0 §2.1）：宿主有 jobs 时由捕获子插件异步填入。
+   * 按引用读——捕获时机可能晚于注册，但一定早于第一次真正的渲染调用。
+   */
+  jobsBox?: { value?: unknown }
 }
 
 /**
@@ -334,7 +350,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       presentCall: () => ({ card: 'generic', title: '检查渲染环境', kind: 'read' }),
       async execute(args, exec) {
         const result = await opDiagnose(deps, args)
-        return { ...result, host: hostServiceReport(ctx, exec, sessionsDir) } as never
+        return { ...result, host: hostServiceReport(ctx, exec, sessionsDir, options.jobsBox) } as never
       },
     }),
   )
@@ -434,13 +450,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + '三条高频错误，写之前先自查：① ease 一律写对象 {"kind":"easeInOut"}，不能直接写 "easeInOut" 字符串；'
             + '② 每个图层必填五字段 id/name/type/props/tracks，一个都不能少（漏 name/tracks 工具会自动补并在回执 repairs 里回报，漏 props/type 则直接报错）；'
             + '③ type 名全小写。'
-            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group | audio。'
+            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group | audio | video。'
             + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size。'
-            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）；'
+            + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）、lineDash 虚线样式（如 [8,6]，rect 也支持）；'
             + 'arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
             + 'polygon 用 sides（边数）+ size（正多边形）；star 用 size + sides（角数，默认 5），形状自动生成。'
-            + 'text 支持 textAlign（left/center/right）。'
-            + 'svg 用 svg 内嵌 SVG 字符串。image 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材。'
+            + 'text 支持 textAlign（left/center/right）；长段落写 maxWidth + textWrap:true（超宽自动折行；textWrap 值为字符串 "pre" 时只认显式换行）；'
+            + '逐字打字机：text 图层的 props.reveal 轨道写 0→1 关键帧，文本按进度逐字浮现（旁白配音的标配）。'
+            + 'fill 可以是纯色字符串或渐变对象 {type:"linear", from:[x,y], to:[x,y], stops:[[0,"#色"],[1,"#色"]]}（radial 用 fromRadius/toRadius；坐标是图层本地坐标，中心原点）。'
+            + 'svg 用 svg 内嵌 SVG 字符串。image/video 的 src 可写 asset:<assetId> 引用 anim_asset_import 登记的素材（video 资产 kind 为 video，mp4/webm/mov）。'
             + 'code 用 code（代码内容）+ language（typescript/ts/tsx/javascript/js/jsx/python/py/json/html/css，自动语法高亮；`{{片段}}` 可给片段着色，字符串里的 `{{` 需写 `\\{{` 转义）+ fontSize/fill。'
             + '代码演化动画：code 图层的 props.code 轨道写多个字符串关键帧（atMs 递增），帧间自动生成逐词 diff morph——分步讲解代码的首选写法（其他图层的字符串关键帧仍是离散跳变）。'
             + 'math 用 tex 写 LaTeX 公式（如 "x = \\\\frac{-b \\\\pm \\\\sqrt{b^2-4ac}}{2a}"）。'
@@ -448,9 +466,10 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + 'audio 用 src:"asset:<assetId>" 引用音频资产，props 可带 volume（0~1）、loop、atMs（相对本幕开头的偏移毫秒）、stop（"sceneEnd"|"specEnd"，默认 sceneEnd）；'
             + 'audio 不进画面，成片渲染时自动混音（回执 audioTracks 列出；anim_preview 抽帧无音频）。'
             + '全片 BGM 的标准写法：第一幕放 audio 图层，loop:true + stop:"specEnd"。'
+            + 'video 用 src:"asset:<assetId>" 引用视频资产，props 可带 time（源内起点秒）、playbackRate、loop、width/height；嵌入实拍片段用。'
             + 'transition 可选 none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn；'
             + 'scene.exit 同形（fade/slide 系列）在幕尾整体退场，占用本幕最后 exit.durationMs。'
-            + '缓动除 linear/easeIn/easeOut/easeInOut/cubicBezier/spring 外还有 bounce（弹跳落定）/elastic（弹性超调）/back（回勾起手），强调类入场优先用这三个。'
+            + '缓动除 linear/easeIn/easeOut/easeInOut/cubicBezier/spring 外还有 bounce（弹跳落定）/elastic（弹性超调）/back（回勾起手）及各自的 In/InOut 变体（如 bounceIn/backInOut），强调类入场优先用 out 形态。'
             + '所有时间都是场景内绝对毫秒。坐标系：props.x/y 的原点在画布中心（x 右正、y 下正），画布左上角是 (-宽/2, -高/2)——不是 web 的左上角原点，居中就是 x=0,y=0；'
             + 'rotation 单位是度、正值顺时针；scale 1 = 原始大小。返回的 warnings 要逐条处理（尤其「疑似左上角原点」与缺尺寸/缺描边兜底），改完再写下一幕。',
         },
@@ -489,10 +508,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_get',
       description:
-        '读取 spec 的片段。整份 spec 通常太长，优先用 JSON Pointer 精确读取，如 /scenes/1/layers/0；省略 path 返回整份（会被截断）。',
+        '读取 spec 的片段或时间线摘要。整份 spec 通常太长，优先用 JSON Pointer 精确读取，如 /scenes/1/layers/0；' +
+        'paths 可一次批量读取多段（单段找不到只在该段报 error，不影响其他段）；' +
+        'view:"summary" 返回时间线摘要（各幕起止/图层规模/音频图层/资产引用计数），做节奏复查或删资产前查引用用它；' +
+        '省略 path/paths/view 返回整份（会被截断）。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         path: { type: 'string', description: 'JSON Pointer，如 /scenes/0/layers/1/tracks/0' },
+        paths: { type: 'array', description: '批量读取：JSON Pointer 数组，一次取多段', items: { type: 'string' } },
+        view: { type: 'string', description: 'summary = 返回时间线摘要而非 spec 片段' },
       },
       output: {
         schema: { type: 'object', additionalProperties: true },
@@ -502,10 +526,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
           ({
             specId: (value as { specId?: unknown }).specId,
             path: (value as { path?: unknown }).path,
+            view: (value as { view?: unknown }).view,
             durationMs: (value as { durationMs?: unknown }).durationMs,
           }) as never,
       },
-      presentCall: args => ({ card: 'generic', title: `读取 ${args.specId}${args.path ?? ''}`, kind: 'read' }),
+      presentCall: args => ({
+        card: 'generic',
+        title: `读取 ${args.specId}${args.view === 'summary' ? '（摘要）' : args.path ?? ''}`,
+        kind: 'read',
+      }),
       execute: args => Promise.resolve(opGet(deps, args) as never),
     }),
   )
@@ -572,15 +601,16 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     defineTool({
       name: 'anim_asset_import',
       description:
-        '登记一份素材（图片/svg/音频/字体）进 spec 的 assets，返回 assetId。'
+        '登记一份素材（图片/svg/音频/字体/视频）进 spec 的 assets，返回 assetId。'
         + '本地文件会被复制进插件资产目录，http URL 原样登记。素材是共享资源：一次导入，多个图层可用。'
-        + '四类都已接通渲染：image/svg 在图层 props 里用 src="asset:<assetId>" 引用；'
+        + '五类都已接通渲染：image/svg 在图层 props 里用 src="asset:<assetId>" 引用；'
         + 'font 导入后 text/code 图层的 fontFamily 直接填 assetId 即生效；'
-        + 'audio 用 audio 图层的 src="asset:<assetId>" 引用（volume/loop/stop 控制播放）。',
+        + 'audio 用 audio 图层的 src="asset:<assetId>" 引用（volume/loop/stop 控制播放）；'
+        + 'video 用 video 图层的 src="asset:<assetId>" 引用（time/playbackRate/loop 控制播放）。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         assetId: { type: 'string', required: true, description: '资产标识（字母/数字/._-），如 gradient-icon' },
-        kind: { type: 'string', required: true, description: '资产类型：image / svg / audio / font' },
+        kind: { type: 'string', required: true, description: '资产类型：image / svg / audio / font / video' },
         src: { type: 'string', required: true, description: '本地文件路径（任意位置，会被复制）或 http(s) URL' },
         alt: { type: 'string', description: '可读说明' },
       },
@@ -605,6 +635,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       description:
         '渲染若干预览帧（降分辨率）用来检查效果。传入关键时间点（毫秒）抽查，不要整片预览——慢且没必要。'
         + '注意：预览帧无音频（音频只在成片渲染尾步混入），画面效果与成片一致。'
+        + '抽帧点全部落在同一幕、且该幕已有渲染段缓存（anim_render 留下的）时自动升级为单幕直放：回执 clip 给出段视频，原画质带音频，零渲染等待。'
         + '宿主支持后台任务时立即返回 jobId，帧清单用 job_output 收集；否则同步等待到出帧。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
@@ -620,12 +651,13 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       },
       presentCall: args => ({ card: 'terminal', title: `anim preview ${args.specId}` }),
       presentResult: (_args, result) => {
-        // 纯函数：从回执里区分「已转后台」与「同步出帧」两种回执
+        // 纯函数：从回执里区分「已转后台」「单幕直放」「同步出帧」三种回执
         let title = '预览帧就绪'
         try {
           const first = result.content[0] as { text?: string } | undefined
-          const parsed = typeof first?.text === 'string' ? (JSON.parse(first.text) as { kind?: string }) : undefined
+          const parsed = typeof first?.text === 'string' ? (JSON.parse(first.text) as { kind?: string; clip?: unknown }) : undefined
           if (parsed?.kind === 'background') title = '预览已转后台任务'
+          else if (parsed?.clip !== undefined) title = '单幕直放（段缓存命中）'
         } catch {
           /* 解析不出就维持默认标题 */
         }
@@ -633,7 +665,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       },
       async execute(args, exec) {
         const owner = (exec as { agent?: unknown }).agent
-        return (await opPreview(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
+        return (await opPreview(deps, args, exec.signal, emitFor(exec), probeJobs(ctx, options.jobsBox), owner)) as never
       },
     }),
   )
@@ -648,6 +680,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         + '段缓存默认开启：没改过的幕直接复用上次渲染结果，只重渲变更幕（回执 incremental 报告命中数）；'
         + '怀疑缓存产物有问题时传 cache:false 强制全量重渲。'
         + 'spec 带 audio 图层时自动混音，回执 audioTracks 列出已混入的音轨。'
+        + 'spec 写了 narration.cues 且宿主配置了 TTS 命令时自动配音：cue 在 atMs 处发声、字幕跟随语音时长，'
+        + '回执 speechNotes 报告每条语音的实测时长与溢出（溢出时用 anim_patch 挪时间轴，工具不会自动改）；'
+        + '未配置 TTS 时旁白只出字幕（设计内形态，anim_diagnose 的 tts 报告可确认）。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
         + '否则同步等待到出片为止。',
       parameters: {
@@ -679,7 +714,7 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       },
       async execute(args, exec) {
         const owner = (exec as { agent?: unknown }).agent
-        return (await opRender(deps, args, exec.signal, emitFor(exec), probeJobs(ctx), owner)) as never
+        return (await opRender(deps, args, exec.signal, emitFor(exec), probeJobs(ctx, options.jobsBox), owner)) as never
       },
     }),
   )

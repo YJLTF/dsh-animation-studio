@@ -24,7 +24,7 @@ export type ValidateResult =
 
 // 权威枚举在 types.ts（LAYER_TYPES 常量），这里只派生放行集合，不再手抄一份
 const LAYER_TYPE_SET: ReadonlySet<string> = new Set<string>(LAYER_TYPES)
-const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring', 'bounce', 'elastic', 'back'])
+const EASE_KINDS: ReadonlySet<string> = new Set(['linear', 'easeIn', 'easeOut', 'easeInOut', 'cubicBezier', 'spring', 'bounce', 'elastic', 'back', 'bounceIn', 'bounceInOut', 'elasticIn', 'elasticInOut', 'backIn', 'backInOut'])
 // 转场 kind：入场全集；退场（Scene.exit）不支持 zoomIn（那是进入画面的形态）
 const TRANSITION_KINDS: ReadonlySet<string> = new Set(['none', 'fade', 'slideLeft', 'slideUp', 'slideRight', 'slideDown', 'zoomIn'])
 const EXIT_KINDS: ReadonlySet<string> = new Set(['none', 'fade', 'slideLeft', 'slideUp', 'slideRight', 'slideDown'])
@@ -214,6 +214,38 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
       c.warn(`图层 ${String(l.id)}（svg）未提供 svg 内容（props.svg 内嵌 SVG 字符串），渲染为空`)
     }
   }
+  // 渐变填充的形态体检（0.5.0 规划 §4.2）：fill 可以是字符串或渐变描述对象。
+  // 描述对象的错误形态（缺 stops、type 拼错）在写库时说，比渲染时黑块/警告强。
+  if (props && isRecord(props.fill)) {
+    const g = props.fill
+    const gtype = g.type
+    if (gtype !== 'linear' && gtype !== 'radial' && gtype !== 'conic') {
+      c.fail(`${p}/props/fill/type`, `渐变 type 应为 "linear" / "radial" / "conic"，实际为 ${JSON.stringify(gtype)}`)
+    }
+    if (!Array.isArray(g.stops) || g.stops.length < 2) {
+      c.fail(`${p}/props/fill/stops`, '渐变 stops 需要 >= 2 个 [offset, color]（offset 为 0~1）')
+    } else {
+      g.stops.forEach((st, i) => {
+        if (!Array.isArray(st) || st.length !== 2 || !isFiniteNumber(st[0]) || typeof st[1] !== 'string') {
+          c.fail(`${p}/props/fill/stops/${i}`, 'stop 应为 [offset(0~1), "#rgb"] 元组，如 [0.5, "#4C9AFF"]')
+        }
+      })
+    }
+    if (gtype === 'linear' && g.to === undefined && g.angle === undefined && g.from === undefined) {
+      c.warn(`图层 ${String(l.id)} 的 linear 渐变未提供 from/to 或 angle，渲染时按默认方向处理`)
+    }
+  }
+  if (l.type === 'video' && props) {
+    if (typeof props.src !== 'string' || (props.src as string).trim() === '') {
+      c.warn(`图层 ${String(l.id)}（video）未提供 src（用 "asset:<assetId>" 引用 anim_asset_import 导入的视频资产），渲染为空`)
+    }
+    if (props.playbackRate !== undefined && (!isFiniteNumber(props.playbackRate) || props.playbackRate <= 0)) {
+      c.fail(`${p}/props/playbackRate`, 'video 的 playbackRate 应为 > 0 的数字')
+    }
+    if (props.time !== undefined && (!isFiniteNumber(props.time) || props.time < 0)) {
+      c.fail(`${p}/props/time`, 'video 的 time（源内起点，秒）应为 >= 0 的数字')
+    }
+  }
   if (l.type === 'code' && props) {
     if (typeof props.code !== 'string' || props.code.trim() === '') {
       c.warn(`图层 ${String(l.id)}（code）未提供代码内容（props.code），渲染为空`)
@@ -241,8 +273,8 @@ function validateAsset(c: Collector, path: string, a: unknown): void {
     c.fail(path, '资产应为对象')
     return
   }
-  if (!['image', 'audio', 'font', 'svg'].includes(a.kind as string)) {
-    c.fail(`${path}/kind`, '资产类型应为 image / audio / font / svg')
+  if (!['image', 'audio', 'font', 'svg', 'video'].includes(a.kind as string)) {
+    c.fail(`${path}/kind`, '资产类型应为 image / audio / font / svg / video')
   }
   c.str(path, a, 'src')
 }
@@ -256,6 +288,14 @@ function validateScene(c: Collector, path: string, s: unknown, index: number): v
   c.str(p, s, 'id')
   c.str(p, s, 'name')
   c.num(p, s, 'durationMs', { min: 1 })
+  // 秒-毫秒量级混淆的软警告（0.5.0 规划 §3.4）：IR 全部时间都是毫秒，而
+  // 「durationMs: 3」这种值几乎必然是把「3 秒」直接写了进来——30fps 下不足
+  // 一帧，渲染端会静默按 0 帧处理，「这一幕凭空消失」。宁可在写库时多说一句。
+  if (isFiniteNumber(s.durationMs) && s.durationMs < 34) {
+    c.warn(
+      `场景 ${JSON.stringify(String(s.id))} 的 durationMs=${s.durationMs} 短于一帧（30fps 下约 33ms），疑似把秒写成了毫秒（3 秒应写 3000）。若确要亚帧时长可忽略本提示`,
+    )
+  }
   if (!Array.isArray(s.layers)) {
     c.fail(`${p}/layers`, 'layers 应为数组')
   } else {
