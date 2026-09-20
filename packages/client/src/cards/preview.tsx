@@ -1,41 +1,51 @@
 /**
  * anim_preview 卡片：抽帧缩略图（0.4.0 §5.4 自 cards.tsx 纯移动；§5.3 起
- * 同步回执直接展示，后台票据复用 BackgroundTicket 的「落定停表 + 不可达
- * 退避」轮询模式）。
+ * 同步回执直接展示，后台票据复用共享轮询 hook）。
+ *
+ * 0.6.0 §6.2：缩略图点开为卡内灯箱（放大/翻页/Esc 关闭），不再打断会话流跳
+ * 新标签；后台票据轮询收敛到 useJobPolling，运行中可点「终止任务」。
  */
 
 import type { ReactNode } from 'react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
-import { fetchRenderStatus, formatMs, isSettled, list, mediaUrl, num, readArgs, readReceipt, str, strings, type Receipt, type RenderStatus, type ToolViewProps } from '../protocol.ts'
-import { Card, Fallback, RenderWarnings } from './primitives.tsx'
+import { formatMs, isSettled, killJobInstruction, list, mediaUrl, num, readArgs, readReceipt, str, strings, type Receipt, type ToolViewProps } from '../protocol.ts'
+import { PanelActions } from './actions.tsx'
+import { Card, Fallback, Lightbox, RenderWarnings } from './primitives.tsx'
 import { caption, figure, thumb, thumbs, videoBox } from './styles.ts'
+import { useJobPolling } from './useJobPolling.ts'
 
-/** 帧清单网格：同步回执与后台票据完成态共用一份 DOM。 */
+/** 帧清单网格：同步回执与后台票据完成态共用一份 DOM；点图开灯箱。 */
 function FrameGrid(props: { frames: Receipt[] }): ReactNode {
+  const [open, setOpen] = useState<number | null>(null)
+  const items = props.frames.map(frame => ({
+    src: mediaUrl(frame.path as string),
+    caption: str(frame, 'atMs') !== undefined ? `${formatMs(num(frame, 'atMs'))} 处画面` : '预览帧',
+  }))
   return (
-    <div style={thumbs}>
-      {props.frames.map((frame, i) => {
-        const path = frame.path as string
-        return (
-          <figure key={i} style={figure} title={path}>
-            {/* 路由不可达/文件被清理时隐藏图块，保留时间标注；点图在新标签看原帧 */}
-            <a href={mediaUrl(path)} target="_blank" rel="noreferrer">
+    <>
+      <div style={thumbs}>
+        {props.frames.map((frame, i) => {
+          const path = frame.path as string
+          return (
+            <figure key={i} style={figure} title={path}>
               <img
                 style={thumb}
                 src={mediaUrl(path)}
                 alt={str(frame, 'atMs') !== undefined ? `${formatMs(num(frame, 'atMs'))} 处画面` : '预览帧'}
                 loading="lazy"
+                onClick={() => setOpen(i)}
                 onError={event => {
                   ;(event.currentTarget as HTMLImageElement).style.visibility = 'hidden'
                 }}
               />
-            </a>
-            <figcaption style={caption}>{formatMs(num(frame, 'atMs'))}</figcaption>
-          </figure>
-        )
-      })}
-    </div>
+              <figcaption style={caption}>{formatMs(num(frame, 'atMs'))}</figcaption>
+            </figure>
+          )
+        })}
+      </div>
+      <Lightbox items={items} index={open} onClose={() => setOpen(null)} onNavigate={setOpen} />
+    </>
   )
 }
 
@@ -57,55 +67,12 @@ function ClipPanel(props: { clip: Receipt; specId?: string }): ReactNode {
   )
 }
 
-/** anim_preview 的后台票据：轮询 /dsh-anim/api/state 直到帧清单落定（§5.3）。 */
+/** anim_preview 的后台票据：共享轮询 hook，落定渲染结果，运行中可终止。 */
 function PreviewTicket(props: { receipt: Receipt }): ReactNode {
   const jobId = str(props.receipt, 'jobId')
   const specId = str(props.receipt, 'specId')
-  const [status, setStatus] = useState<RenderStatus | null>(null)
-  const [unreachable, setUnreachable] = useState(false)
-
-  useEffect(() => {
-    if (!jobId) return
-    const id: string = jobId
-    let alive = true
-    let timer: ReturnType<typeof setInterval> | undefined = setInterval(tick, 2000)
-    let misses = 0
-    // 与渲染票据同一纪律：落定即停表，连续不可达退避到 10s
-    async function tick(): Promise<void> {
-      try {
-        const job = await fetchRenderStatus(id)
-        if (!alive) return
-        setUnreachable(job === null)
-        if (job === null) {
-          misses += 1
-          if (misses === 3 && timer) {
-            clearInterval(timer)
-            timer = setInterval(tick, 10_000)
-          }
-          return
-        }
-        misses = 0
-        setStatus(job)
-        if (job.status !== 'running' && timer) {
-          clearInterval(timer)
-          timer = undefined
-        }
-      } catch {
-        if (!alive) return
-        setUnreachable(true)
-        misses += 1
-        if (misses === 3 && timer) {
-          clearInterval(timer)
-          timer = setInterval(tick, 10_000)
-        }
-      }
-    }
-    void tick()
-    return () => {
-      alive = false
-      if (timer) clearInterval(timer)
-    }
-  }, [jobId])
+  const sessionId = str(props.receipt, 'sessionId')
+  const { status, unreachable } = useJobPolling(jobId)
 
   if (status !== null && status.status === 'completed') {
     const frames = list(status as unknown as Receipt, 'frames')
@@ -133,6 +100,10 @@ function PreviewTicket(props: { receipt: Receipt }): ReactNode {
   return (
     <Card title={`抽帧预览中${specId ? `：${specId}` : ''}`}>
       <div style={{ ...caption }}>后台抽帧进行中…</div>
+      <PanelActions
+        sessionId={sessionId}
+        actions={jobId !== undefined && specId !== undefined ? [{ label: '终止任务', instruction: killJobInstruction(specId, jobId) }] : []}
+      />
       {unreachable && <div style={caption}>工作台服务不可达（可能由宿主重启）。结果可用 job_output 收集。</div>}
     </Card>
   )

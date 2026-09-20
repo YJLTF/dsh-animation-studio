@@ -1443,6 +1443,23 @@ await checkA('/dsh-anim 内核：渲染任务簿 + 状态 API + 媒体放行', a
   assert.equal(state.specs[0]?.renders[0]?.percent, 50)
   assert.equal(state.renders.length, 1)
 
+  // /api/job（0.6.0 §6.4）：单任务查询命中与 404；state 的 spec 带 lastRender 投影
+  const jobRes = await kernel({ method: 'GET', url: '/dsh-anim/api/job?id=anim-render-1', headers: {} })
+  assert.equal(jobRes.status, 200)
+  const job = (JSON.parse((await drain(jobRes)).toString('utf8')) as { job: { jobId: string; status: string } }).job
+  assert.equal(job.jobId, 'anim-render-1')
+  assert.equal(job.status, 'completed')
+  assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/api/job?id=nope', headers: {} })).status, 404)
+  assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/api/job', headers: {} })).status, 404)
+
+  // /dsh-anim/ 总览页（0.6.0 §6.1）：HTML 直接可服务，含标题与挂载点
+  const page = await kernel({ method: 'GET', url: '/dsh-anim/', headers: {} })
+  assert.equal(page.status, 200)
+  assert.match(page.headers['content-type'] ?? '', /text\/html/)
+  const pageHtml = (await drain(page)).toString('utf8')
+  assert.match(pageHtml, /动画工作台/)
+  assert.match(pageHtml, /\/dsh-anim\/api\/state/, '页面轮询 state 端点')
+
   // /api/spec：整份 spec 可读；未知 id 404
   const specRes = await kernel({ method: 'GET', url: '/dsh-anim/api/spec?id=webdemo', headers: {} })
   assert.equal(specRes.status, 200)

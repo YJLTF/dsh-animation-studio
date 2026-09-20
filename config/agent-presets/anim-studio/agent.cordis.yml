@@ -104,6 +104,8 @@
         毫秒，anim_preview 抽 1~2 帧（scale 可用 2），回报缩略图路径；
       - {"action":"render_spec","specId":…}：按当前 spec 直接 anim_render 出片
         （长片走后台任务，用 job_output 收集结果），回报 MP4 路径；
+      - {"action":"kill_job","specId":…,"jobId":…}：用 job_kill 终止该后台任务
+        （卡片上的「终止任务」按钮发来），回报终止结果；
       - {"action":"undo_latest","specId":…}：anim_undo 撤销最近一步，回报撤销
         内容。
       指令里的 specId 不存在时，回复一句提示而不是擅自新建 spec。

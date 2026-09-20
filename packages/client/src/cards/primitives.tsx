@@ -6,10 +6,11 @@
  * 的分级呈现；VideoPanel 是成片播放器；ProgressBar 是后台任务进度条。
  */
 
-import type { ReactNode } from 'react'
+import type { ReactNode, Ref } from 'react'
+import { useEffect, useState } from 'react'
 
 import { formatMs, isSettled, mediaUrl, num, readArgs, str, type Receipt, type ToolViewProps } from '../protocol.ts'
-import { badge, headRow, link, linkRow, muted, progressBarInner, progressBarOuter, preBox, row, titleStyle, videoBox, warnBox, card } from './styles.ts'
+import { badge, caption, headRow, link, linkRow, muted, progressBarInner, progressBarOuter, preBox, row, thumbLightbox, titleStyle, videoBox, warnBox, card } from './styles.ts'
 
 export function Card(props: { title: string; children?: ReactNode }): ReactNode {
   return (
@@ -109,27 +110,100 @@ export function IncrementalNotes(props: { receipt: Receipt }): ReactNode {
 }
 
 /**
- * 全片关键帧拼贴图（0.5.0 规划 §3.3）：渲染回执自带的 contact sheet，
- * 用户一键看全片概览；点图在新标签看原分辨率。加载失败整块隐藏。
+ * 全片关键帧拼贴图（0.5.0 规划 §3.3）：渲染回执自带的 contact sheet，用户
+ * 一键看全片概览。0.6.0 起支持点帧跳转：拼贴图是 ffmpeg tile 4×2 均匀采样，
+ * 点击落在第 i 格（行优先）即把视频 seek 到 (i+0.5)/8 处——点哪格看哪段画面。
+ * 未提供 onSeek（或加载失败）时点图在新标签看原图。
  */
-export function ContactSheet(props: { path: string }): ReactNode {
+export function ContactSheet(props: { path: string; onSeek?: (fraction: number) => void }): ReactNode {
+  const [failed, setFailed] = useState(false)
+  if (failed) return null
+  const handleClick = (event: React.MouseEvent<HTMLImageElement>): void => {
+    if (!props.onSeek) {
+      window.open(mediaUrl(props.path), '_blank', 'noreferrer')
+      return
+    }
+    const rect = event.currentTarget.getBoundingClientRect()
+    const col = Math.min(3, Math.max(0, Math.floor(((event.clientX - rect.left) / rect.width) * 4)))
+    const row = Math.min(1, Math.max(0, Math.floor(((event.clientY - rect.top) / rect.height) * 2)))
+    props.onSeek((row * 4 + col + 0.5) / 8)
+  }
   return (
-    <a href={mediaUrl(props.path)} target="_blank" rel="noreferrer" title="查看拼贴原图">
+    <figure style={{ margin: 0 }}>
       <img
-        style={{ width: '100%', borderRadius: 4, display: 'block' }}
+        style={{ width: '100%', borderRadius: 4, display: 'block', cursor: props.onSeek ? 'pointer' : 'zoom-in' }}
         src={mediaUrl(props.path)}
         alt="全片关键帧拼贴"
         loading="lazy"
-        onError={event => {
-          ;(event.currentTarget as HTMLImageElement).style.display = 'none'
-        }}
+        title={props.onSeek ? '点击某一格，视频跳到对应画面' : '查看拼贴原图'}
+        onClick={handleClick}
+        onError={() => setFailed(true)}
       />
-    </a>
+      {props.onSeek && <figcaption style={caption}>点击拼贴图的某一格，上方视频跳到对应画面</figcaption>}
+    </figure>
   )
 }
 
-/** 成片播放器 + 元信息 + 打开方式。 */
-export function VideoPanel(props: { path: string; meta: Receipt; openFile?: ToolViewProps['openFile'] }): ReactNode {
+/**
+ * 缩略图灯箱（0.6.0 规划 §6.2）：点缩略图在卡内模态放大——此前只能跳新标签，
+ * 会话流的上下文被打断；灯箱内左右翻页、Esc/点背景关闭。
+ */
+export function Lightbox(props: {
+  items: Array<{ src: string; caption?: string }>
+  index: number | null
+  onClose: () => void
+  onNavigate: (index: number) => void
+}): ReactNode {
+  useEffect(() => {
+    if (props.index === null) return
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') props.onClose()
+      if (event.key === 'ArrowRight' && props.index !== null) props.onNavigate(Math.min(props.items.length - 1, props.index + 1))
+      if (event.key === 'ArrowLeft' && props.index !== null) props.onNavigate(Math.max(0, props.index - 1))
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+  if (props.index === null || props.items.length === 0) return null
+  const bounded = Math.min(props.index, props.items.length - 1)
+  const item = props.items[bounded]!
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.82)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 10,
+      }}
+      onClick={props.onClose}
+    >
+      <img
+        style={{ maxWidth: '92vw', maxHeight: '84vh', borderRadius: 6 }}
+        src={item.src}
+        alt={item.caption ?? '预览帧'}
+        onClick={event => event.stopPropagation()}
+      />
+      <div style={{ ...caption, color: '#e8eaed' }} onClick={event => event.stopPropagation()}>
+        {item.caption ?? ''}
+        {props.items.length > 1 && (
+          <>
+            <button style={{ ...link, color: '#8ec2ff', marginLeft: 14 }} type="button" onClick={event => { event.stopPropagation(); props.onNavigate(Math.max(0, bounded - 1)) }}>
+              ← 上一帧
+            </button>
+            <span style={{ margin: '0 8px' }}>{bounded + 1} / {props.items.length}</span>
+            <button style={{ ...link, color: '#8ec2ff' }} type="button" onClick={event => { event.stopPropagation(); props.onNavigate(Math.min(props.items.length - 1, bounded + 1)) }}>
+              下一帧 →
+            </button>
+          </>
+        )}
+        <button style={{ ...link, color: '#8ec2ff', marginLeft: 14 }} type="button" onClick={props.onClose}>
+          关闭（Esc）
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** 成片播放器 + 元信息 + 打开方式。videoRef 供拼贴图点帧 seek 用（0.6.0 §6.2）。 */
+export function VideoPanel(props: { path: string; meta: Receipt; openFile?: ToolViewProps['openFile']; videoRef?: Ref<HTMLVideoElement> }): ReactNode {
   const meta = props.meta
   const dims =
     num(meta, 'width') !== undefined && num(meta, 'height') !== undefined
@@ -138,7 +212,7 @@ export function VideoPanel(props: { path: string; meta: Receipt; openFile?: Tool
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       {/* dsh 不支持视频预览——工作台面板是片子的唯一出口 */}
-      <video style={videoBox} controls preload="metadata" src={mediaUrl(props.path)} />
+      <video style={videoBox} controls preload="metadata" src={mediaUrl(props.path)} ref={props.videoRef} />
       <div style={row}>
         {dims !== undefined && <span style={muted}>{dims}</span>}
         {num(meta, 'frameCount') !== undefined && <span style={muted}>{num(meta, 'frameCount')} 帧</span>}
