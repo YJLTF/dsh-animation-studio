@@ -51,7 +51,7 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
+import { AnimOpError, coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
@@ -1025,7 +1025,8 @@ await checkA('opRender: scenes 切片默认落 solo 路径，绝不覆盖正片�
   const sliced = await opRender(deps, { specId: 'gd', scenes: [0] }, new AbortController().signal, emit)
   assert.match(sliced.outputPath, /gd-solo-0\.mp4$/, '切片渲染默认落 solo 路径')
   assert.ok(!sliced.outputPath.endsWith('gd.mp4'), '不得写正片路径')
-  const explicit = await opRender(deps, { specId: 'gd', scenes: [1], outputPath: '.tmp/xyz.mp4' }, new AbortController().signal, emit)
+  // 显式 outputPath 由调用者决定（0.6.0 起越界 scenes 在预检即被拒绝，夹具用合法下标）
+  const explicit = await opRender(deps, { specId: 'gd', scenes: [0], outputPath: '.tmp/xyz.mp4' }, new AbortController().signal, emit)
   assert.match(explicit.outputPath, /xyz\.mp4$/, '显式 outputPath 由调用者决定')
   assert.deepEqual(paths, [sliced.outputPath, explicit.outputPath], '渲染器拿到的就是解析后的路径')
 })
@@ -1061,7 +1062,7 @@ await checkA('sliceSpeechForScenes: 语音轨按选中幕过滤并平移到切�
   assert.equal(cross.tracks[0]?.durationMs, 2500, '尾巴裁到窗口右缘（4000 − 1500）')
 })
 
-await checkA('opPreview: 同参重复发起护栏——第 3 次起票据给纠正指引（真机 turn 17 回归）', async () => {
+await checkA('opPreview: 同参重复发起护栏——第 3 次软提示、第 6 次硬拒绝、version 重置（0.6.0 §3.3）', async () => {
   const previewImpl: AnimRenderer['preview'] = async () => ({
     frames: [{ atMs: 700, path: 'f.png', width: 1, height: 1 }],
     renderer: 'fake',
@@ -1082,8 +1083,135 @@ await checkA('opPreview: 同参重复发起护栏——第 3 次起票据给纠�
   assert.ok(!t1.next.includes('连续发起') && !t2.next.includes('连续发起'), '前两次不打扰')
   assert.match(t3.next, /连续发起 3 次/, '第三次起给出纠正指引')
   assert.match(t3.next, /job_output/, '指引指向正确姿势')
+  // 签名归一化：999ms 与 700ms 秒级量化后同签名——「挪一点参数」不再绕过计数
   const t4 = (await opPreview(deps, { specId: 'guard-spec', atMs: [999] }, new AbortController().signal, emit, jobs)) as { next: string }
-  assert.ok(!t4.next.includes('连续发起'), '不同参数独立计数')
+  assert.match(t4.next, /连续发起/, '量化后同签名继续计数（旧版此处被换参绕过）')
+  // version 重置：patch 过的 spec 计数清零——正当的修改-复查循环豁免
+  deps.store.patch('guard-spec', [{ op: 'replace', path: '/scenes/0/durationMs', value: 2600 }], '修改后复查')
+  const t5 = (await call()) as { next: string }
+  assert.ok(!t5.next.includes('连续发起'), 'patch 后计数重置')
+  // 硬拒绝：patch 重置后重新计数（t5 为 1），4 次到 5，第 6 次直接抛 AnimOpError，且文案给出路
+  await call()
+  await call()
+  await call()
+  await call()
+  await assert.rejects(
+    call(),
+    (err: unknown) => err instanceof AnimOpError && /拒绝执行/.test(err.message) && /job_output/.test(err.message),
+    '第 6 次同参硬拒绝，文案给出路（job_output / patch 重置 / 等窗口）',
+  )
+})
+
+await checkA('opPreview: spec 维度护栏——换参也计数，治「每次挪一点参数」的绕行（0.6.0 §3.3）', async () => {
+  const previewImpl: AnimRenderer['preview'] = async () => ({
+    frames: [{ atMs: 100, path: 'f.png', width: 1, height: 1 }],
+    renderer: 'fake',
+  })
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT, previewImpl)
+  deps.store.create('guard-spec-2', demoSpec())
+  deps.guard = { specSoftAt: 3, specHardAt: 5 }
+  const jobs: AnimJobsService = {
+    start(spec) {
+      spec.run()
+      return 'anim-preview-spec-guard'
+    },
+  }
+  // 每次都换抽帧点（秒级量化后仍不同签名），靠 spec 维度计数兜住
+  const callN = (ms: number) => opPreview(deps, { specId: 'guard-spec-2', atMs: [ms] }, new AbortController().signal, emit, jobs)
+  const t1 = (await callN(100)) as { next: string }
+  const t2 = (await callN(2000)) as { next: string }
+  assert.ok(!t1.next.includes('已对同一 spec') && !t2.next.includes('已对同一 spec'), '窗口内未达阈值不打扰')
+  const t3 = (await callN(3000)) as { next: string }
+  assert.match(t3.next, /已对同一 spec 发起 3 次/, 'spec 维度第 3 次软提示（阈值压低后）')
+  await callN(4000)
+  await assert.rejects(callN(5000), (err: unknown) => err instanceof AnimOpError && /拒绝执行/.test(err.message), 'spec 维度硬拒绝')
+  // patch 重置对 spec 维度同样生效
+  deps.store.patch('guard-spec-2', [{ op: 'replace', path: '/scenes/0/durationMs', value: 2800 }], '修改')
+  const t6 = (await callN(100)) as { next: string }
+  assert.ok(!t6.next.includes('已对同一 spec'), 'patch 后 spec 维度计数重置')
+})
+
+await checkA('opRender: 完成回执带收束指引 next + specVersion；store 投影 lastRender（0.6.0 §3.1/§3.2）', async () => {
+  const { deps, emitted, emit } = renderFixture(async () => ({ ...RENDER_RESULT }))
+  const view = (await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)) as { next?: string }
+  assert.match(view.next ?? '', /成片已就绪/, '同步回执带收束指引')
+  assert.match(view.next ?? '', /结束本回合/, '指引要求结束回合')
+  const finished = emitted.find(e => e.type === 'anim/render-finished')
+  assert.match((finished!.data as { next?: string }).next ?? '', /成片已就绪/, 'render-finished 事件带同文指引')
+  assert.equal((finished!.data as { specVersion?: number }).specVersion, 0, '事件带渲染开始时的 spec 版本')
+  // 渲染后未修改：lastRender 投影 + 抽帧/重渲的语境提示
+  const record = deps.store.record('gd')
+  assert.ok(record.lastRender, 'store 投影 lastRender')
+  assert.equal(record.lastRender!.specVersionAtRender, 0, '版本取开跑时')
+  assert.equal(record.lastRender!.outputPath, '.tmp/gd.mp4')
+  // fold 回放同源：同一事件流还原出同一份 lastRender（fixture 直建 store，
+  // fold 输入补一条合成 spec-created 让回放有根）
+  const refolded = foldEvents([
+    { type: 'anim/spec-created', data: { specId: 'gd', spec: deps.store.get('gd') } },
+    ...emitted.map(e => ({ type: e.type, data: e.data })),
+  ])
+  assert.ok(refolded.record('gd').lastRender, 'foldEvents 回放投影 lastRender')
+  assert.equal(refolded.record('gd').lastRender!.specVersionAtRender, 0)
+  // 渲染后未修改再抽帧：回执带「不会产生新信息」提示
+  const previewImpl: AnimRenderer['preview'] = async () => ({
+    frames: [{ atMs: 500, path: 'f.png', width: 1, height: 1 }],
+    renderer: 'fake',
+  })
+  const registry = new AnimRendererRegistry()
+  registry.register({ name: 'fake2', diagnose: async () => ({ renderer: 'fake2', ok: true, issues: [] }), preview: previewImpl, render: async () => ({ ...RENDER_RESULT }) })
+  const deps2: AnimDeps = { store: deps.store, renderers: registry, outputDir: '.tmp' }
+  const pv = (await opPreview(deps2, { specId: 'gd', atMs: [500] }, new AbortController().signal)) as { warnings?: string[] }
+  assert.ok((pv.warnings ?? []).some(w => /未修改/.test(w) && /不会产生新信息/.test(w)), '渲染后未修改的抽帧带语境提示')
+  // patch 之后提示消失：正当复查不受干扰
+  deps.store.patch('gd', [{ op: 'replace', path: '/scenes/0/durationMs', value: 2400 }], '修改')
+  const pv2 = (await opPreview(deps2, { specId: 'gd', atMs: [500] }, new AbortController().signal)) as { warnings?: string[] }
+  assert.ok(!(pv2.warnings ?? []).some(w => /不会产生新信息/.test(w)), 'patch 后不再提示未修改')
+})
+
+await checkA('opRender: 渲染前预检——scenes 越界/空数组快速失败，缺资产文件报人话（0.6.0 §4.1）', async () => {
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT)
+  await assert.rejects(
+    opRender(deps, { specId: 'gd', scenes: [] }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /空数组/.test(err.message),
+    '空 scenes 数组给可执行报错',
+  )
+  await assert.rejects(
+    opRender(deps, { specId: 'gd', scenes: [5] }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /越界下标 5/.test(err.message),
+    'scenes 越界点名合法范围',
+  )
+  // 缺失的资产引用：登记后删文件的形态
+  const spec = deps.store.get('gd')
+  spec.scenes[0]!.layers.push({
+    id: 'pic', name: '图', type: 'image',
+    props: { src: 'asset:ghost' }, tracks: [],
+  } as never)
+  spec.assets.ghost = { kind: 'image', src: '.tmp/ghost.png' }
+  await assert.rejects(
+    opRender(deps, { specId: 'gd' }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /渲染预检失败/.test(err.message) && /ghost/.test(err.message),
+    '资产源文件丢失在预检快速失败，不烧渲染开销',
+  )
+  // 未登记的引用同样拦截
+  ;(spec.scenes[0]!.layers.at(-1) as { props: { src: string } }).props.src = 'asset:never-registered'
+  await assert.rejects(
+    opRender(deps, { specId: 'gd' }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /未登记/.test(err.message),
+  )
+})
+
+await checkA('opPreview: 抽帧点卫生——越界钳到片尾并提示（0.6.0 §4.2）', async () => {
+  const seen: Array<number[] | undefined> = []
+  const previewImpl: AnimRenderer['preview'] = async request => {
+    seen.push(request.atMs ? [...request.atMs] : undefined)
+    return { frames: [], renderer: 'fake' }
+  }
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT, previewImpl)
+  deps.store.create('hygiene', demoSpec())
+  const view = (await opPreview(deps, { specId: 'hygiene', atMs: [500, 99999, -20] }, new AbortController().signal, emit)) as { warnings?: string[] }
+  assert.ok((view.warnings ?? []).some(w => /钳到有效范围/.test(w)), '越界抽帧点给警告')
+  const total = deps.store.durationMs('hygiene')
+  assert.deepEqual(seen[0], [500, total, 0], '负值钳 0、越界钳片尾，顺序保持不动')
 })
 
 await checkA('opRender: 进度 done 超过预估 total 时 percent 钳在 100（真机实测 92/90 → 102%）', async () => {

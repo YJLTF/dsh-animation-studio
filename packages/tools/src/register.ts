@@ -684,7 +684,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         + '回执 speechNotes 报告每条语音的实测时长与溢出（溢出时用 anim_patch 挪时间轴，工具不会自动改）；'
         + '未配置 TTS 时旁白只出字幕（设计内形态，anim_diagnose 的 tts 报告可确认）。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
-        + '否则同步等待到出片为止。',
+        + '否则同步等待到出片为止。'
+        + '渲染完成即收尾：回执 next 提醒直接向用户报告结果并结束回合；对未修改的 spec 反复抽帧/重渲没有意义（回执会明说），'
+        + '同参高频连发会被防死循环护栏拒绝（anim_patch 修改 spec 会重置计数）。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         outputPath: { type: 'string', description: '输出 MP4 路径，省略则用默认目录' },

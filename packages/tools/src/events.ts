@@ -97,6 +97,16 @@ export interface AnimRenderFinishedData {
   speechNotes?: Array<{ index: number; text: string; atMs: number; audioMs: number; overflowMs: number }>
   /** 全片关键帧拼贴图（0.5.0 规划 §3.3，jpg 绝对路径），生成失败时缺省。 */
   contactSheet?: string
+  /**
+   * 渲染开始时的 spec 版本（0.6.0 规划 §3.1）：fold 据此投影 lastRender，
+   * 与当前版本不等即「渲染后已修改」。旧事件载荷缺省，fold 按回放时版本兜底。
+   */
+  specVersion?: number
+  /**
+   * 完成时刻的收束指引（0.6.0 规划 §3.2）：成片就绪时告诉模型「报告用户并
+   * 结束回合，修改走 patch→重渲」。模型拿到完成结果的那一刻恰恰最需要这句话。
+   */
+  next?: string
 }
 
 /**

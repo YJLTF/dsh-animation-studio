@@ -34,6 +34,20 @@ export interface PatchRecord {
   note?: string
 }
 
+/**
+ * 最近一次渲染完成的状态（0.6.0 规划 §3.1）。
+ *
+ * 「spec 是否刚渲染过、渲染后改没改过」此前工具层无从判断——渲染完成只体现为
+ * 事件与产物文件，渲染后再抽帧/重渲得不到任何语境提示。`specVersionAtRender`
+ * 是判据：与当前 `version` 不等即「渲染后已修改」，相等则「未修改的重复检查」。
+ */
+export interface LastRenderInfo {
+  outputPath: string
+  finishedAt: number
+  /** 渲染开始时的 spec 版本（渲染过程中的 patch 不计入）。 */
+  specVersionAtRender: number
+}
+
 export interface SpecRecord {
   specId: string
   spec: AnimationSpec
@@ -46,6 +60,11 @@ export interface SpecRecord {
    * 不再无人说话（0.4.0 规划 N3）。
    */
   outline?: OutlineItem[]
+  /**
+   * 最近一次成功渲染（0.6.0 规划 §3.1）：opRender 写入 / foldEvents 回放
+   * `anim/render-finished`。事件溯源同源，会话恢复后依然成立。
+   */
+  lastRender?: LastRenderInfo
 }
 
 export class SpecStoreError extends Error {}
@@ -170,6 +189,14 @@ export class SpecStore {
   setOutline(specId: string, outline: readonly OutlineItem[]): void {
     this.record(specId).outline = [...outline]
   }
+
+  /**
+   * 记录最近一次成功渲染（0.6.0 规划 §3.1）。与 setOutline 同款双路径设计：
+   * opRender 完成时写入，回放时 foldEvents 消费同一条 `anim/render-finished`。
+   */
+  setLastRender(specId: string, info: LastRenderInfo): void {
+    this.record(specId).lastRender = info
+  }
 }
 
 /**
@@ -182,6 +209,8 @@ export class SpecStore {
 export interface AnimEventView {
   type: string
   data: unknown
+  /** 事件落盘时间（毫秒）。sidecar 行自带；缺省（旧路径）按回放时刻兜底。 */
+  time?: number
 }
 
 /** 从事件流还原 store。回放、fork、刷新恢复走的是同一条路径。 */
@@ -217,6 +246,21 @@ export function foldEvents(events: readonly AnimEventView[]): SpecStore {
         if (typeof data.specId !== 'string' || !Array.isArray(data.outline)) break
         if (store.has(data.specId)) {
           store.record(data.specId).outline = data.outline as OutlineItem[]
+        }
+        break
+      }
+      case 'anim/render-finished': {
+        // 渲染状态进状态（0.6.0 规划 §3.1）：「已渲染 + 渲染后是否修改」
+        // 投影成 lastRender。旧事件载荷没有 specVersion 时按回放到此处的
+        // 当前版本兜底（事件有序，此前的 patch 已全部回放）。
+        const data = ev.data as { specId?: unknown; outputPath?: unknown; status?: unknown; specVersion?: unknown }
+        if (typeof data.specId !== 'string' || typeof data.outputPath !== 'string') break
+        if (data.status !== undefined) break // killed / failed 不算「已渲染」
+        if (!store.has(data.specId)) break
+        store.record(data.specId).lastRender = {
+          outputPath: data.outputPath,
+          finishedAt: typeof ev.time === 'number' ? ev.time : Date.now(),
+          specVersionAtRender: typeof data.specVersion === 'number' ? data.specVersion : store.record(data.specId).version,
         }
         break
       }
