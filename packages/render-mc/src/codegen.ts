@@ -53,8 +53,11 @@ export interface GenerateResult {
  * v5：text 的 maxWidth 同步落 width 并放行 width 静态属性（独立 Txt 只有
  * maxWidth 不触发折行 reflow，真机验收抓到；width 初版被白名单丢弃），
  * 同输入下段落文本段的输出变了，旧段必须失效。
+ * v6（0.6.0）：chart/curve/grid 三种新图层、filters/shadow 节点级属性、
+ * text letterSpacing、image radius、motion path（followPath+progress）——
+ * 生成语义整体扩面，旧段自然失效。
  */
-export const CODEGEN_VERSION = 5
+export const CODEGEN_VERSION = 6
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -78,18 +81,24 @@ export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   // 语义坑：\n 要 textWrap:'pre' 才生效、lineHeight 数字是 px）；
   // width 是折行的边界（normalize 会把 maxWidth 同步到 width，真机验证抓到
   // 「只给 maxWidth 不参与布局就不 reflow」），必须进白名单否则被「不支持」丢弃
-  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign', maxWidth: 'maxWidth', textWrap: 'textWrap', width: 'width' },
+  text: { text: 'text', fontSize: 'fontSize', fontFamily: 'fontFamily', fontWeight: 'fontWeight', fill: 'fill', lineHeight: 'lineHeight', textAlign: 'textAlign', maxWidth: 'maxWidth', textWrap: 'textWrap', width: 'width', letterSpacing: 'letterSpacing' },
   // lineDash 是 Shape 基类 signal（number[]，虚线样式）——line/arrow/rect 通用
   rect: { width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth', radius: 'radius', lineDash: 'lineDash' },
   // Circle 原生支持 width/height（width≠height 即椭圆），radius/r 是圆的半径，
   // 由 normalizeLayerProps 换算成 size；见 0.3.0 规划 §1.4（圆形画不出来的修复）。
   circle: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
-  image: { src: 'src', width: 'width', height: 'height' },
+  image: { src: 'src', width: 'width', height: 'height', radius: 'radius' },
   // 成员经 children 引用，由 genSceneFile 组合成 Node 容器；静态属性只有变换。
   group: {},
   // Line 的 start/end（0~1 画线进度）与 endArrow/arrowSize 都是 Curve 内建 signal
   line: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize', lineDash: 'lineDash' },
   arrow: { points: 'points', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize', lineDash: 'lineDash' },
+  // curve（0.6.0 §5.2）：MC Spline 平滑曲线（Catmull-Rom 过点），start/end/
+  // 箭头/虚线与 line 同为 Curve 基类信号；smoothness 是 Spline 特有 signal
+  curve: { points: 'points', smoothness: 'smoothness', lineWidth: 'lineWidth', stroke: 'stroke', start: 'start', end: 'end', startArrow: 'startArrow', endArrow: 'endArrow', arrowSize: 'arrowSize', lineDash: 'lineDash' },
+  // grid（0.6.0 §5.3）：MC Grid（Shape 基类），spacing 支持 number 或 [w, h]；
+  // width/height 是网格覆盖区域（Layout 尺寸信号，缺省由 normalize 兜底画布）
+  grid: { width: 'width', height: 'height', spacing: 'spacing', stroke: 'stroke', lineWidth: 'lineWidth', lineDash: 'lineDash' },
   // MC 没有独立的 Ellipse 节点：椭圆 = Circle + width/height（官方用法）
   ellipse: { size: 'size', width: 'width', height: 'height', fill: 'fill', stroke: 'stroke', lineWidth: 'lineWidth' },
   // MC Polygon 是正多边形（sides 边数 + radius 角圆角）；star 用 Path + codegen 内置星形 path
@@ -105,6 +114,10 @@ export const STATIC_PROPS: Record<LayerType, Record<string, string>> = {
   // video 图层（0.5.0 §4.4）：MC Video extends Rect；play 固定注入（见 emitNode），
   // volume 无对应 signal（MC 按节点调音量不可行），写了会被「不支持」告警降级
   video: { src: 'src', width: 'width', height: 'height', loop: 'loop', time: 'time', playbackRate: 'playbackRate' },
+  // chart（0.6.0 §5.1）：不是单一 MC 组件——emitNode 特判成组合生成
+  // （Node 容器 + 坐标轴 + 柱/线 + 标签），props 由 emitChartNode 消费，
+  // 此表只为 Record 完整性与 progress 轨道放行存在
+  chart: {},
   // audio 不进 MC 画面生成（genSceneFile 在 emitNode 之前跳过），此表只为
   // Record<LayerType, …> 的完整性存在
   audio: {},
@@ -132,12 +145,15 @@ export const COMPONENT: Record<LayerType, string> = {
   group: 'Node', // 容器：成员用 .add() 挂进来，变换属性作用于整组
   line: 'Line',
   arrow: 'Line', // Line + endArrow（Curve 内建箭头，arrowSize 默认 24）
+  curve: 'Spline', // 平滑曲线（Catmull-Rom 过点，0.6.0 §5.2）
+  grid: 'Grid', // 网格（0.6.0 §5.3）
   ellipse: 'Circle',
   polygon: 'Polygon',
   star: 'Path', // codegen 内置星形 path（MC 3.17 没有 Star 组件）
   svg: 'SVG',
   code: 'Code',
   math: 'Latex',
+  chart: 'Node', // 组合生成的容器节点（见 emitChartNode）；变换轨道作用于整图
   video: 'Video', // 实拍片段嵌入（0.5.0 §4.4）；headless 帧同步经真机 gate 验证
   audio: 'Node', // audio 永不 emitNode（不进画面），此处仅满足 Record 完整性
 }
@@ -230,6 +246,108 @@ function estimateTextWidth(text: string, fontSize: number): number {
   let w = 0
   for (const ch of text) w += ch.charCodeAt(0) > 0xff ? fontSize : fontSize * 0.6
   return Math.round(w)
+}
+
+/* ------------------------------------------------------------ 图表几何 */
+
+/** chart 图层缺省尺寸（props.width/height 未给时）。 */
+export const CHART_DEFAULT_WIDTH = 720
+export const CHART_DEFAULT_HEIGHT = 440
+/** 图表内置色板（props.palette 未给时按序循环取用）。 */
+export const CHART_PALETTE = ['#4C9AFF', '#FFB020', '#5DD39E', '#FF7A6B', '#B58CFF', '#3DD6C3']
+
+export interface ChartInput {
+  chartType: 'bar' | 'line'
+  data: Array<{ label: string; value: number }>
+  maxValue?: number
+}
+
+/**
+ * 图表几何（0.6.0 规划 §5.1，纯函数，冒烟钉口径）。
+ * 坐标为容器本地坐标（中心原点契约）：绘图区上下左右留出轴与标签的边距，
+ * 柱体的 fullHeight 与折线的点都按 `value / max` 线性映射到绘图区高度。
+ */
+export interface ChartGeometry {
+  chartType: 'bar' | 'line'
+  /** 纵轴最大值（niceMax 取整后的「好看」数）。 */
+  max: number
+  /** 纵轴刻度值（含 0 与 max，共 5 档）。 */
+  ticks: number[]
+  plot: { left: number; right: number; top: number; bottom: number }
+  /** bar 模式：每根柱的横向中心与满值高度（动画时按 progress 由此生长）。 */
+  bars: Array<{ x: number; fullHeight: number; color: string; label: string; value: number }>
+  /** bar 模式：柱宽（像素）。 */
+  barWidth: number
+  /** line 模式：折线顶点（容器本地坐标，随 progress 用 Line end 描画）。 */
+  linePoints: Array<[number, number]>
+  /** 类目标签的横向位置（bar=每根柱中心；line=每个顶点投影）。 */
+  labels: Array<{ x: number; text: string }>
+}
+
+/**
+ * 纵轴最大值取整：向上取到 1/2/2.5/5 ×10^k——数据 0~83 时给 100、0~0.16 给
+ * 0.2，刻度标签保持短且可读。
+ */
+export function niceMax(v: number): number {
+  if (!(Number.isFinite(v) && v > 0)) return 1
+  const exp = Math.floor(Math.log10(v))
+  const base = Math.pow(10, exp)
+  for (const m of [1, 2, 2.5, 5, 10]) {
+    if (v <= m * base + 1e-12) return m * base
+  }
+  return 10 * base
+}
+
+export function chartGeometry(input: ChartInput, width = CHART_DEFAULT_WIDTH, height = CHART_DEFAULT_HEIGHT): ChartGeometry {
+  const marginL = 84
+  const marginR = 32
+  const marginT = 28
+  const marginB = 52
+  const plot = {
+    left: -width / 2 + marginL,
+    right: width / 2 - marginR,
+    top: -height / 2 + marginT,
+    bottom: height / 2 - marginB,
+  }
+  const plotW = plot.right - plot.left
+  const plotH = plot.bottom - plot.top
+  const values = input.data.map(d => d.value)
+  const dataMax = Math.max(0, ...values)
+  const max = input.maxValue !== undefined && input.maxValue > 0 ? input.maxValue : niceMax(dataMax)
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map(r => Math.round(max * r * 1000) / 1000)
+  const n = input.data.length
+  const yOf = (v: number): number => plot.bottom - (Math.max(0, Math.min(v, max)) / max) * plotH
+  if (input.chartType === 'line') {
+    const step = n > 1 ? plotW / (n - 1) : 0
+    const points = input.data.map((d, i) => {
+      const x = n > 1 ? plot.left + i * step : plot.left + plotW / 2
+      return [Math.round(x * 100) / 100, Math.round(yOf(d.value) * 100) / 100] as [number, number]
+    })
+    // MC Line 至少要两个点：单点数据横向复制一份，保证折线可画
+    if (points.length === 1) points.push([points[0]![0] + 1, points[0]![1]])
+    return {
+      chartType: 'line', max, ticks, plot,
+      bars: [],
+      barWidth: 0,
+      linePoints: points,
+      labels: input.data.map((d, i) => ({ x: points[i]![0], text: d.label })),
+    }
+  }
+  const slot = plotW / Math.max(1, n)
+  const barWidth = Math.round(Math.min(96, slot * 0.6) * 100) / 100
+  return {
+    chartType: 'bar', max, ticks, plot,
+    bars: input.data.map((d, i) => ({
+      x: Math.round((plot.left + slot * (i + 0.5)) * 100) / 100,
+      fullHeight: (Math.max(0, Math.min(d.value, max)) / max) * plotH,
+      color: CHART_PALETTE[i % CHART_PALETTE.length],
+      label: d.label,
+      value: d.value,
+    })),
+    barWidth,
+    linePoints: [],
+    labels: input.data.map((d, i) => ({ x: Math.round((plot.left + slot * (i + 0.5)) * 100) / 100, text: d.label })),
+  }
 }
 
 /**
@@ -382,7 +500,7 @@ function normalizeLayerProps(
       out.width = out.maxWidth
     }
   }
-  if (type === 'line' || type === 'arrow') {
+  if (type === 'line' || type === 'arrow' || type === 'curve') {
     if (out.stroke === undefined) {
       out.stroke = defaultTextFill
       warnings.push(`${type} 图层未指定 stroke，已按主题文字色描边兜底`)
@@ -665,6 +783,83 @@ function genSceneFile(
   // 变量名 = 图层在数组里的位置 + 净化后的 id（与文件内唯一性解耦）
   const varName = (layer: Layer): string => `n${scene.layers.indexOf(layer)}_${sanitize(layer.id)}`
 
+  // followPath 已生效的图层：layerId → { 进度信号名, 是否带 x/y 轨道 }。
+  // 位置函数属性在 emitNode 里挂，emitTracks 据此补间信号、拦截 x/y 轨道
+  const followInfo = new Map<string, { signal: string; hasXyTracks: boolean }>()
+
+  /**
+   * chart 图层的组合生成（0.6.0 规划 §5.1）：chart 不是单一 MC 组件，
+   * 由 Node 容器 + 坐标轴（Line/Txt）+ 柱（Rect）或折线（Line）组合而成。
+   * 数据→像素的映射在 codegen 侧算完（chartGeometry，纯函数可单测），
+   * 生成物只含字面量与 progress 信号的函数属性。
+   */
+  const emitChartNode = (layer: Layer, parentExpr: string): void => {
+    const name = varName(layer)
+    const props = layer.props
+    components.add('Node')
+    coreImports.add('createRef')
+    const data = (Array.isArray(props.data) ? props.data : []).filter(
+      (d): d is { label: string; value: number } =>
+        d !== null && typeof d === 'object' && typeof (d as { label?: unknown }).label === 'string' && Number.isFinite((d as { value?: unknown }).value),
+    )
+    if (data.length === 0) {
+      warnings.push(`chart 图层 ${layer.id} 的 data 为空或形态非法，已渲染为空容器`)
+      setup.push(`const ${name} = createRef<Node>();`)
+      setup.push(`${parentExpr}.add(<Node ref={${name}} />);`)
+      return
+    }
+    if (props.chartType !== undefined && props.chartType !== 'bar' && props.chartType !== 'line') {
+      warnings.push(`chart 图层 ${layer.id} 的 chartType ${JSON.stringify(props.chartType)} 不支持（bar/line），已按 bar 渲染`)
+    }
+    const chartType = props.chartType === 'line' ? 'line' : 'bar'
+    const width = typeof props.width === 'number' && props.width > 0 ? props.width : CHART_DEFAULT_WIDTH
+    const height = typeof props.height === 'number' && props.height > 0 ? props.height : CHART_DEFAULT_HEIGHT
+    const geo = chartGeometry({ chartType, data, ...(typeof props.maxValue === 'number' && props.maxValue > 0 ? { maxValue: props.maxValue } : {}) }, width, height)
+    const labelSize = typeof props.labelSize === 'number' && props.labelSize > 0 ? props.labelSize : 22
+    const palette = Array.isArray(props.palette) && props.palette.every(x => typeof x === 'string') ? (props.palette as string[]) : CHART_PALETTE
+    const showAxis = props.showAxis !== false
+
+    // 进度信号：有 props.progress 轨道则从首关键帧值起步（emitTracks 补间），
+    // 无轨道则静态 1（成图直出，不需要动画的图表零额外成本）
+    const progressTrack = layer.tracks.find(t => t.target === 'props.progress')
+    const sig = `${name}_progress`
+    const first = progressTrack ? [...progressTrack.keys].sort((a, b) => a.atMs - b.atMs)[0] : undefined
+    const startVal = progressTrack && first && typeof first.value === 'number' && Number.isFinite(first.value) ? first.value : 1
+    setup.push(`const ${sig} = createSignal(${num(startVal)});`)
+    coreImports.add('createSignal')
+
+    components.add('Line')
+    components.add('Rect')
+    components.add('Txt')
+    const axisStroke = JSON.stringify(defaultTextFill)
+    const fontLit = JSON.stringify(defaultTextFill)
+    const clampP = `Math.min(1, Math.max(0, ${sig}()))`
+    const kids: string[] = []
+    if (showAxis) {
+      kids.push(`<Line points={[[${num(geo.plot.left)}, ${num(geo.plot.bottom)}], [${num(geo.plot.right)}, ${num(geo.plot.bottom)}]]} stroke={${axisStroke}} lineWidth={2} />`)
+      kids.push(`<Line points={[[${num(geo.plot.left)}, ${num(geo.plot.bottom)}], [${num(geo.plot.left)}, ${num(geo.plot.top)}]]} stroke={${axisStroke}} lineWidth={2} />`)
+      for (const tick of geo.ticks) {
+        const y = geo.plot.bottom - (tick / geo.max) * (geo.plot.bottom - geo.plot.top)
+        kids.push(`<Txt text={${JSON.stringify(String(tick))}} x={${num(geo.plot.left - 12)}} y={${num(y)}} fontSize={${num(labelSize)}} fill={${fontLit}} textAlign={"right"} />`)
+      }
+    }
+    if (chartType === 'bar') {
+      for (const [i, bar] of geo.bars.entries()) {
+        const color = JSON.stringify(palette[i % palette.length]!)
+        kids.push(
+          `<Rect width={${num(geo.barWidth)}} height={() => Math.max(0.001, ${num(bar.fullHeight)} * ${clampP})} fill={${color}} x={${num(bar.x)}} y={() => ${num(geo.plot.bottom)} - Math.max(0.001, ${num(bar.fullHeight)} * ${clampP}) / 2} />`,
+        )
+      }
+    } else {
+      kids.push(`<Line points={${JSON.stringify(geo.linePoints)}} stroke={${JSON.stringify(palette[0]!)}} lineWidth={4} end={() => ${clampP}} />`)
+    }
+    for (const label of geo.labels) {
+      kids.push(`<Txt text={${JSON.stringify(label.text)}} x={${num(label.x)}} y={${num(geo.plot.bottom + 26)}} fontSize={${num(labelSize)}} fill={${fontLit}} textAlign={"center"} />`)
+    }
+    setup.push(`const ${name} = createRef<Node>();`)
+    setup.push(`${parentExpr}.add(<Node ref={${name}}>${kids.join('')}</Node>);`)
+  }
+
   /**
    * 生成单个图层的节点创建：createRef + 挂到 parentExpr（view 或组节点）。
    * 返回该图层的变量名，轨道生成要用它。
@@ -680,6 +875,78 @@ function genSceneFile(
     const allowed: Record<string, string> = { ...STATIC_PROPS[layer.type] }
     for (const key of COMMON_PROPS) allowed[key] = key
     const normalized = normalizeLayerProps(layer.type, layer.props, defaultTextFill, warnings, assets)
+
+    // chart 图层（0.6.0 §5.1）：组合生成（容器 + 坐标轴 + 柱/线 + 标签），
+    // props 由 emitChartNode 消费，不走通用白名单循环
+    if (layer.type === 'chart') {
+      emitChartNode(layer, parentExpr)
+      return name
+    }
+
+    // followPath（0.6.0 §5.4）：位置由被跟随路径采样驱动——静态 x/y 从节点
+    // 上摘除（函数属性才会生效），进度信号在此建，emitTracks 只补间它
+    const followId = typeof layer.props.followPath === 'string' ? layer.props.followPath : undefined
+    const followTrack = followId ? layer.tracks.find(t => t.target === 'props.progress') : undefined
+    if (followId) {
+      if (!followTrack) {
+        warnings.push(`图层 ${layer.id} 配置了 followPath 但没有 props.progress 轨道，运动位置无从驱动，已忽略 followPath`)
+      } else {
+        const pathLayer = scene.layers.find(l => l.id === followId)
+        if (!pathLayer || !['line', 'arrow', 'curve'].includes(pathLayer.type)) {
+          warnings.push(`图层 ${layer.id} 的 followPath 引用了不可跟随的图层 ${followId}（需要 line/arrow/curve），已忽略`)
+        } else {
+          const sig = `${name}_fp`
+          const first = [...followTrack.keys].sort((a, b) => a.atMs - b.atMs)[0]
+          const startVal = typeof first?.value === 'number' && Number.isFinite(first.value) ? first.value : 0
+          setup.push(`const ${sig} = createSignal(${num(startVal)});`)
+          coreImports.add('createSignal')
+          const pathVar = varName(pathLayer)
+          attrs.push(`x={() => ${pathVar}().getPointAtPercentage(Math.min(1, Math.max(0, ${sig}()))).position.x}`)
+          attrs.push(`y={() => ${pathVar}().getPointAtPercentage(Math.min(1, Math.max(0, ${sig}()))).position.y}`)
+          followInfo.set(layer.id, { signal: sig, hasXyTracks: layer.tracks.some(t => t.target === 'props.x' || t.target === 'props.y') })
+          delete normalized.x
+          delete normalized.y
+        }
+      }
+    }
+
+    // filters/shadow（0.6.0 §5.4）：Node 级信号、全部图层可用——先于白名单
+    // 循环摘除并翻译，不进 STATIC_PROPS 各表
+    if (normalized.filters !== undefined) {
+      const f = normalized.filters as Record<string, JsonValue>
+      delete normalized.filters
+      const FACTORY: Record<string, string> = { blur: 'blur', brightness: 'brightness', contrast: 'contrast', saturate: 'saturate', grayscale: 'grayscale', invert: 'invert', sepia: 'sepia', hue: 'hue' }
+      const items: string[] = []
+      for (const [k, factory] of Object.entries(FACTORY)) {
+        const v = f[k]
+        if (v === undefined || typeof v !== 'number' || !Number.isFinite(v)) continue
+        const active = k === 'blur' ? v > 0 : k === 'hue' ? v !== 0 : !(k === 'brightness' || k === 'contrast' || k === 'saturate') ? v > 0 : v !== 1
+        if (!active) continue
+        items.push(`${factory}(${num(v)})`)
+        components.add(factory)
+      }
+      if (items.length > 0) attrs.push(`filters={[${items.join(', ')}]}`)
+    }
+    for (const [irKey, mcKey] of [['shadowColor', 'shadowColor'], ['shadowBlur', 'shadowBlur'], ['shadowOffset', 'shadowOffset']] as const) {
+      if (normalized[irKey] === undefined) continue
+      const v = normalized[irKey]
+      delete normalized[irKey]
+      if (irKey === 'shadowColor' && typeof v === 'string') attrs.push(`${mcKey}={${JSON.stringify(v)}}`)
+      else if (irKey === 'shadowBlur' && typeof v === 'number') attrs.push(`${mcKey}={${num(v)}}`)
+      else if (irKey === 'shadowOffset' && Array.isArray(v) && v.length === 2 && v.every(x => typeof x === 'number')) {
+        attrs.push(`${mcKey}={[${num(v[0] as number)}, ${num(v[1] as number)}]}`)
+      } else {
+        warnings.push(`图层 ${layer.id} 的 ${irKey} 形态无效，已忽略`)
+      }
+    }
+
+    // grid 图层（0.6.0 §5.3）：缺尺寸兜底为画布满幅——坐标系参考网格的
+    // 默认形态就是铺满画布，与 chart/curve 搭配讲函数图象
+    if (layer.type === 'grid' && normalized.width === undefined && normalized.height === undefined && normalized.size === undefined) {
+      normalized.width = subtitleStyle.canvasWidth
+      normalized.height = subtitleStyle.canvasHeight
+      warnings.push(`grid 图层 ${layer.id} 未指定尺寸，已按画布满幅（${subtitleStyle.canvasWidth}×${subtitleStyle.canvasHeight}）兜底`)
+    }
     // reveal 打字机（0.5.0 §4.3）：text 图层带 props.reveal 轨道时，静态 text
     // 不直接上节点——改由 revealSignal 逐字裁剪（见下方与 emitTracks 的特判）
     const revealTrack = layer.type === 'text' ? layer.tracks.find(t => t.target === 'props.reveal') : undefined
@@ -763,6 +1030,27 @@ function genSceneFile(
             tasks.push(`delay(${sec(t.startMs)}, ${sig}(${num(to)}, ${sec(t.durationMs)}${easeArg})),`)
           }
         }
+        continue
+      }
+      // chart / followPath 的 progress 轨道（0.6.0 §5.1/§5.4）：0~1 进度
+      // 补间的是 emitNode 建好的进度信号，不是节点属性
+      if (prop === 'progress' && (layer.type === 'chart' || followInfo.has(layer.id))) {
+        const sig = layer.type === 'chart' ? `${name}_progress` : followInfo.get(layer.id)!.signal
+        for (const t of tweensOf(track)) {
+          const ease = easeExpr(t.ease, imports)
+          const easeArg = ease ? `, ${ease}` : ''
+          const to = typeof t.to === 'number' && Number.isFinite(t.to) ? t.to : 1
+          if (t.durationMs <= 0) {
+            tasks.push(`delay(${sec(t.startMs)}, () => ${sig}(${num(to)})),`)
+          } else {
+            tasks.push(`delay(${sec(t.startMs)}, ${sig}(${num(to)}, ${sec(t.durationMs)}${easeArg})),`)
+          }
+        }
+        continue
+      }
+      // 被 followPath 接管的图层：x/y 由路径采样驱动，显式轨道与之冲突
+      if (followInfo.has(layer.id) && (prop === 'x' || prop === 'y')) {
+        warnings.push(`图层 ${layer.id} 的 ${prop} 轨道被 followPath 接管，已忽略（运动位置由 props.progress 驱动）`)
         continue
       }
       // 轨道目标走同一张别名表（@dsh-anim/spec）：存量 spec 里已落库的

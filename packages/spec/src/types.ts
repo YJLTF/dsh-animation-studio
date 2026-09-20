@@ -100,10 +100,12 @@ export interface Track {
  */
 export const LAYER_TYPES = [
   'text', 'rect', 'circle', 'ellipse', 'image',
-  'line', 'arrow',
+  'line', 'arrow', 'curve',
+  'grid',
   'polygon', 'star',
   'svg',
   'code', 'math',
+  'chart',
   'group',
   'audio',
   'video',
@@ -209,6 +211,54 @@ export interface LayerProps {
   time?: number
   /** 播放速率倍数，默认 1。 */
   playbackRate?: number
+  // 文本微调（text）
+  /** 字间距（像素，MC Layout 的 letterSpacing 信号；0 = 默认）。 */
+  letterSpacing?: number
+  // 图片圆角：radius 字段已存在（circle 用），image 复用同一字段名（Img 继承
+  // Layout 的 radius 信号，正值为圆角半径 px）。
+  // 沿路径运动（0.6.0 规划 §5.4）：跟随同场景内 line/arrow/curve 图层运动
+  /** 被跟随的 line/arrow/curve 图层 id（同一场景内）。须配合 props.progress
+   * 轨道（0→1）使用：progress 驱动本图层沿路径的位置。 */
+  followPath?: LayerId
+  /** 路径/图表进度 0~1。chart 图层：驱动柱体生长 / 折线描画；配置了
+   * followPath 的图层：驱动沿路径的位置。均通过 props.progress 轨道动画。 */
+  progress?: number
+  // 曲线（curve 图层；MC Spline 平滑曲线，points 同 line 折线语义）
+  /** 平滑度（默认 0.5，0=折线，1=最大化平滑）。 */
+  smoothness?: number
+  // 网格（grid 图层；MC Grid，坐标系/对齐参考）
+  /** 网格间距（像素，或 [宽间距, 高间距]）。 */
+  spacing?: number | [number, number]
+  // 数据图表（chart 图层；codegen 组合生成，0.6.0 规划 §5.1）
+  /** 图表类型：bar（柱状图，柱体随 progress 生长）/ line（折线图，随 progress 描画）。 */
+  chartType?: 'bar' | 'line'
+  /** 数据系列（v1 单系列）：label 为类目名，value 为数值。 */
+  data?: Array<{ label: string; value: number }>
+  /** 纵轴最大值；缺省按数据自动取整。 */
+  maxValue?: number
+  /** 是否显示坐标轴与类目标签，默认 true。 */
+  showAxis?: boolean
+  /** 系列色板（按数据项循环取用）；缺省用内置色板。 */
+  palette?: string[]
+  /** 类目/数值标签字号，默认 22。 */
+  labelSize?: number
+  // CSS 滤镜（全部图层可用；Node 级 filters 信号，静态直通）
+  /** 滤镜集：blur(px)、brightness/contrast/saturate(倍率，1=原样)、
+   * grayscale/invert/sepia(0~1)、hue(度)。缺省项=不启用该滤镜。 */
+  filters?: {
+    blur?: number
+    brightness?: number
+    contrast?: number
+    saturate?: number
+    grayscale?: number
+    invert?: number
+    sepia?: number
+    hue?: number
+  }
+  /** 阴影（Node 级信号）：颜色 + 模糊半径(px) + 偏移 [x, y](px)。 */
+  shadowColor?: string
+  shadowBlur?: number
+  shadowOffset?: [number, number]
   [key: string]: JsonValue | undefined
 }
 

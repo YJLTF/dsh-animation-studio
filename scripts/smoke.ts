@@ -20,6 +20,7 @@ import { promisify } from 'node:util'
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
 import {
   ANIMATABLE_BY_TYPE,
+  chartGeometry,
   COMPONENT,
   dedupeWarnings,
   encodeFrames,
@@ -30,6 +31,7 @@ import {
   generateProjectMeta,
   MotionCanvasRenderer,
   muxAudioTracks,
+  niceMax,
   pickScenes,
   sceneFrameBoundaries,
   sceneFingerprint,
@@ -2486,6 +2488,132 @@ await checkA('codegen: 渐变 fill / reveal 打字机 / in-inOut 缓动 / video 
   spec.scenes[0]!.layers[0]!.props.fill = { type: 'linearX', stops: [] } as never
   const bad = generateProject(spec, { resolutionScale: 1 })
   assert.ok(bad.warnings.some(w => w.includes('渐变描述无效')), '坏渐变告警摘除')
+})
+
+await checkA('codegen: chart/curve/grid 图层 + filters/shadow/followPath/letterSpacing 落进生成物（0.6.0 §5）', async () => {
+  const spec = demoSpec()
+  spec.scenes = [{
+    id: 'm2', name: '扩面演示', durationMs: 4000,
+    layers: [
+      {
+        id: 'sales', name: '柱状图', type: 'chart',
+        props: {
+          chartType: 'bar', x: 0, y: -60,
+          data: [{ label: '一月', value: 42 }, { label: '二月', value: 83 }, { label: '三月', value: 65 }],
+        },
+        tracks: [{ id: 'sales-grow', target: 'props.progress', keys: [{ atMs: 0, value: 0 }, { atMs: 1200, value: 1, ease: { kind: 'easeOut' } }] }],
+      },
+      {
+        id: 'trend', name: '折线图', type: 'chart',
+        props: {
+          chartType: 'line', y: 60, palette: ['#FFB020'], maxValue: 100, showAxis: true,
+          data: [{ label: 'A', value: 20 }, { label: 'B', value: 55 }, { label: 'C', value: 90 }],
+        },
+        tracks: [{ id: 'trend-draw', target: 'props.progress', keys: [{ atMs: 400, value: 0 }, { atMs: 2000, value: 1 }] }],
+      },
+      {
+        id: 'path', name: '轨迹', type: 'curve',
+        props: { points: [[-300, 200], [0, 120], [300, 220]], stroke: '#5DD39E', smoothness: 0.7 },
+        tracks: [],
+      },
+      {
+        id: 'ball', name: '小球', type: 'circle',
+        props: { size: 24, fill: '#FF7A6B', followPath: 'path', filters: { blur: 0 } },
+        tracks: [{ id: 'ball-move', target: 'props.progress', keys: [{ atMs: 0, value: 0 }, { atMs: 3000, value: 1, ease: { kind: 'easeInOut' } }] }],
+      },
+      {
+        id: 'card', name: '卡片', type: 'rect',
+        props: { width: 200, height: 100, fill: '#1B3A5C', shadowColor: '#000000', shadowBlur: 18, shadowOffset: [4, 8], filters: { grayscale: 0.5 } },
+        tracks: [],
+      },
+      {
+        id: 'tag', name: '字距标签', type: 'text',
+        props: { text: 'TRACKING', y: -200, fontSize: 40, letterSpacing: 12 },
+        tracks: [],
+      },
+    ],
+  }]
+  spec.scenes.push({
+    id: 'grid-math', name: '网格', durationMs: 1000,
+    layers: [
+      { id: 'axes', name: '坐标网格', type: 'grid', props: { spacing: [80, 60], stroke: '#2A3B4D' }, tracks: [] },
+    ],
+  })
+  const { files, warnings } = generateProject(spec, { resolutionScale: 1 })
+  const scene1 = files.find(f => f.path.includes('m2'))!.content
+  const scene2 = files.find(f => f.path.includes('grid_math'))!.content
+
+  // chart（bar）：容器 + 进度信号 + 柱体按信号生长（height/y 双函数属性，从轴底长起）
+  assert.match(scene1, /const \w+_sales_progress = createSignal\(0\);/, 'bar 进度信号初值取首关键帧')
+  assert.match(scene1, /<Node ref=\{\w+_sales\}>/, 'chart 组合为 Node 容器')
+  assert.match(scene1, /height=\{\(\) => Math\.max\(0\.001, [\d.]+ \* Math\.min\(1, Math\.max\(0, \w+_sales_progress\(\)\)\)\)\}/, '柱高随 progress 生长（带 clamp）')
+  assert.match(scene1, /y=\{\(\) => [-\d.]+ - Math\.max\(0\.001, [\d.]+ \* Math\.min\(1, Math\.max\(0, \w+_sales_progress\(\)\)\)\) \/ 2\}/, '柱 y 随生长保持底边贴轴')
+  assert.match(scene1, /\w+_sales_progress\(1, 1\.2, easeOutCubic\)/, 'progress 轨道补间信号')
+  assert.match(scene1, /textAlign=\{"right"\}/, 'Y 轴刻度标签右对齐')
+  assert.match(scene1, /fill=\{"#4C9AFF"\}/, '缺省色板取内置色')
+  // chart（line）：折线 end 绑定进度信号，调色板覆盖生效
+  assert.match(scene1, /end=\{\(\) => Math\.min\(1, Math\.max\(0, \w+_trend_progress\(\)\)\)\}/, '折线描画绑定 progress')
+  assert.match(scene1, /stroke=\{"#FFB020"\}/, 'palette 覆盖折线色')
+  assert.match(scene1, /lineWidth=\{4\}/, '折线描边宽度')
+  // curve + followPath：Spline + 小球位置由路径采样驱动
+  assert.match(scene1, /Spline/, 'curve 映射 Spline')
+  assert.match(scene1, /smoothness=\{0\.7\}/, 'smoothness 直通')
+  assert.match(scene1, /const \w+_ball_fp = createSignal\(0\);/, 'followPath 进度信号')
+  assert.match(scene1, /x=\{\(\) => \w+_path\(\)\.getPointAtPercentage\(Math\.min\(1, Math\.max\(0, \w+_ball_fp\(\)\)\)\)\.position\.x\}/, 'x 由路径采样驱动')
+  assert.ok(!/n\d+_ball\(\)\.x\(/.test(scene1), 'ball 的 x 轨道初值不再直写节点')
+  assert.match(scene1, /_ball_fp\(1, 3, easeInOutCubic\)/, 'progress 轨道补间 followPath 信号')
+  // filters / shadow / letterSpacing
+  assert.match(scene1, /grayscale\(0\.5\)/, 'grayscale 滤镜生成')
+  assert.ok(!/blur\(/.test(scene1), 'blur 0 视为未启用，不生成')
+  assert.match(scene1, /shadowColor=\{"#000000"\}/, '阴影颜色直通')
+  assert.match(scene1, /shadowBlur=\{18\}/, '阴影模糊直通')
+  assert.match(scene1, /shadowOffset=\{\[4, 8\]\}/, '阴影偏移数组')
+  assert.match(scene1, /letterSpacing=\{12\}/, '字间距直通')
+  // grid：spacing 数组直通、缺尺寸按画布满幅兜底
+  assert.match(scene2, /Grid/, 'grid 映射 Grid 组件')
+  assert.match(scene2, /spacing=\{\[80,60\]\}/, 'spacing [w,h] 直通')
+  assert.match(scene2, /width=\{1280\}/, 'grid 缺尺寸按画布宽兜底')
+  assert.match(scene2, /height=\{720\}/, 'grid 缺尺寸按画布高兜底')
+  // 图表几何纯函数口径
+  assert.equal(niceMax(83), 100, 'niceMax 83→100')
+  assert.equal(niceMax(0.16), 0.2, 'niceMax 小数位')
+  const geo = chartGeometry({ chartType: 'bar', data: [{ label: 'a', value: 50 }, { label: 'b', value: 100 }] }, 720, 440)
+  assert.equal(geo.max, 100)
+  assert.equal(geo.bars[1]!.fullHeight, geo.plot.bottom - geo.plot.top, '满值柱高 = 绘图区高')
+  assert.equal(geo.bars[0]!.fullHeight, (geo.plot.bottom - geo.plot.top) / 2, '半值柱高减半')
+  assert.equal(chartGeometry({ chartType: 'line', data: [{ label: 'x', value: 1 }] }).linePoints.length, 2, '单点折线复制为两点')
+  assert.deepEqual(warnings.filter(w => w.includes('不支持')), [], '新属性不被白名单误伤')
+})
+
+check('validateSpec: chart 数据形态硬校验 + followPath 引用体检（0.6.0 §5）', () => {
+  const spec = demoSpec()
+  spec.scenes = [{
+    id: 'v', name: '校验', durationMs: 2000,
+    layers: [
+      { id: 'c1', name: '坏数据', type: 'chart', props: { chartType: 'pie', data: [{ label: 'x', value: 'abc' }] }, tracks: [] },
+      { id: 'c2', name: '悬空跟随', type: 'circle', props: { size: 20, followPath: 'ghost' }, tracks: [] },
+      { id: 'c3', name: '类型不合法', type: 'circle', props: { size: 20, followPath: 'c1' }, tracks: [] },
+    ],
+  }]
+  const r = validateSpec(spec)
+  assert.equal(r.ok, false)
+  const messages = r.errors.map(e => e.message).join('\n')
+  assert.match(messages, /chartType 应为 "bar" 或 "line"/, '未知 chartType 报错')
+  assert.match(messages, /value 应为有限数字/, '坏数值报错')
+  assert.match(messages, /引用了本幕不存在的图层 ghost/, 'followPath 悬空引用报错')
+  assert.match(messages, /只能跟随 line\/arrow\/curve/, 'followPath 类型限制报错')
+  // 合法形态：bar+line 图表、curve 被跟随、缺 progress 只提示不报错
+  const okSpec = demoSpec()
+  okSpec.scenes = [{
+    id: 'v2', name: '合法', durationMs: 2000,
+    layers: [
+      { id: 'path', name: '路径', type: 'curve', props: { points: [[-100, 0], [100, 0]], stroke: '#fff' }, tracks: [] },
+      { id: 'dot', name: '点', type: 'circle', props: { size: 10, fill: '#fff', followPath: 'path' }, tracks: [] },
+    ],
+  }]
+  const ok = validateSpec(okSpec)
+  assert.equal(ok.ok, true, '合法 followPath 过校验')
+  assert.ok(ok.warnings.some(w => w.includes('props.progress 轨道')), '缺 progress 轨道给软警告')
 })
 
 await checkA('synthesizeNarration: 注入合成器逐 cue 产轨 + 字幕跟随实测 + 溢出对账（§5.3）', async () => {
