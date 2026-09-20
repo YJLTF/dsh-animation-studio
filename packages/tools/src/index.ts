@@ -34,6 +34,10 @@ export interface Config {
   outputDir: string
   /** 配音（TTS）配置（0.5.0 规划 §5）：不配置则旁白只出字幕、不发声。 */
   tts?: TtsConfig
+  /** 重复发起护栏阈值（0.6.0 规划 §3.3）：缺省 3 软提示 / 6 硬拒绝（同参）、15/30（同 spec 窗口内）。 */
+  guard?: { softAt?: number; hardAt?: number; specSoftAt?: number; specHardAt?: number; windowMs?: number }
+  /** 新建 spec 的缺省画质（0.6.0）：模型建片不写 fps/width/height 时生效；模型显式传参或用户在会话里指定时以参数为准。 */
+  defaults?: { fps?: number; width?: number; height?: number }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -51,6 +55,18 @@ export const Config: Schema<Config> = Schema.object({
     timeoutMs: Schema.number().description('单条合成超时（毫秒），默认 120000'),
     retries: Schema.number().description('单条失败后的额外重试次数（默认 2，退避 500ms/1500ms；0 关闭）'),
   }).description('配音配置：留空 = 旁白只出字幕不发声'),
+  guard: Schema.object({
+    softAt: Schema.number().description('同一参数第 N 次起软提示（默认 3）'),
+    hardAt: Schema.number().description('同一参数第 N 次起拒绝执行（默认 6）'),
+    specSoftAt: Schema.number().description('同一 spec 在窗口内第 N 次起软提示，含换参（默认 15）'),
+    specHardAt: Schema.number().description('同一 spec 在窗口内第 N 次起拒绝执行（默认 30）'),
+    windowMs: Schema.number().description('计数窗口毫秒（默认 600000 = 10 分钟）'),
+  }).description('重复发起护栏（防模型死循环）：spec 被 patch 后计数自动重置，正当的修改-复查循环不受误伤'),
+  defaults: Schema.object({
+    fps: Schema.number().description('新建 spec 的缺省帧率（未配置为 30）'),
+    width: Schema.number().description('新建 spec 的缺省画布宽（未配置为 1280）'),
+    height: Schema.number().description('新建 spec 的缺省画布高（未配置为 720）'),
+  }).description('新建 spec 的缺省画质：模型建片不带 fps/width/height 时生效；模型显式传参或用户在会话里指定时仍以参数为准'),
 })
 
 const DEFAULT_OUTPUT_DIR = './.dsh/anim'
@@ -206,7 +222,14 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   const registry = new AnimRendererRegistry()
   // 配音服务（0.5.0 §5）：配置了 tts.command 才可用；未配置时旁白只出字幕
   const tts = config.tts?.command && config.tts.command.length > 0 ? createTtsService(config.tts as TtsConfig) : undefined
-  const deps: AnimDeps = { store, renderers: registry, outputDir, ...(tts ? { tts } : {}) }
+  const deps: AnimDeps = {
+    store,
+    renderers: registry,
+    outputDir,
+    ...(tts ? { tts } : {}),
+    ...(config.guard ? { guard: config.guard } : {}),
+    ...(config.defaults ? { defaults: config.defaults } : {}),
+  }
   // jobs 服务捕获（0.5.0 §2.1 真机调查结论）：cordis 4 按 inject 声明**许可**
   // 服务属性访问（未声明=抛错），而把 jobs 写进本插件的 inject 会在宿主缺失
   // 该服务时把挂载**延迟到永远**（冒烟实证：裸 cordis 上插件不再启动）。
@@ -215,6 +238,10 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   // 宿主没有 jobs 时子插件静默不启动，主插件照常挂载、渲染维持同步回退。
   const jobsBox: { value?: unknown } = {}
   captureOptionalService(ctx, ['jobs'], jobsBox)
+  // 路由鉴权捕获（0.6.0 N9）：宿主 connection 服务在则 /dsh-anim 逐请求做
+  // requestRejection（与 /api 同款），不在则退回现状（路由保持可用）
+  const authBox: { value?: unknown } = {}
+  captureOptionalService(ctx, ['connection'], authBox)
   const hydrate = makeSessionHydrator(store, { sessionsDir })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
@@ -223,7 +250,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media, jobsBox }))
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
   // /dsh-anim 路由：宿主有 webServer（dsh web）才挂得上，headless 形态整段不存在
-  mountAnimWebRoutes(ctx, { store, tracker, media, outputDir })
+  mountAnimWebRoutes(ctx, { store, tracker, media, outputDir, auth: authBox })
 }
 
 /**

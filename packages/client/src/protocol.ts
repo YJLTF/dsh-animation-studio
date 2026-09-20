@@ -147,8 +147,24 @@ export interface RenderStatus {
   frames?: Array<{ atMs: number; path: string }>
 }
 
-/** 从工作台状态 API 里找一条渲染任务；路由不可达返回 null。 */
+/**
+ * 查一条渲染/预览任务。0.6.0 起优先走单任务端点 `/dsh-anim/api/job?id=`
+ * （不再为找一条记录拉全量 state）；端点 404（旧版插件/宿主重启清簿）时
+ * 回退全量 state 查找。都拿不到返回 null。
+ */
 export async function fetchRenderStatus(jobId: string, signal?: AbortSignal): Promise<RenderStatus | null> {
+  try {
+    const res = await fetch(`/dsh-anim/api/job?id=${encodeURIComponent(jobId)}`, { signal })
+    if (res.ok) {
+      const data: unknown = await res.json()
+      const job = (data as { job?: unknown }).job
+      return job !== null && typeof job === 'object' ? (job as RenderStatus) : null
+    }
+    if (res.status !== 404) return null
+  } catch (err) {
+    if (signal?.aborted) return null
+    throw err
+  }
   const res = await fetch('/dsh-anim/api/state', { signal })
   if (!res.ok) return null
   const data: unknown = await res.json()
@@ -216,3 +232,7 @@ export const renderSpecInstruction = (specId: string): string =>
 /** 撤销最近一次修改：agent 调 anim_undo。 */
 export const undoLatestInstruction = (specId: string): string =>
   PANEL_INSTRUCTION_PREFIX + JSON.stringify({ action: 'undo_latest', specId })
+
+/** 终止后台任务（0.6.0 规划 §6.2）：agent 用 job_kill 终止指定任务。 */
+export const killJobInstruction = (specId: string, jobId: string): string =>
+  PANEL_INSTRUCTION_PREFIX + JSON.stringify({ action: 'kill_job', specId, jobId })

@@ -20,6 +20,7 @@ import { promisify } from 'node:util'
 // 离线打包器在暂存目录里的 npm install 不会被它绊住
 import {
   ANIMATABLE_BY_TYPE,
+  chartGeometry,
   COMPONENT,
   dedupeWarnings,
   encodeFrames,
@@ -30,6 +31,7 @@ import {
   generateProjectMeta,
   MotionCanvasRenderer,
   muxAudioTracks,
+  niceMax,
   pickScenes,
   sceneFrameBoundaries,
   sceneFingerprint,
@@ -51,7 +53,7 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
+import { AnimOpError, coerceScene, opCreateSpec, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
@@ -664,6 +666,8 @@ check('preset: anim-studio 预设文件齐全且含 persona 方法论锚点', ()
   for (const anchor of ['stop:"specEnd"', '{"kind":"back"}', 'props.code', 'narration/cues', 'fontFamily', 'scene.exit']) {
     assert.ok(agent.includes(anchor), `persona 视频技巧应提到 ${anchor}`)
   }
+  // 0.6.0 缺省画质可配置：方法论要指向工具描述的真实档位（defaults 配置）
+  assert.ok(agent.includes('缺省档位以工具描述为准'), 'persona 应说明画质缺省看工具描述（defaults 配置）')
 })
 
 /* ------------------------------------------------------------------ host */
@@ -1025,7 +1029,8 @@ await checkA('opRender: scenes 切片默认落 solo 路径，绝不覆盖正片�
   const sliced = await opRender(deps, { specId: 'gd', scenes: [0] }, new AbortController().signal, emit)
   assert.match(sliced.outputPath, /gd-solo-0\.mp4$/, '切片渲染默认落 solo 路径')
   assert.ok(!sliced.outputPath.endsWith('gd.mp4'), '不得写正片路径')
-  const explicit = await opRender(deps, { specId: 'gd', scenes: [1], outputPath: '.tmp/xyz.mp4' }, new AbortController().signal, emit)
+  // 显式 outputPath 由调用者决定（0.6.0 起越界 scenes 在预检即被拒绝，夹具用合法下标）
+  const explicit = await opRender(deps, { specId: 'gd', scenes: [0], outputPath: '.tmp/xyz.mp4' }, new AbortController().signal, emit)
   assert.match(explicit.outputPath, /xyz\.mp4$/, '显式 outputPath 由调用者决定')
   assert.deepEqual(paths, [sliced.outputPath, explicit.outputPath], '渲染器拿到的就是解析后的路径')
 })
@@ -1061,7 +1066,33 @@ await checkA('sliceSpeechForScenes: 语音轨按选中幕过滤并平移到切�
   assert.equal(cross.tracks[0]?.durationMs, 2500, '尾巴裁到窗口右缘（4000 − 1500）')
 })
 
-await checkA('opPreview: 同参重复发起护栏——第 3 次起票据给纠正指引（真机 turn 17 回归）', async () => {
+await checkA('opCreateSpec: 缺省画质三层生效——参数 > defaults 配置 > 内置 30fps/1280×720（0.6.0）', async () => {
+  const emitted: AnimEvent[] = []
+  const emit = (event: AnimEvent): void => { emitted.push(event) }
+  const store = new SpecStore()
+  const registry = new AnimRendererRegistry()
+  // 未配置：内置缺省
+  const bare: AnimDeps = { store, renderers: registry, outputDir: '.tmp' }
+  const r1 = opCreateSpec(bare, { specId: 'q1', title: '未配置' }, emit)
+  assert.equal(r1.fps, 30)
+  assert.deepEqual(r1.size, { width: 1280, height: 720 })
+  // 配置 defaults：生效
+  const configured: AnimDeps = { store, renderers: registry, outputDir: '.tmp', defaults: { fps: 60, width: 1920, height: 1080 } }
+  const r2 = opCreateSpec(configured, { specId: 'q2', title: '配置生效' }, emit)
+  assert.equal(r2.fps, 60, 'defaults.fps 生效')
+  assert.deepEqual(r2.size, { width: 1920, height: 1080 }, 'defaults 宽高生效')
+  // 模型显式传参：优先于 defaults
+  const r3 = opCreateSpec(configured, { specId: 'q3', title: '参数优先', fps: 24, width: 640 }, emit)
+  assert.equal(r3.fps, 24, '显式 fps 覆盖 defaults')
+  assert.equal(r3.size.width, 640, '显式宽覆盖 defaults')
+  assert.equal(r3.size.height, 1080, '未传的高度仍用 defaults')
+  // 落库的 spec meta 与回执一致
+  const meta = store.get('q2').meta
+  assert.equal(meta.fps, 60)
+  assert.deepEqual(meta.size, { width: 1920, height: 1080 })
+})
+
+await checkA('opPreview: 同参重复发起护栏——第 3 次软提示、第 6 次硬拒绝、version 重置（0.6.0 §3.3）', async () => {
   const previewImpl: AnimRenderer['preview'] = async () => ({
     frames: [{ atMs: 700, path: 'f.png', width: 1, height: 1 }],
     renderer: 'fake',
@@ -1082,8 +1113,135 @@ await checkA('opPreview: 同参重复发起护栏——第 3 次起票据给纠�
   assert.ok(!t1.next.includes('连续发起') && !t2.next.includes('连续发起'), '前两次不打扰')
   assert.match(t3.next, /连续发起 3 次/, '第三次起给出纠正指引')
   assert.match(t3.next, /job_output/, '指引指向正确姿势')
+  // 签名归一化：999ms 与 700ms 秒级量化后同签名——「挪一点参数」不再绕过计数
   const t4 = (await opPreview(deps, { specId: 'guard-spec', atMs: [999] }, new AbortController().signal, emit, jobs)) as { next: string }
-  assert.ok(!t4.next.includes('连续发起'), '不同参数独立计数')
+  assert.match(t4.next, /连续发起/, '量化后同签名继续计数（旧版此处被换参绕过）')
+  // version 重置：patch 过的 spec 计数清零——正当的修改-复查循环豁免
+  deps.store.patch('guard-spec', [{ op: 'replace', path: '/scenes/0/durationMs', value: 2600 }], '修改后复查')
+  const t5 = (await call()) as { next: string }
+  assert.ok(!t5.next.includes('连续发起'), 'patch 后计数重置')
+  // 硬拒绝：patch 重置后重新计数（t5 为 1），4 次到 5，第 6 次直接抛 AnimOpError，且文案给出路
+  await call()
+  await call()
+  await call()
+  await call()
+  await assert.rejects(
+    call(),
+    (err: unknown) => err instanceof AnimOpError && /拒绝执行/.test(err.message) && /job_output/.test(err.message),
+    '第 6 次同参硬拒绝，文案给出路（job_output / patch 重置 / 等窗口）',
+  )
+})
+
+await checkA('opPreview: spec 维度护栏——换参也计数，治「每次挪一点参数」的绕行（0.6.0 §3.3）', async () => {
+  const previewImpl: AnimRenderer['preview'] = async () => ({
+    frames: [{ atMs: 100, path: 'f.png', width: 1, height: 1 }],
+    renderer: 'fake',
+  })
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT, previewImpl)
+  deps.store.create('guard-spec-2', demoSpec())
+  deps.guard = { specSoftAt: 3, specHardAt: 5 }
+  const jobs: AnimJobsService = {
+    start(spec) {
+      spec.run()
+      return 'anim-preview-spec-guard'
+    },
+  }
+  // 每次都换抽帧点（秒级量化后仍不同签名），靠 spec 维度计数兜住
+  const callN = (ms: number) => opPreview(deps, { specId: 'guard-spec-2', atMs: [ms] }, new AbortController().signal, emit, jobs)
+  const t1 = (await callN(100)) as { next: string }
+  const t2 = (await callN(2000)) as { next: string }
+  assert.ok(!t1.next.includes('已对同一 spec') && !t2.next.includes('已对同一 spec'), '窗口内未达阈值不打扰')
+  const t3 = (await callN(3000)) as { next: string }
+  assert.match(t3.next, /已对同一 spec 发起 3 次/, 'spec 维度第 3 次软提示（阈值压低后）')
+  await callN(4000)
+  await assert.rejects(callN(5000), (err: unknown) => err instanceof AnimOpError && /拒绝执行/.test(err.message), 'spec 维度硬拒绝')
+  // patch 重置对 spec 维度同样生效
+  deps.store.patch('guard-spec-2', [{ op: 'replace', path: '/scenes/0/durationMs', value: 2800 }], '修改')
+  const t6 = (await callN(100)) as { next: string }
+  assert.ok(!t6.next.includes('已对同一 spec'), 'patch 后 spec 维度计数重置')
+})
+
+await checkA('opRender: 完成回执带收束指引 next + specVersion；store 投影 lastRender（0.6.0 §3.1/§3.2）', async () => {
+  const { deps, emitted, emit } = renderFixture(async () => ({ ...RENDER_RESULT }))
+  const view = (await opRender(deps, { specId: 'gd' }, new AbortController().signal, emit)) as { next?: string }
+  assert.match(view.next ?? '', /成片已就绪/, '同步回执带收束指引')
+  assert.match(view.next ?? '', /结束本回合/, '指引要求结束回合')
+  const finished = emitted.find(e => e.type === 'anim/render-finished')
+  assert.match((finished!.data as { next?: string }).next ?? '', /成片已就绪/, 'render-finished 事件带同文指引')
+  assert.equal((finished!.data as { specVersion?: number }).specVersion, 0, '事件带渲染开始时的 spec 版本')
+  // 渲染后未修改：lastRender 投影 + 抽帧/重渲的语境提示
+  const record = deps.store.record('gd')
+  assert.ok(record.lastRender, 'store 投影 lastRender')
+  assert.equal(record.lastRender!.specVersionAtRender, 0, '版本取开跑时')
+  assert.equal(record.lastRender!.outputPath, '.tmp/gd.mp4')
+  // fold 回放同源：同一事件流还原出同一份 lastRender（fixture 直建 store，
+  // fold 输入补一条合成 spec-created 让回放有根）
+  const refolded = foldEvents([
+    { type: 'anim/spec-created', data: { specId: 'gd', spec: deps.store.get('gd') } },
+    ...emitted.map(e => ({ type: e.type, data: e.data })),
+  ])
+  assert.ok(refolded.record('gd').lastRender, 'foldEvents 回放投影 lastRender')
+  assert.equal(refolded.record('gd').lastRender!.specVersionAtRender, 0)
+  // 渲染后未修改再抽帧：回执带「不会产生新信息」提示
+  const previewImpl: AnimRenderer['preview'] = async () => ({
+    frames: [{ atMs: 500, path: 'f.png', width: 1, height: 1 }],
+    renderer: 'fake',
+  })
+  const registry = new AnimRendererRegistry()
+  registry.register({ name: 'fake2', diagnose: async () => ({ renderer: 'fake2', ok: true, issues: [] }), preview: previewImpl, render: async () => ({ ...RENDER_RESULT }) })
+  const deps2: AnimDeps = { store: deps.store, renderers: registry, outputDir: '.tmp' }
+  const pv = (await opPreview(deps2, { specId: 'gd', atMs: [500] }, new AbortController().signal)) as { warnings?: string[] }
+  assert.ok((pv.warnings ?? []).some(w => /未修改/.test(w) && /不会产生新信息/.test(w)), '渲染后未修改的抽帧带语境提示')
+  // patch 之后提示消失：正当复查不受干扰
+  deps.store.patch('gd', [{ op: 'replace', path: '/scenes/0/durationMs', value: 2400 }], '修改')
+  const pv2 = (await opPreview(deps2, { specId: 'gd', atMs: [500] }, new AbortController().signal)) as { warnings?: string[] }
+  assert.ok(!(pv2.warnings ?? []).some(w => /不会产生新信息/.test(w)), 'patch 后不再提示未修改')
+})
+
+await checkA('opRender: 渲染前预检——scenes 越界/空数组快速失败，缺资产文件报人话（0.6.0 §4.1）', async () => {
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT)
+  await assert.rejects(
+    opRender(deps, { specId: 'gd', scenes: [] }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /空数组/.test(err.message),
+    '空 scenes 数组给可执行报错',
+  )
+  await assert.rejects(
+    opRender(deps, { specId: 'gd', scenes: [5] }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /越界下标 5/.test(err.message),
+    'scenes 越界点名合法范围',
+  )
+  // 缺失的资产引用：登记后删文件的形态
+  const spec = deps.store.get('gd')
+  spec.scenes[0]!.layers.push({
+    id: 'pic', name: '图', type: 'image',
+    props: { src: 'asset:ghost' }, tracks: [],
+  } as never)
+  spec.assets.ghost = { kind: 'image', src: '.tmp/ghost.png' }
+  await assert.rejects(
+    opRender(deps, { specId: 'gd' }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /渲染预检失败/.test(err.message) && /ghost/.test(err.message),
+    '资产源文件丢失在预检快速失败，不烧渲染开销',
+  )
+  // 未登记的引用同样拦截
+  ;(spec.scenes[0]!.layers.at(-1) as { props: { src: string } }).props.src = 'asset:never-registered'
+  await assert.rejects(
+    opRender(deps, { specId: 'gd' }, new AbortController().signal, emit),
+    (err: unknown) => err instanceof AnimOpError && /未登记/.test(err.message),
+  )
+})
+
+await checkA('opPreview: 抽帧点卫生——越界钳到片尾并提示（0.6.0 §4.2）', async () => {
+  const seen: Array<number[] | undefined> = []
+  const previewImpl: AnimRenderer['preview'] = async request => {
+    seen.push(request.atMs ? [...request.atMs] : undefined)
+    return { frames: [], renderer: 'fake' }
+  }
+  const { deps, emit } = renderFixture(async () => RENDER_RESULT, previewImpl)
+  deps.store.create('hygiene', demoSpec())
+  const view = (await opPreview(deps, { specId: 'hygiene', atMs: [500, 99999, -20] }, new AbortController().signal, emit)) as { warnings?: string[] }
+  assert.ok((view.warnings ?? []).some(w => /钳到有效范围/.test(w)), '越界抽帧点给警告')
+  const total = deps.store.durationMs('hygiene')
+  assert.deepEqual(seen[0], [500, total, 0], '负值钳 0、越界钳片尾，顺序保持不动')
 })
 
 await checkA('opRender: 进度 done 超过预估 total 时 percent 钳在 100（真机实测 92/90 → 102%）', async () => {
@@ -1312,6 +1470,23 @@ await checkA('/dsh-anim 内核：渲染任务簿 + 状态 API + 媒体放行', a
   assert.equal(state.specs[0]?.renders[0]?.status, 'completed')
   assert.equal(state.specs[0]?.renders[0]?.percent, 50)
   assert.equal(state.renders.length, 1)
+
+  // /api/job（0.6.0 §6.4）：单任务查询命中与 404；state 的 spec 带 lastRender 投影
+  const jobRes = await kernel({ method: 'GET', url: '/dsh-anim/api/job?id=anim-render-1', headers: {} })
+  assert.equal(jobRes.status, 200)
+  const job = (JSON.parse((await drain(jobRes)).toString('utf8')) as { job: { jobId: string; status: string } }).job
+  assert.equal(job.jobId, 'anim-render-1')
+  assert.equal(job.status, 'completed')
+  assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/api/job?id=nope', headers: {} })).status, 404)
+  assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/api/job', headers: {} })).status, 404)
+
+  // /dsh-anim/ 总览页（0.6.0 §6.1）：HTML 直接可服务，含标题与挂载点
+  const page = await kernel({ method: 'GET', url: '/dsh-anim/', headers: {} })
+  assert.equal(page.status, 200)
+  assert.match(page.headers['content-type'] ?? '', /text\/html/)
+  const pageHtml = (await drain(page)).toString('utf8')
+  assert.match(pageHtml, /动画工作台/)
+  assert.match(pageHtml, /\/dsh-anim\/api\/state/, '页面轮询 state 端点')
 
   // /api/spec：整份 spec 可读；未知 id 404
   const specRes = await kernel({ method: 'GET', url: '/dsh-anim/api/spec?id=webdemo', headers: {} })
@@ -1926,9 +2101,9 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
   }
   const { spec: expanded, warnings } = expandNarration(spec)
   assert.equal(expanded.narration, undefined, '展开后顶层 narration 摘除')
-  assert.deepEqual(expanded.scenes[0]!.subtitles, [{ text: '跨幕字幕', startMs: 1000, endMs: 2000 }])
+  assert.deepEqual(expanded.scenes[0]!.subtitles, [{ text: '跨幕字幕', startMs: 1000, endMs: 2000, continues: true }])
   assert.equal(expanded.scenes[1]!.subtitles!.length, 2)
-  assert.deepEqual(expanded.scenes[1]!.subtitles![0], { text: '跨幕字幕', startMs: 0, endMs: 200 })
+  assert.deepEqual(expanded.scenes[1]!.subtitles![0], { text: '跨幕字幕', startMs: 0, endMs: 200 }, '幕 b 内自然结束的段不带 continues')
   assert.equal(expanded.scenes[1]!.subtitles![1]!.text, '长'.repeat(85), '超长 cue 不截断（折行在渲染端做）')
   assert.equal(expanded.scenes[1]!.subtitles![1]!.startMs, 500, '全局 2500ms 在幕 b 的本地时间是 500ms')
   assert.ok(warnings.some(w => w.includes('5000')), JSON.stringify(warnings))
@@ -1942,13 +2117,49 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
   const solo = { ...expanded, scenes: [expanded.scenes[1]!] }
   const tsx = generateProject(solo).files.find(f => f.path.startsWith('scenes/s0-'))!.content
   assert.ok(tsx.includes('"跨幕字幕"'), `solo 切片后字幕应保留：\n${tsx}`)
-  // 跨幕字幕的幕 b 段是 [0,200)：时段 <300ms 时渐变自动减半为 100ms
-  assert.ok(tsx.includes('delay(0, nsub0tx().opacity(1, 0.1)'), tsx)
+  // 跨幕字幕的幕 b 段是 [0,200)：起点是延续——首帧即全显（初值 opacity={1}）、
+  // 不吃淡入；但 cue 在幕 b 内自然结束，淡出照常（切幕守则只管幕边界）
+  assert.ok(tsx.includes('opacity={1} />)'), `跨幕段初值应全显：\n${tsx}`)
+  assert.ok(!tsx.includes('delay(0, nsub0tx().opacity(1,'), '跨幕延续段不吃淡入')
+  assert.ok(tsx.includes('delay(0.1, nsub0tx().opacity(0, 0.1)'), tsx)
+  // 幕 a 段 [1000,2000)：continues=true → 不提前淡出，顶到切幕帧
+  const aTsx = generateProject({ ...expanded, scenes: [expanded.scenes[0]!] }).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(!aTsx.includes('nsub0tx().opacity(0,'), `幕 a 延续段应顶到切幕不淡出：\n${aTsx}`)
   // 与本幕交集不足 30ms 的尾巴不生成
   const edge = demoSpec()
   edge.scenes = spec.scenes
   edge.narration = { cues: [{ atMs: 1980, text: '擦边', durationMs: 40 }] }
   assert.equal(expandNarration(edge).spec.scenes[1]!.subtitles, undefined)
+})
+
+check('codegen: 字幕切幕守则——淡出提前到幕尾前收完、正点 cue 不受影响', () => {
+  const spec = demoSpec()
+  spec.scenes[0].subtitles = [
+    { text: '顶到幕尾的', startMs: 100, endMs: 2000 }, // endMs 被钳到 2000-120=1880
+    { text: '中间的', startMs: 600, endMs: 1000 },
+  ]
+  const { files } = generateProject(spec)
+  const tsx = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // 顶到幕尾的：fadeOutAt = 1880-150 = 1730，1.88s（幕尾前 120ms）已完全消失
+  assert.ok(tsx.includes('delay(1.73, nsub0bg().opacity(0, 0.15)'), `幕尾前应提前收完淡出：\n${tsx}`)
+  assert.ok(tsx.includes('delay(1.73, nsub0tx().opacity(0, 0.15)'), tsx)
+  // 中间的：不顶幕尾，fade 时刻按 cue 原时段
+  assert.ok(tsx.includes('delay(0.6, nsub1bg().opacity(0.6, 0.15)'), tsx)
+  assert.ok(tsx.includes('delay(0.85, nsub1tx().opacity(0, 0.15)'), tsx)
+  // 擦边字幕：钳完剩不足 30ms 整条不生成
+  const skim = demoSpec()
+  skim.scenes[0].subtitles = [{ text: '擦边', startMs: 1970, endMs: 2000 }]
+  const skimTsx = generateProject(skim).files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  assert.ok(!skimTsx.includes('nsub0bg'), '幕尾 30ms 内的残余 cue 不生成')
+  // continues=true（跨幕延续）：不提前淡出、顶到切幕帧
+  const cont = demoSpec()
+  cont.scenes[0].subtitles = [{ text: '延续', startMs: 1500, endMs: 2000, continues: true }]
+  const contTsx = generateProject(cont).files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  assert.ok(!contTsx.includes('nsub0bg().opacity(0,'), `延续段不做淡出：\n${contTsx}`)
+  assert.ok(contTsx.includes('delay(1.5, nsub0bg().opacity(0.6, 0.15)'), contTsx)
+  // 延续段的 lastEnd 按淡入完成时刻（1650）计，不拿 endMs 撑——tail waitFor
+  // 恰好补到 2s，场景不会提前收场也不会拖长
+  assert.ok(contTsx.includes('yield* waitFor(0.35)'), `tail 应补足到 2s：\n${contTsx}`)
 })
 
 check('codegen: 字幕条/转场扩族/exit 退场落进 TSX——绝对时间 delay、不与尾部 waitFor 打架', () => {
@@ -2358,6 +2569,131 @@ await checkA('codegen: 渐变 fill / reveal 打字机 / in-inOut 缓动 / video 
   spec.scenes[0]!.layers[0]!.props.fill = { type: 'linearX', stops: [] } as never
   const bad = generateProject(spec, { resolutionScale: 1 })
   assert.ok(bad.warnings.some(w => w.includes('渐变描述无效')), '坏渐变告警摘除')
+})
+
+await checkA('codegen: chart/curve/grid 图层 + filters/shadow/followPath/letterSpacing 落进生成物（0.6.0 §5）', async () => {
+  const spec = demoSpec()
+  spec.scenes = [{
+    id: 'm2', name: '扩面演示', durationMs: 4000,
+    layers: [
+      {
+        id: 'sales', name: '柱状图', type: 'chart',
+        props: {
+          chartType: 'bar', x: 0, y: -60,
+          data: [{ label: '一月', value: 42 }, { label: '二月', value: 83 }, { label: '三月', value: 65 }],
+        },
+        tracks: [{ id: 'sales-grow', target: 'props.progress', keys: [{ atMs: 0, value: 0 }, { atMs: 1200, value: 1, ease: { kind: 'easeOut' } }] }],
+      },
+      {
+        id: 'trend', name: '折线图', type: 'chart',
+        props: {
+          chartType: 'line', y: 60, palette: ['#FFB020'], maxValue: 100, showAxis: true,
+          data: [{ label: 'A', value: 20 }, { label: 'B', value: 55 }, { label: 'C', value: 90 }],
+        },
+        tracks: [{ id: 'trend-draw', target: 'props.progress', keys: [{ atMs: 400, value: 0 }, { atMs: 2000, value: 1 }] }],
+      },
+      {
+        id: 'path', name: '轨迹', type: 'curve',
+        props: { points: [[-300, 200], [0, 120], [300, 220]], stroke: '#5DD39E', smoothness: 0.7 },
+        tracks: [],
+      },
+      {
+        id: 'ball', name: '小球', type: 'circle',
+        props: { size: 24, fill: '#FF7A6B', followPath: 'path', filters: { blur: 0 } },
+        tracks: [{ id: 'ball-move', target: 'props.progress', keys: [{ atMs: 0, value: 0 }, { atMs: 3000, value: 1, ease: { kind: 'easeInOut' } }] }],
+      },
+      {
+        id: 'card', name: '卡片', type: 'rect',
+        props: { width: 200, height: 100, fill: '#1B3A5C', shadowColor: '#000000', shadowBlur: 18, shadowOffset: [4, 8], filters: { grayscale: 0.5 } },
+        tracks: [],
+      },
+      {
+        id: 'tag', name: '字距标签', type: 'text',
+        props: { text: 'TRACKING', y: -200, fontSize: 40, letterSpacing: 12 },
+        tracks: [],
+      },
+    ],
+  }]
+  spec.scenes.push({
+    id: 'grid-math', name: '网格', durationMs: 1000,
+    layers: [
+      { id: 'axes', name: '坐标网格', type: 'grid', props: { spacing: [80, 60], stroke: '#2A3B4D' }, tracks: [] },
+    ],
+  })
+  const { files, warnings } = generateProject(spec, { resolutionScale: 1 })
+  const scene1 = files.find(f => f.path.includes('m2'))!.content
+  const scene2 = files.find(f => f.path.includes('grid_math'))!.content
+
+  // chart（bar）：容器 + 进度信号 + 柱体按信号生长（height/y 双函数属性，从轴底长起）
+  assert.match(scene1, /const \w+_sales_progress = createSignal\(0\);/, 'bar 进度信号初值取首关键帧')
+  assert.match(scene1, /<Node ref=\{\w+_sales\}>/, 'chart 组合为 Node 容器')
+  assert.match(scene1, /height=\{\(\) => Math\.max\(0\.001, [\d.]+ \* Math\.min\(1, Math\.max\(0, \w+_sales_progress\(\)\)\)\)\}/, '柱高随 progress 生长（带 clamp）')
+  assert.match(scene1, /y=\{\(\) => [-\d.]+ - Math\.max\(0\.001, [\d.]+ \* Math\.min\(1, Math\.max\(0, \w+_sales_progress\(\)\)\)\) \/ 2\}/, '柱 y 随生长保持底边贴轴')
+  assert.match(scene1, /\w+_sales_progress\(1, 1\.2, easeOutCubic\)/, 'progress 轨道补间信号')
+  assert.match(scene1, /textAlign=\{"right"\}/, 'Y 轴刻度标签右对齐')
+  assert.match(scene1, /fill=\{"#4C9AFF"\}/, '缺省色板取内置色')
+  // chart（line）：折线 end 绑定进度信号，调色板覆盖生效
+  assert.match(scene1, /end=\{\(\) => Math\.min\(1, Math\.max\(0, \w+_trend_progress\(\)\)\)\}/, '折线描画绑定 progress')
+  assert.match(scene1, /stroke=\{"#FFB020"\}/, 'palette 覆盖折线色')
+  assert.match(scene1, /lineWidth=\{4\}/, '折线描边宽度')
+  // curve + followPath：Spline + 小球位置由路径采样驱动
+  assert.match(scene1, /Spline/, 'curve 映射 Spline')
+  assert.match(scene1, /smoothness=\{0\.7\}/, 'smoothness 直通')
+  assert.match(scene1, /const \w+_ball_fp = createSignal\(0\);/, 'followPath 进度信号')
+  assert.match(scene1, /x=\{\(\) => \w+_path\(\)\.getPointAtPercentage\(Math\.min\(1, Math\.max\(0, \w+_ball_fp\(\)\)\)\)\.position\.x\}/, 'x 由路径采样驱动')
+  assert.ok(!/n\d+_ball\(\)\.x\(/.test(scene1), 'ball 的 x 轨道初值不再直写节点')
+  assert.match(scene1, /_ball_fp\(1, 3, easeInOutCubic\)/, 'progress 轨道补间 followPath 信号')
+  // filters / shadow / letterSpacing
+  assert.match(scene1, /grayscale\(0\.5\)/, 'grayscale 滤镜生成')
+  assert.ok(!/blur\(/.test(scene1), 'blur 0 视为未启用，不生成')
+  assert.match(scene1, /shadowColor=\{"#000000"\}/, '阴影颜色直通')
+  assert.match(scene1, /shadowBlur=\{18\}/, '阴影模糊直通')
+  assert.match(scene1, /shadowOffset=\{\[4, 8\]\}/, '阴影偏移数组')
+  assert.match(scene1, /letterSpacing=\{12\}/, '字间距直通')
+  // grid：spacing 数组直通、缺尺寸按画布满幅兜底
+  assert.match(scene2, /Grid/, 'grid 映射 Grid 组件')
+  assert.match(scene2, /spacing=\{\[80,60\]\}/, 'spacing [w,h] 直通')
+  assert.match(scene2, /width=\{1280\}/, 'grid 缺尺寸按画布宽兜底')
+  assert.match(scene2, /height=\{720\}/, 'grid 缺尺寸按画布高兜底')
+  // 图表几何纯函数口径
+  assert.equal(niceMax(83), 100, 'niceMax 83→100')
+  assert.equal(niceMax(0.16), 0.2, 'niceMax 小数位')
+  const geo = chartGeometry({ chartType: 'bar', data: [{ label: 'a', value: 50 }, { label: 'b', value: 100 }] }, 720, 440)
+  assert.equal(geo.max, 100)
+  assert.equal(geo.bars[1]!.fullHeight, geo.plot.bottom - geo.plot.top, '满值柱高 = 绘图区高')
+  assert.equal(geo.bars[0]!.fullHeight, (geo.plot.bottom - geo.plot.top) / 2, '半值柱高减半')
+  assert.equal(chartGeometry({ chartType: 'line', data: [{ label: 'x', value: 1 }] }).linePoints.length, 2, '单点折线复制为两点')
+  assert.deepEqual(warnings.filter(w => w.includes('不支持')), [], '新属性不被白名单误伤')
+})
+
+check('validateSpec: chart 数据形态硬校验 + followPath 引用体检（0.6.0 §5）', () => {  const spec = demoSpec()
+  spec.scenes = [{
+    id: 'v', name: '校验', durationMs: 2000,
+    layers: [
+      { id: 'c1', name: '坏数据', type: 'chart', props: { chartType: 'pie', data: [{ label: 'x', value: 'abc' }] }, tracks: [] },
+      { id: 'c2', name: '悬空跟随', type: 'circle', props: { size: 20, followPath: 'ghost' }, tracks: [] },
+      { id: 'c3', name: '类型不合法', type: 'circle', props: { size: 20, followPath: 'c1' }, tracks: [] },
+    ],
+  }]
+  const r = validateSpec(spec)
+  assert.equal(r.ok, false)
+  const messages = r.errors.map(e => e.message).join('\n')
+  assert.match(messages, /chartType 应为 "bar" 或 "line"/, '未知 chartType 报错')
+  assert.match(messages, /value 应为有限数字/, '坏数值报错')
+  assert.match(messages, /引用了本幕不存在的图层 ghost/, 'followPath 悬空引用报错')
+  assert.match(messages, /只能跟随 line\/arrow\/curve/, 'followPath 类型限制报错')
+  // 合法形态：bar+line 图表、curve 被跟随、缺 progress 只提示不报错
+  const okSpec = demoSpec()
+  okSpec.scenes = [{
+    id: 'v2', name: '合法', durationMs: 2000,
+    layers: [
+      { id: 'path', name: '路径', type: 'curve', props: { points: [[-100, 0], [100, 0]], stroke: '#fff' }, tracks: [] },
+      { id: 'dot', name: '点', type: 'circle', props: { size: 10, fill: '#fff', followPath: 'path' }, tracks: [] },
+    ],
+  }]
+  const ok = validateSpec(okSpec)
+  assert.equal(ok.ok, true, '合法 followPath 过校验')
+  assert.ok(ok.warnings.some(w => w.includes('props.progress 轨道')), '缺 progress 轨道给软警告')
 })
 
 await checkA('synthesizeNarration: 注入合成器逐 cue 产轨 + 字幕跟随实测 + 溢出对账（§5.3）', async () => {

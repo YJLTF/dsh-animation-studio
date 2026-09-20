@@ -289,6 +289,11 @@ function indexMediaFromResult(media: { add(path: string): void } | undefined, re
  */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
   const { deps, sink, sessionsDir, hydrate } = options
+  // 缺省画质的实际生效值（0.6.0）：工具描述带真实档位——模型读描述就知道
+  // 本次部署的缺省，不用用户每次口述；模型显式传参仍优先
+  const defaultFps = deps.defaults?.fps ?? 30
+  const defaultWidth = deps.defaults?.width ?? 1280
+  const defaultHeight = deps.defaults?.height ?? 720
   /**
    * 每次工具调用构造自己的 emit：闭包绑定当次 agent，后台渲染在 job 里
    * 异步发事件时归因也不会被其他会话的工具调用覆盖（优化清单 O3）。
@@ -361,14 +366,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_create_spec',
       description:
         '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。'
+        + `画布与帧率在此刻定死并贯穿全片（预览/渲染/段缓存都以它为准）：本部署缺省 ${defaultWidth}×${defaultHeight} @ ${defaultFps}fps（宿主可用 defaults 配置改），用户对画质有要求时在这里传参，建完再改要走 anim_patch 且全量重渲。`
         + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。'
         + '旁白字幕：用 anim_patch 往 /narration/cues 写 [{ atMs, text, durationMs? }]（atMs 是全片绝对毫秒，durationMs 缺省按 4 字/秒估算），渲染时自动出底部字幕条（字号随画布自适应、超宽自动折行，一条建议 ≤40 字）；写了字幕的片子，画布底部字幕带是保留区，正文图层的 y 要避开。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec 标识，建议用短横线命名，如 gradient-descent' },
         title: { type: 'string', required: true, description: '片名' },
-        fps: { type: 'number', description: '帧率，默认 30' },
-        width: { type: 'number', description: '画布宽，默认 1280' },
-        height: { type: 'number', description: '画布高，默认 720' },
+        fps: { type: 'number', description: `帧率，缺省 ${defaultFps}` },
+        width: { type: 'number', description: `画布宽，缺省 ${defaultWidth}` },
+        height: { type: 'number', description: `画布高，缺省 ${defaultHeight}` },
         background: { type: 'string', description: '背景色，如 #101418' },
         fontFamily: { type: 'string', description: '字体族，中文建议 Noto Sans CJK SC' },
       },
@@ -450,11 +456,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + '三条高频错误，写之前先自查：① ease 一律写对象 {"kind":"easeInOut"}，不能直接写 "easeInOut" 字符串；'
             + '② 每个图层必填五字段 id/name/type/props/tracks，一个都不能少（漏 name/tracks 工具会自动补并在回执 repairs 里回报，漏 props/type 则直接报错）；'
             + '③ type 名全小写。'
-            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | polygon | star | svg | code | math | group | audio | video。'
+            + 'type 可选：text | rect | circle | ellipse | image | line | arrow | curve | grid | polygon | star | svg | code | math | chart | group | audio | video。'
             + 'circle/ellipse 用 size（或 width/height，width≠height 即椭圆），radius 会被换算为 size。'
             + 'line/arrow 用 points: [[x,y],...] 定折线，stroke 描边色、lineWidth 描边宽度（SVG 习惯名 strokeWidth 会被自动换算成 lineWidth）、lineDash 虚线样式（如 [8,6]，rect 也支持）；'
             + 'arrow 自动带末端箭头，画线进度用 start/end（0~1）轨道。'
             + 'polygon 用 sides（边数）+ size（正多边形）；star 用 size + sides（角数，默认 5），形状自动生成。'
+            + 'curve 用 points（同折线）+ smoothness（0~1，默认 0.5，0=折线）画平滑曲线（函数图象/轨迹批注），start/end 画线进度与箭头同 line。'
+            + 'grid 用 spacing（如 60 或 [80,50]）+ stroke/lineWidth 画坐标网格，缺尺寸按画布满幅，与 math/chart 搭配讲函数图象。'
+            + 'chart 用 chartType: "bar"|"line" + data: [{label, value}] 画数据图表（v1 单系列），maxValue/showAxis/palette/labelSize 可选；'
+            + '入场动画写 props.progress 轨道 0→1——柱体逐根生长、折线描画，不写则静态成图。'
             + 'text 支持 textAlign（left/center/right）；长段落写 maxWidth + textWrap:true（超宽自动折行；textWrap 值为字符串 "pre" 时只认显式换行）；'
             + '逐字打字机：text 图层的 props.reveal 轨道写 0→1 关键帧，文本按进度逐字浮现（旁白配音的标配）。'
             + 'fill 可以是纯色字符串或渐变对象 {type:"linear", from:[x,y], to:[x,y], stops:[[0,"#色"],[1,"#色"]]}（radial 用 fromRadius/toRadius；坐标是图层本地坐标，中心原点）。'
@@ -467,6 +477,11 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
             + 'audio 不进画面，成片渲染时自动混音（回执 audioTracks 列出；anim_preview 抽帧无音频）。'
             + '全片 BGM 的标准写法：第一幕放 audio 图层，loop:true + stop:"specEnd"。'
             + 'video 用 src:"asset:<assetId>" 引用视频资产，props 可带 time（源内起点秒）、playbackRate、loop、width/height；嵌入实拍片段用。'
+            + '全部图层通用：props.filters 写 CSS 滤镜对象（如 {blur:12} 虚化周边、{grayscale:1} 灰度弱化、{brightness:1.2}；'
+            + 'blur 为 px，brightness/contrast/saturate 是倍率 1=原样，grayscale/invert/sepia 为 0~1，hue 为度）；'
+            + 'props.shadowColor/shadowBlur/shadowOffset 写阴影；text 可写 letterSpacing（字间距 px）；image 可写 radius（圆角裁切）。'
+            + '沿路径运动：图层 props.followPath 填同场景内 line/arrow/curve 的图层 id，再写 props.progress 轨道 0→1，'
+            + '图层位置即沿该路径移动（轨迹演示）；followPath 生效时 x/y 由路径接管。'
             + 'transition 可选 none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn；'
             + 'scene.exit 同形（fade/slide 系列）在幕尾整体退场，占用本幕最后 exit.durationMs。'
             + '缓动除 linear/easeIn/easeOut/easeInOut/cubicBezier/spring 外还有 bounce（弹跳落定）/elastic（弹性超调）/back（回勾起手）及各自的 In/InOut 变体（如 bounceIn/backInOut），强调类入场优先用 out 形态。'
@@ -684,7 +699,9 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
         + '回执 speechNotes 报告每条语音的实测时长与溢出（溢出时用 anim_patch 挪时间轴，工具不会自动改）；'
         + '未配置 TTS 时旁白只出字幕（设计内形态，anim_diagnose 的 tts 报告可确认）。'
         + '宿主支持后台任务时立即返回 jobId 并开始渲染，进度以渲染事件可见，结果用 job_output 收集、job_kill 可终止；'
-        + '否则同步等待到出片为止。',
+        + '否则同步等待到出片为止。'
+        + '渲染完成即收尾：回执 next 提醒直接向用户报告结果并结束回合；对未修改的 spec 反复抽帧/重渲没有意义（回执会明说），'
+        + '同参高频连发会被防死循环护栏拒绝（anim_patch 修改 spec 会重置计数）。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec id' },
         outputPath: { type: 'string', description: '输出 MP4 路径，省略则用默认目录' },

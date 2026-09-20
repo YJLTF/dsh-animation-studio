@@ -9,7 +9,7 @@
  * 「一次修改对应一条事件」这个约束在类型上就钉死了。
  */
 
-import { copyFileSync, mkdirSync, readdirSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 
 import type { AnimationSpec, JsonValue, PatchOp, Scene, SpecSummary, ThemeToken } from '@dsh-anim/spec'
@@ -18,7 +18,7 @@ import type { OutlineItem } from '@dsh-anim/store'
 import { SpecStore, SpecStoreError } from '@dsh-anim/store'
 
 import type { AnimEvent, AnimOutlineData } from './events.ts'
-import type { AnimRenderer, AnimRendererRegistry, IncrementalInfo } from './render.ts'
+import type { AnimRenderer, AnimRendererRegistry, IncrementalInfo, RenderResult } from './render.ts'
 import type { SpeechNote, TtsService } from './tts.ts'
 import { synthesizeNarration, type SpeechBuildResult } from './tts.ts'
 
@@ -29,6 +29,10 @@ export interface AnimDeps {
   outputDir: string
   /** 配音服务（0.5.0 §5）：宿主配置了 tts.command 时存在，否则旁白只出字幕。 */
   tts?: TtsService
+  /** 护栏阈值覆盖（0.6.0 §3.3）：不配置用 DEFAULT_GUARD_THRESHOLDS。 */
+  guard?: Partial<GuardThresholds>
+  /** 新建 spec 的缺省画质（0.6.0）：模型建片不带 fps/width/height 时生效。 */
+  defaults?: { fps?: number; width?: number; height?: number }
 }
 
 export type Emit = (event: AnimEvent) => void
@@ -76,13 +80,18 @@ export type CreateSpecResult = {
 }
 
 export function opCreateSpec(deps: AnimDeps, args: CreateSpecArgs, emit: Emit): CreateSpecResult {
+  // 缺省画质三层：模型显式传参 > 宿主 defaults 配置 > 内置 30fps / 1280×720。
+  // 生效值随回执（fps/size）返回，模型与面板看到的都是实际落库值
   const spec: AnimationSpec = {
     version: 1,
     meta: {
       id: args.specId,
       title: args.title,
-      fps: args.fps ?? 30,
-      size: { width: args.width ?? 1280, height: args.height ?? 720 },
+      fps: args.fps ?? deps.defaults?.fps ?? 30,
+      size: {
+        width: args.width ?? deps.defaults?.width ?? 1280,
+        height: args.height ?? deps.defaults?.height ?? 720,
+      },
       background: args.background ?? DEFAULT_THEME.colors.background,
       locale: 'zh-CN',
     },
@@ -582,37 +591,167 @@ export interface PreviewBackgroundTicket {
 /* --------------------------------------------------------- 重复发起护栏 */
 
 /**
- * 同参重复发起护栏（真机 turn 17 教训）：模型把「等待后台任务」误作反复发
- * 同一预览/渲染（wait_agent 是等 Agent Team 队友的工具，对后台任务会立即
- * 空转返回 no-progress，形成 preview→wait_agent→preview 死循环）。同一签名
- * 短期内第 3 次起，在票据/回执里给出纠正指引——任务照常执行不拒绝，只把
- * 正确姿势递到模型眼前。
+ * 护栏阈值（0.6.0 规划 §3.3）：0.5 的软提示被真机证明拦不住死循环（模型 70+
+ * 次同参连发、每次都收到提示、每次都不听），升级为四层——状态（lastRender，
+ * 见 store）→ 收束指引（完成回执 next）→ 软提示（softAt/specSoftAt 起）→
+ * 硬拒绝（hardAt/specHardAt 起）。阈值经插件配置 `guard` 可调。
  */
-const repeatGuardByDeps = new WeakMap<object, Map<string, { count: number; firstAt: number }>>()
-const REPEAT_GUARD_WINDOW_MS = 10 * 60_000
+export interface GuardThresholds {
+  /** 同参第 N 次起软提示（回执附纠正文案，任务照常执行）。 */
+  softAt: number
+  /** 同参第 N 次起硬拒绝（抛 AnimOpError，任务不执行）。 */
+  hardAt: number
+  /** 同 spec 同工具在窗口内第 N 次起软提示（换参也计数——治「每次换一点参数」的绕行）。 */
+  specSoftAt: number
+  /** 同 spec 同工具在窗口内第 N 次起硬拒绝。 */
+  specHardAt: number
+  /** 计数窗口（毫秒）。 */
+  windowMs: number
+}
+
+export const DEFAULT_GUARD_THRESHOLDS: GuardThresholds = {
+  softAt: 3,
+  hardAt: 6,
+  specSoftAt: 15,
+  specHardAt: 30,
+  windowMs: 10 * 60_000,
+}
+
+export interface GuardVerdict {
+  /** 软提示：附进回执 warnings / 票据 next，任务照常执行。 */
+  note?: string
+  /** 硬拒绝文案：调用方必须抛 AnimOpError，任务不执行。永远给出路。 */
+  refuse?: string
+}
+
+interface GuardEntry {
+  count: number
+  firstAt: number
+  /** 计数开始时的 spec 版本：版本变化（patch 过）即重置——合法的修改-检查循环豁免。 */
+  specVersion: number
+}
 
 /** 护栏状态按 deps（= 插件实例）隔离：冒烟多夹具与多插件互不串计数。 */
-export function repeatGuardNote(owner: object, scope: string, key: string): string | undefined {
-  const now = Date.now()
-  let repeatGuard = repeatGuardByDeps.get(owner)
-  if (!repeatGuard) {
-    repeatGuard = new Map()
-    repeatGuardByDeps.set(owner, repeatGuard)
+const repeatGuardByDeps = new WeakMap<object, { byKey: Map<string, GuardEntry>; bySpec: Map<string, GuardEntry> }>()
+
+function guardThresholds(deps: AnimDeps): GuardThresholds {
+  return { ...DEFAULT_GUARD_THRESHOLDS, ...deps.guard }
+}
+
+/** 当前 spec 版本（version 重置判据）；spec 不存在按 -1（不触发重置）。 */
+function specVersionOf(deps: AnimDeps, specId: string): number {
+  try {
+    return deps.store.has(specId) ? deps.store.record(specId).version : -1
+  } catch {
+    return -1
   }
-  if (repeatGuard.size > 500) {
-    for (const [k, v] of repeatGuard) {
-      if (now - v.firstAt > REPEAT_GUARD_WINDOW_MS) repeatGuard.delete(k)
-    }
+}
+
+/** 计数 +1（窗口外或版本变化则重置），返回计数后的条目。 */
+function bumpGuard(map: Map<string, GuardEntry>, sig: string, now: number, windowMs: number, version: number): GuardEntry {
+  // 过期项惰性清理：Map 过大时扫一遍窗口外的
+  if (map.size > 500) {
+    for (const [k, v] of map) if (now - v.firstAt > windowMs) map.delete(k)
   }
-  const sig = `${scope}|${key}`
-  const entry = repeatGuard.get(sig)
-  if (!entry || now - entry.firstAt > REPEAT_GUARD_WINDOW_MS) {
-    repeatGuard.set(sig, { count: 1, firstAt: now })
-    return undefined
+  const entry = map.get(sig)
+  if (!entry || now - entry.firstAt > windowMs) {
+    const fresh: GuardEntry = { count: 1, firstAt: now, specVersion: version }
+    map.set(sig, fresh)
+    return fresh
+  }
+  if (version >= 0 && entry.specVersion !== version) {
+    entry.count = 1
+    entry.firstAt = now
+    entry.specVersion = version
+    return entry
   }
   entry.count += 1
-  if (entry.count < 3) return undefined
-  return `同一参数的${scope}已连续发起 ${entry.count} 次：后台任务不会因重复发起而变快或提前完成，请改用 job_output 查询既有任务的结果（jobId 见此前回执）；wait_agent 只用于等待团队成员，对本工具的后台任务会立即空转返回。`
+  return entry
+}
+
+/**
+ * 同参/同 spec 重复发起判定（真机 turn 17 教训，0.6.0 §3.3 强化）。
+ *
+ * 两层计数互补：
+ * - **同参维度**（key）：治 preview→wait_agent→preview 的机械死循环；
+ * - **spec 维度**（bySpec）：治「每次挪一点参数」的绕行——死循环的本质特征
+ *   是高频 + spec 未修改，spec 维度只看频次。
+ *
+ * 签名归一化：atMs 排序去重 + 秒级量化，挪几百毫秒不再重置计数；一次调用取
+ * 多个抽帧点本就合法（数组语义），不受影响。version 重置：patch 过的 spec
+ * 计数清零，「修改 → 抽帧复查」的正当循环永不误伤。持久化刻意不做：退化循环
+ * 发生在同一进程的同一回合里，重启即断环，持久化反而让隔天的正当复查撞上
+ * 昨天的计数（0.6.0 §3.3 评估结论）。
+ */
+export function checkRepeatGuard(deps: AnimDeps, scope: string, specId: string, key: string): GuardVerdict {
+  const th = guardThresholds(deps)
+  const now = Date.now()
+  let guard = repeatGuardByDeps.get(deps)
+  if (!guard) {
+    guard = { byKey: new Map(), bySpec: new Map() }
+    repeatGuardByDeps.set(deps, guard)
+  }
+  const version = specVersionOf(deps, specId)
+  const byKey = bumpGuard(guard.byKey, `${scope}|${key}`, now, th.windowMs, version)
+  const bySpec = bumpGuard(guard.bySpec, `${scope}|${specId}`, now, th.windowMs, version)
+  const minutes = Math.max(1, Math.round(th.windowMs / 60_000))
+  if (byKey.count >= th.hardAt || bySpec.count >= th.specHardAt) {
+    const sameParam = byKey.count >= th.hardAt
+    return {
+      refuse: `${scope}已连续第 ${sameParam ? byKey.count : bySpec.count} 次重复发起${sameParam ? '（同一参数）' : '（本会话短时间内高频，含换参）'}，本次已拒绝执行。`
+        + '后台任务不会因重复发起而变快：请改用 job_output 查询既有任务的结果（jobId 见此前回执）；wait_agent 对后台任务只会立即空转返回。'
+        + `若确需再次执行，请先用 anim_patch 修改 spec（版本变化会重置计数）或等待 ${minutes} 分钟后重试；如是用户明确要求，请向用户说明该限制。`,
+    }
+  }
+  if (byKey.count >= th.softAt || bySpec.count >= th.specSoftAt) {
+    return {
+      note: byKey.count >= th.softAt
+        ? `同一参数的${scope}已连续发起 ${byKey.count} 次：后台任务不会因重复发起而变快或提前完成，请改用 job_output 查询既有任务的结果（jobId 见此前回执）；wait_agent 只用于等待团队成员，对本工具的后台任务会立即空转返回。再连续 ${Math.max(0, th.hardAt - byKey.count)} 次将被拒绝执行。`
+        : `近 ${minutes} 分钟内已对同一 spec 发起 ${bySpec.count} 次${scope}（含换参）：这个频率通常是在无效重试——后台任务的结果请用 job_output 查询；修改请走 anim_patch（版本变化会重置本计数），确认修改已落库再复查。`,
+    }
+  }
+  return {}
+}
+
+/**
+ * 「渲染后未修改再检查」提示（0.6.0 §3.1/§3.3 配套）：lastRender 的版本与
+ * 当前一致说明 spec 渲染后没改过，此时抽帧/重渲不产生新信息——把这句话递到
+ * 模型眼前，让「看一眼就收尾」成为默认动作。只提示不拦截（用户显式要求的
+ * 复查是正当的，但模型该知道自己可以停了）。
+ */
+function staleRenderNote(deps: AnimDeps, specId: string, verb: string): string | undefined {
+  let record
+  try {
+    if (!deps.store.has(specId)) return undefined
+    record = deps.store.record(specId)
+  } catch {
+    return undefined
+  }
+  const lr = record.lastRender
+  if (!lr || lr.specVersionAtRender !== record.version) return undefined
+  return `该 spec 自上次渲染成片（${lr.outputPath}）后未修改，本次${verb}不会产生新信息——若只是想确认成片效果，请直接向用户报告既有结果并结束回合。`
+}
+
+/**
+ * 抽帧点卫生（0.6.0 规划 §4.2）：越界点钳到片尾、负值钳到 0，钳动过就给
+ * 一条警告。抽帧点落在片外此前行为未定义（落到末幕的越界偏移），显式钳制
+ * 让回执与画面口径一致。
+ */
+function sanitizeAtMs(spec: AnimationSpec, atMs: number[] | undefined): { atMs: number[] | undefined; note?: string } {
+  if (atMs === undefined) return { atMs: undefined }
+  const totalMs = specDurationMs(spec.scenes)
+  const clamped = atMs.map(ms => Math.max(0, Math.min(ms, totalMs)))
+  if (clamped.every((ms, i) => ms === atMs[i])) return { atMs }
+  return {
+    atMs: clamped,
+    note: `抽帧点 [${atMs.join(', ')}]ms 含超出全片时长（${totalMs}ms）或负值的点，已钳到有效范围`,
+  }
+}
+
+/** 护栏签名（0.6.0 §3.3 归一化）：atMs 排序去重 + 秒级量化，微调参数不再绕过计数。 */
+function normalizeAtMsKey(atMs: number[] | undefined): string {
+  const quantized = [...new Set((atMs ?? []).map(ms => Math.round(ms / 1000)))].sort((a, b) => a - b)
+  return JSON.stringify(quantized)
 }
 
 export async function opPreview(
@@ -625,8 +764,22 @@ export async function opPreview(
 ): Promise<PreviewResultView | PreviewBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
-  // 重复发起护栏（真机 turn 17 教训）：同参反复发起时在回执里递上正确姿势
-  const guardNote = repeatGuardNote(deps, '预览', `${args.specId}|atMs=${JSON.stringify(args.atMs ?? [])}|scale=${args.scale ?? ''}`)
+  // 重复发起护栏（真机 turn 17 教训，0.6.0 §3.3 强化）：软提示附进回执、
+  // 高频硬拒绝——拒绝在一切工作开始前，绝不烧渲染开销
+  const verdict = checkRepeatGuard(
+    deps,
+    '预览',
+    args.specId,
+    `${args.specId}|atMs=${normalizeAtMsKey(args.atMs)}|scale=${args.scale ?? ''}`,
+  )
+  if (verdict.refuse) throw new AnimOpError(verdict.refuse)
+  const guardNote = verdict.note
+  // 抽帧点卫生（0.6.0 §4.2）：越界钳制 + 警告
+  const { atMs, note: atMsNote } = sanitizeAtMs(spec, args.atMs)
+  if (atMsNote !== undefined) args = { ...args, atMs }
+  // 渲染后未修改的语境提示（0.6.0 §3.1）：spec 渲染后没改过就明说「不会有新信息」
+  const staleNote = staleRenderNote(deps, args.specId, '抽帧')
+  const warnings = [guardNote, atMsNote, staleNote].filter((w): w is string => w !== undefined)
   // 单幕直放快路径（0.5.0 §3.2）：零渲染开销，无「后台」可言，命中即同步返回。
   // 配音 spec 先按缓存口径还原 displayMs（渲染后命中缓存近零开销），
   // 保证查段指纹与 anim_render 完全同口径。
@@ -636,14 +789,14 @@ export async function opPreview(
     if (clip) {
       emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
       emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
-      return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(guardNote ? { warnings: [guardNote] } : {}) }
+      return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(warnings.length > 0 ? { warnings } : {}) }
     }
   }
   const clip = previewClipFastPath(spec, renderer, args)
   if (clip) {
     emit({ type: 'anim/preview-start', data: { specId: args.specId, jobId: 'clip' } })
     emit({ type: 'anim/preview-finished', data: { specId: args.specId, jobId: 'clip', frames: [], clip } })
-    return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(guardNote ? { warnings: [guardNote] } : {}) }
+    return { specId: args.specId, renderer: renderer.name, frames: [], clip, ...(warnings.length > 0 ? { warnings } : {}) }
   }
   if (jobs) {
     // 与 opRender 同一降级链：先带 owner，失败退无主，再失败退同步
@@ -651,7 +804,7 @@ export async function opPreview(
     for (const ownerCandidate of [owner, undefined]) {
       try {
         const ticket = await startBackgroundPreview(args, { spec, renderer }, emit, jobs, ownerCandidate)
-        return guardNote ? { ...ticket, next: `${ticket.next} ⚠️${guardNote}` } : ticket
+        return warnings.length > 0 ? { ...ticket, next: `${ticket.next} ⚠️${warnings.join(' ')}` } : ticket
       } catch (err) {
         lastError = err
       }
@@ -659,7 +812,7 @@ export async function opPreview(
     console.warn(`[dsh-anim-studio] 后台预览发布失败（owner 与无主两档均被拒），退回同步抽帧：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
   const view = await previewSync(args, { spec, renderer }, signal, emit)
-  return guardNote ? { ...view, warnings: [...(view.warnings ?? []), guardNote] } : view
+  return warnings.length > 0 ? { ...view, warnings: [...(view.warnings ?? []), ...warnings] } : view
 }
 
 async function startBackgroundPreview(
@@ -814,6 +967,12 @@ export interface RenderResultView {
   speechNotes?: SpeechNote[]
   /** 全片关键帧拼贴图（0.5.0 规划 §3.3，jpg 绝对路径），生成失败时缺省。 */
   contactSheet?: string
+  /**
+   * 完成时刻的收束指引（0.6.0 规划 §3.2）：成片就绪 → 报告用户并结束回合。
+   * 0.5 真机教训：模型拿到完成结果的那一刻恰恰没有这句指引，转而反复抽帧。
+   * 同步回执、后台 job_output 产物、render-finished 事件三处出口同文。
+   */
+  next: string
 }
 
 /** 后台模式下工具的即时回执：真正的渲染结果经 job_output / 完成通知到达。 */
@@ -891,6 +1050,83 @@ function emitRenderStart(emit: Emit, specId: string, jobId: string, outputPath: 
   })
 }
 
+/** 完成时刻的收束指引（0.6.0 §3.2）：同步回执 / 后台产物 / 事件三处出口同文。 */
+function renderDoneNext(outputPath: string): string {
+  return `成片已就绪：${outputPath}——请直接向用户报告结果并结束本回合；如需修改，先用 anim_patch 改时间线再 anim_render 重渲，不要对未修改的 spec 反复抽帧或重渲。`
+}
+
+/**
+ * 渲染成功视图组装：同步路径与后台路径共用一份形态——job_output 的产物就是
+ * 这个视图（带 kind/next/speechNotes），模型在两条路径看到的结果一致。
+ */
+function buildRenderView(
+  result: RenderResult,
+  extras: { warnings: string[]; outlineNotes: string[] },
+): RenderResultView {
+  const warnings = extras.warnings
+  return {
+    ...result,
+    kind: 'sync',
+    next: renderDoneNext(result.outputPath),
+    ...(warnings.length > 0 ? { warnings } : {}),
+    ...(extras.outlineNotes.length > 0 ? { outlineNotes: extras.outlineNotes } : {}),
+  }
+}
+
+/* ------------------------------------------------------- 渲染前预检 */
+
+/**
+ * 渲染前预检（0.6.0 规划 §4.1）：零渲染开销的快检。硬问题（注定渲不出或渲出
+ * 也无意义的形态）直接报错快速失败——替代适配器深处的隐晦报错；软问题汇总成
+ * 预检警告进回执，让模型在开跑前看到全貌。
+ *
+ * 硬检：scenes 越界/空数组；图层引用的 asset 未登记或登记的本地文件已丢失。
+ * 软检：validateSpec 的软警告族（字幕带占用、缺尺寸兜底、秒毫秒混淆等）在
+ * 渲染入口聚合一份——写幕时模型可能没逐条处理，开跑前最后一次提醒。
+ */
+export function preflightRender(deps: AnimDeps, spec: AnimationSpec, args: RenderArgs): string[] {
+  // 硬检 1：scenes 形态
+  if (args.scenes !== undefined) {
+    if (args.scenes.length === 0) {
+      throw new AnimOpError('scenes 是空数组：要么省略 scenes 渲整片，要么给出至少一个幕下标（0 基）')
+    }
+    const total = spec.scenes.length
+    const bad = args.scenes.filter(i => !Number.isInteger(i) || i < 0 || i >= total)
+    if (bad.length > 0) {
+      throw new AnimOpError(`scenes 含越界下标 ${bad.join('、')}：本片共 ${total} 幕，合法范围 0~${total - 1}`)
+    }
+  }
+  // 硬检 2：资产引用完整性。图层引用 asset:<id>（src）或按 assetId 引字体
+  // （fontFamily），未登记/文件丢失的引用渲出来必然 404——此刻说最便宜。
+  const assets = spec.assets
+  const missing: string[] = []
+  for (const scene of spec.scenes) {
+    for (const layer of scene.layers) {
+      const props = layer.props as Record<string, unknown>
+      const label = `${scene.id}/${layer.id}`
+      const src = typeof props.src === 'string' ? /^asset:(.+)$/.exec(props.src) : null
+      if (src) {
+        const id = src[1]!
+        const asset = assets[id]
+        if (!asset) {
+          missing.push(`图层「${label}」引用的资产 ${id} 未登记（anim_asset_import 导入后再引用，或改 src 为直连路径）`)
+        } else if (!/^https?:\/\//.test(asset.src) && !existsSync(asset.src)) {
+          missing.push(`图层「${label}」引用的资产 ${id} 源文件不存在：${asset.src}（文件被移动或删除，重新 anim_asset_import 导入）`)
+        }
+      }
+      const font = typeof props.fontFamily === 'string' ? props.fontFamily : ''
+      if (font !== '' && assets[font]?.kind === 'font' && !/^https?:\/\//.test(assets[font]!.src) && !existsSync(assets[font]!.src)) {
+        missing.push(`图层「${label}」引用的字体资产 ${font} 源文件不存在：${assets[font]!.src}`)
+      }
+    }
+  }
+  if (missing.length > 0) {
+    throw new AnimOpError(`渲染预检失败（未开始渲染）：\n- ${missing.join('\n- ')}`)
+  }
+  // 软检：写库校验的警告族在渲染入口再报一次（模型写幕时可能没逐条处理）
+  return validateSpec(spec).warnings
+}
+
 /**
  * 渲染成 MP4。
  *
@@ -910,6 +1146,17 @@ export async function opRender(
 ): Promise<RenderResultView | RenderBackgroundTicket> {
   const spec = deps.store.get(args.specId)
   const renderer = deps.renderers.get(args.renderer)
+  // 重复发起护栏（0.6.0 §3.3）：软提示附进回执、高频硬拒绝，都在开跑前
+  const verdict = checkRepeatGuard(
+    deps,
+    '渲染',
+    args.specId,
+    `${args.specId}|scenes=${JSON.stringify(args.scenes ?? null)}|out=${args.outputPath ?? ''}|cache=${args.cache ?? ''}`,
+  )
+  if (verdict.refuse) throw new AnimOpError(verdict.refuse)
+  const guardNote = verdict.note
+  // 渲染前预检（0.6.0 §4.1）：硬问题快速失败；软警告汇总进回执
+  const preflightWarnings = preflightRender(deps, spec, args)
   // 切片渲染（scenes 选幕）不默认写正片路径：solo 出片与整片是两种产物，
   // 覆盖正片是真实事故（真机：8s 第一幕 solo 覆盖了 64.5s 成片，用户点开
   // 只见第一幕）。显式传了 outputPath 的调用者自己决定落点。
@@ -921,12 +1168,20 @@ export async function opRender(
       ?? (args.scenes?.length ? `${deps.outputDir}/${args.specId}-solo-${args.scenes.join('-')}.mp4` : `${deps.outputDir}/${args.specId}.mp4`),
   )
   if (signal.aborted) throw new AnimOpError('渲染已取消')
-  // 重复发起护栏（真机 turn 17 教训）：同参反复发起时在票据/回执里递上正确姿势
-  const guardNote = repeatGuardNote(
-    deps,
-    '渲染',
-    `${args.specId}|scenes=${JSON.stringify(args.scenes ?? [])}|out=${args.outputPath ?? ''}|cache=${args.cache ?? ''}`,
-  )
+  // 渲染后未修改的语境提示（0.6.0 §3.1）：重渲未修改的 spec 会全量命中段缓存，
+  // 明说「不会有新画面」，让「报告既有成片」成为默认动作
+  const staleNote = staleRenderNote(deps, args.specId, '渲染')
+  const extraWarnings = [...preflightWarnings, guardNote, staleNote].filter((w): w is string => w !== undefined)
+  // 渲染状态投影（0.6.0 §3.1）：完成时写 lastRender，版本取开跑时的——
+  // 渲染过程中 model patch（后台渲染完全可能）不算「渲染后修改」
+  const specVersionAtStart = deps.store.record(args.specId).version
+  const onRendered = (done: string): void => {
+    try {
+      deps.store.setLastRender(args.specId, { outputPath: done, finishedAt: Date.now(), specVersionAtRender: specVersionAtStart })
+    } catch {
+      /* spec 已被 drop 等边缘态：状态投影失败不拖垮渲染回执 */
+    }
+  }
   // 渲染前对账（0.4.0 规划 N3）：大纲与实际场景对不上时，此刻说比渲完说便宜
   const outline = deps.store.record(args.specId).outline
   const outlineNotes = outline !== undefined && outline.length > 0 ? reconcileOutline(outline, spec.scenes) : []
@@ -950,16 +1205,16 @@ export async function opRender(
     let lastError: unknown
     for (const ownerCandidate of [owner, undefined]) {
       try {
-        const ticket = await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes, speech }, emit, jobs, ownerCandidate)
-        return guardNote ? { ...ticket, next: `${ticket.next} ⚠️${guardNote}` } : ticket
+        const ticket = await startBackgroundRender(args, { spec, renderer, outputPath, outlineNotes, extraWarnings, speech, specVersionAtStart, onRendered }, emit, jobs, ownerCandidate)
+        return extraWarnings.length > 0 ? { ...ticket, next: `${ticket.next} ⚠️${extraWarnings.join(' ')}` } : ticket
       } catch (err) {
         lastError = err
       }
     }
     console.warn(`[dsh-anim-studio] 后台渲染发布失败（owner 与无主两档均被拒），退回同步渲染：${lastError instanceof Error ? lastError.message : String(lastError)}`)
   }
-  const view = await renderSync(args, { spec, renderer, outputPath, outlineNotes, speech }, signal, emit)
-  return guardNote ? { ...view, warnings: [...(view.warnings ?? []), guardNote] } : view
+  const view = await renderSync(args, { spec, renderer, outputPath, outlineNotes, extraWarnings, speech, specVersionAtStart, onRendered }, signal, emit)
+  return view
 }
 
 /**
@@ -1007,12 +1262,21 @@ export function sliceSpeechForScenes(build: SpeechBuildResult, spec: AnimationSp
 
 async function startBackgroundRender(
   args: RenderArgs,
-  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[]; speech: Promise<SpeechBuildResult | undefined> },
+  resolved: {
+    spec: AnimationSpec
+    renderer: AnimRenderer
+    outputPath: string
+    outlineNotes: string[]
+    extraWarnings: string[]
+    speech: Promise<SpeechBuildResult | undefined>
+    specVersionAtStart: number
+    onRendered: (outputPath: string) => void
+  },
   emit: Emit,
   jobs: AnimJobsService,
   owner: unknown,
 ): Promise<RenderBackgroundTicket> {
-  const { spec, renderer, outputPath, outlineNotes, speech } = resolved
+  const { spec, renderer, outputPath, outlineNotes, extraWarnings, speech, specVersionAtStart, onRendered } = resolved
   const specId = args.specId
   const controller = new AbortController()
   const jobIdBox: { value: string | null } = { value: null }
@@ -1042,6 +1306,12 @@ async function startBackgroundRender(
       .then(
         async result => {
           const speechBuild = await speech
+          // 渲染状态投影（0.6.0 §3.1）+ 完成视图（job_output 产物与同步回执同形）
+          onRendered(result.outputPath)
+          const view = buildRenderView(result, {
+            warnings: [...(speechBuild?.warnings ?? []), ...(result.warnings ?? []), ...extraWarnings],
+            outlineNotes,
+          })
           gate.pass(() => ({
             type: 'anim/render-finished',
             data: {
@@ -1052,16 +1322,18 @@ async function startBackgroundRender(
               durationMs: result.durationMs,
               width: result.width,
               height: result.height,
-              ...((speechBuild?.warnings.length ?? 0) + (result.warnings?.length ?? 0) > 0
-                ? { warnings: [...(speechBuild?.warnings ?? []), ...(result.warnings ?? [])] }
+              ...((speechBuild?.warnings.length ?? 0) + (result.warnings?.length ?? 0) + extraWarnings.length > 0
+                ? { warnings: [...(speechBuild?.warnings ?? []), ...(result.warnings ?? []), ...extraWarnings] }
                 : {}),
               ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
               ...(result.audioTracks !== undefined && result.audioTracks.length > 0 ? { audioTracks: result.audioTracks } : {}),
               ...(result.contactSheet !== undefined ? { contactSheet: result.contactSheet } : {}),
               ...(speechBuild !== undefined && speechBuild.notes.length > 0 ? { speechNotes: speechBuild.notes } : {}),
+              specVersion: specVersionAtStart,
+              next: view.next,
             },
           }))
-          return { status: 'completed' as const, output: result }
+          return { status: 'completed' as const, output: view }
         },
         (err: unknown) => {
           const message = err instanceof Error ? err.message : String(err)
@@ -1105,11 +1377,20 @@ async function startBackgroundRender(
 
 async function renderSync(
   args: RenderArgs,
-  resolved: { spec: AnimationSpec; renderer: AnimRenderer; outputPath: string; outlineNotes: string[]; speech: Promise<SpeechBuildResult | undefined> },
+  resolved: {
+    spec: AnimationSpec
+    renderer: AnimRenderer
+    outputPath: string
+    outlineNotes: string[]
+    extraWarnings: string[]
+    speech: Promise<SpeechBuildResult | undefined>
+    specVersionAtStart: number
+    onRendered: (outputPath: string) => void
+  },
   signal: AbortSignal,
   emit: Emit,
 ): Promise<RenderResultView> {
-  const { spec, renderer, outputPath, outlineNotes, speech } = resolved
+  const { spec, renderer, outputPath, outlineNotes, extraWarnings, speech, specVersionAtStart, onRendered } = resolved
   const specId = args.specId
   const jobIdBox: { value: string | null } = { value: 'sync' }
   const gate = createRenderEventGate(emit, jobIdBox)
@@ -1124,7 +1405,12 @@ async function renderSync(
       },
       signal,
     )
-    const warnings = [...(speechBuild?.warnings ?? []), ...(result.warnings ?? [])]
+    onRendered(result.outputPath)
+    const view = buildRenderView(result, {
+      warnings: [...(speechBuild?.warnings ?? []), ...(result.warnings ?? []), ...extraWarnings],
+      outlineNotes,
+    })
+    const warnings = view.warnings
     emit({
       type: 'anim/render-finished',
       data: {
@@ -1135,20 +1421,16 @@ async function renderSync(
         durationMs: result.durationMs,
         width: result.width,
         height: result.height,
-        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(warnings !== undefined && warnings.length > 0 ? { warnings } : {}),
         ...(result.incremental !== undefined ? { incremental: result.incremental } : {}),
         ...(result.audioTracks !== undefined && result.audioTracks.length > 0 ? { audioTracks: result.audioTracks } : {}),
         ...(result.contactSheet !== undefined ? { contactSheet: result.contactSheet } : {}),
         ...(speechBuild !== undefined && speechBuild.notes.length > 0 ? { speechNotes: speechBuild.notes } : {}),
+        specVersion: specVersionAtStart,
+        next: view.next,
       },
     })
-    return {
-      ...result,
-      kind: 'sync' as const,
-      ...(warnings.length > 0 ? { warnings } : {}),
-      ...(speechBuild !== undefined && speechBuild.notes.length > 0 ? { speechNotes: speechBuild.notes } : {}),
-      ...(outlineNotes.length > 0 ? { outlineNotes } : {}),
-    }
+    return view
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     emit({

@@ -88,5 +88,7 @@ export const progressBarInner: CSSProperties = {
 }
 export const thumbs: CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8 }
 export const figure: CSSProperties = { margin: 0, maxWidth: 220 }
-export const thumb: CSSProperties = { maxWidth: 220, maxHeight: 130, borderRadius: 6, display: 'block' }
+export const thumb: CSSProperties = { maxWidth: 220, maxHeight: 130, borderRadius: 6, display: 'block', cursor: 'zoom-in' }
 export const caption: CSSProperties = { ...muted, fontSize: 11, marginTop: 2 }
+/** 灯箱控制按钮的基形态（颜色由调用处覆盖）。 */
+export const thumbLightbox: CSSProperties = { ...link }

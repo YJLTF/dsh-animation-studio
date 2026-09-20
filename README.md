@@ -98,6 +98,12 @@ dsh plugin --profile web add ./dsh-animation-studio-<版本>.tgz
   name: dsh-animation-studio
   config:
     outputDir: ./.dsh/anim   # 渲染产物与中间工作目录的根，默认 ./.dsh/anim
+    # 新建 spec 的缺省画质（可选）：模型建片不带 fps/宽高时生效；
+    # 模型显式传参或用户在会话里指定时仍以参数为准。未配置为 30fps / 1280×720
+    # defaults:
+    #   fps: 30
+    #   width: 1920
+    #   height: 1080
     # 配音（TTS，可选）：不配置则旁白只出字幕、不发声
     tts:
       # 命令模板（数组，逐项替换占位符后直接执行，不经 shell）：
@@ -135,7 +141,7 @@ dsh plugin --profile web add ./dsh-animation-studio-<版本>.tgz
 ```
 你：用动画讲一下"梯度下降"的直觉，30 秒以内，中文。
 AI：anim_diagnose   → 环境自检
-    anim_create_spec → 建立时间线文档（30fps，1280x720）
+    anim_create_spec → 建立时间线文档（缺省画质见 defaults 配置，未配置 30fps 1280x720）
     anim_plan        → 写分镜大纲，工具做节奏体检（太短/太长/缺意图会提示）
     anim_draft_scene → 逐幕写入图层与关键帧（可反复调用）
     anim_preview     → 低分辨率抽几帧自查
@@ -210,7 +216,7 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 
 ## 已知限制与说明
 
-- **图层类型**：`text / rect / circle / ellipse / image / line / arrow / polygon / star / svg / code / math / group / audio / video`（15 种）。要点：circle/ellipse 用 `size`（`radius` 自动换算）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`lineDash` 虚线；polygon/star 由 `sides`+`size` 生成；svg 内嵌字符串；image/video `src` 写 `asset:<id>`；code 用 `code`+`language`（自动高亮，`{{片段}}` 着色，`props.code` 多关键帧即代码演化 morph）；math 用 `tex` 写 LaTeX；group 用 `children` 引用成员；audio 引用音频资产（渲染尾步 ffmpeg 混入成片，不进画面）；video 引用视频资产（`time`/`playbackRate`/`loop` 控制播放）。`fill` 支持渐变对象 `{type:"linear", from, to, stops:[[offset,"#色"]]}`；text 支持 `maxWidth`+`textWrap:true` 自动折行与 `props.reveal` 逐字打字机轨道。不支持的属性以警告降级，不失败。
+- **图层类型**：`text / rect / circle / ellipse / image / line / arrow / curve / grid / polygon / star / svg / code / math / chart / group / audio / video`（18 种）。要点：circle/ellipse 用 `size`（`radius` 自动换算）；line/arrow 用 `points` 定折线、`endArrow` 内建箭头、`lineDash` 虚线；curve 用 `points`+`smoothness` 画平滑曲线；grid 用 `spacing` 画坐标网格（缺尺寸按画布满幅）；polygon/star 由 `sides`+`size` 生成；svg 内嵌字符串；image/video `src` 写 `asset:<id>`；code 用 `code`+`language`（自动高亮，`{{片段}}` 着色，`props.code` 多关键帧即代码演化 morph）；math 用 `tex` 写 LaTeX；chart 用 `chartType`+`data` 画 bar/line 数据图表（`props.progress` 轨道驱动柱体生长/折线描画）；group 用 `children` 引用成员；audio 引用音频资产（渲染尾步 ffmpeg 混入成片，不进画面）；video 引用视频资产（`time`/`playbackRate`/`loop` 控制播放）。`fill` 支持渐变对象 `{type:"linear", from, to, stops:[[offset,"#色"]]}`；text 支持 `maxWidth`+`textWrap:true` 自动折行、`letterSpacing` 字距与 `props.reveal` 逐字打字机轨道；全部图层支持 `filters`（blur/grayscale 等 CSS 滤镜）与 `shadow*` 阴影；`followPath`+`props.progress` 轨道让图层沿 line/curve 路径运动。不支持的属性以警告降级，不失败。
 - **转场与缓动**：`transition.kind` 支持 `none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn`；`scene.exit`（fade/slide 系列）在幕尾整体退场；缓动另有 `bounce/elastic/back` 及各自 In/InOut 变体（强调类入场优先 out 形态）。
 - **旁白字幕**：字幕字号按画布高度约 4% 自适应（与正文字号解耦），超宽自动折行；底部字幕带是保留区，建议一条 cue ≤40 字、正文图层的 y 避开字幕带（重叠时渲染给软警告）。未配置 TTS 时旁白只出字幕（设计内形态）。
 - **字体**：font 资产导入后 text/code 图层 `fontFamily` 填 assetId 即生效；远端 http(s) 字体 URL 需要目标服务器允许跨源（CORS）。
@@ -223,4 +229,4 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 ## 文档
 
 - [`docs/设计草案.md`](docs/设计草案.md)：dsh 平台事实、AnimationSpec IR 设计、事件模型、选型与踩坑
-- [`docs/0.2.0-规划.md`](docs/0.2.0-规划.md) / [`docs/0.3.0-规划.md`](docs/0.3.0-规划.md) / [`docs/0.3.x-优化清单.md`](docs/0.3.x-优化清单.md) / [`docs/0.4.0-规划.md`](docs/0.4.0-规划.md) / [`docs/0.5.0-规划.md`](docs/0.5.0-规划.md)：各版本的范围、验收与迭代记录
+- [`docs/0.2.0-规划.md`](docs/0.2.0-规划.md) / [`docs/0.3.0-规划.md`](docs/0.3.0-规划.md) / [`docs/0.3.x-优化清单.md`](docs/0.3.x-优化清单.md) / [`docs/0.4.0-规划.md`](docs/0.4.0-规划.md) / [`docs/0.5.0-规划.md`](docs/0.5.0-规划.md) / [`docs/0.6.0-规划.md`](docs/0.6.0-规划.md)：各版本的范围、验收与迭代记录

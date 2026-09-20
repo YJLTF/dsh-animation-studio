@@ -206,6 +206,12 @@ export interface AnimWebState {
   media: MediaIndex
   /** 渲染产物默认根目录：其中的媒体文件天然可服务。 */
   outputDir: string
+  /**
+   * 宿主 `connection` 服务的捕获盒（0.6.0 N9 鉴权）：按引用读——捕获时机
+   * 可能晚于路由注册。服务在则逐请求 requestRejection（Host/Origin fence +
+   * 签名 cookie），与宿主 `/api` 前缀同款。
+   */
+  auth?: { value?: unknown }
 }
 
 const MEDIA_TYPES: Record<string, string> = {
@@ -311,10 +317,26 @@ export function createAnimKernel(state: AnimWebState): (req: KernelRequest) => P
     if (pathname === `${ANIM_ROUTE_PREFIX}/api/state`) {
       return json(200, buildState(state))
     }
+    if (pathname === `${ANIM_ROUTE_PREFIX}/api/job`) {
+      // 单任务查询（0.6.0 规划 §6.4）：卡片轮询不再为找一条记录拉全量 state
+      const id = parsed.searchParams.get('id')
+      const job = id ? state.tracker.snapshot().find(j => j.jobId === id) : undefined
+      if (!job) return json(404, { error: `任务不在簿中：${id ?? '(缺 id)'}` })
+      return json(200, { job })
+    }
     if (pathname === `${ANIM_ROUTE_PREFIX}/api/spec`) {
       const id = parsed.searchParams.get('id')
       if (!id || !state.store.has(id)) return json(404, { error: `spec 不存在：${id ?? '(缺 id)'}` })
       return json(200, { specId: id, spec: state.store.get(id), record: { version: state.store.record(id).version } })
+    }
+    if (pathname === ANIM_ROUTE_PREFIX || pathname === `${ANIM_ROUTE_PREFIX}/index.html`) {
+      // 工作台总览页（0.6.0 规划 §6.1）：specs + 任务簿一屏看清，零宿主插槽
+      // 依赖——插件自有路由直接 serve，与卡片同一鉴权（同源 cookie）
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+        body: Buffer.from(WORKBENCH_HTML, 'utf8'),
+      }
     }
     if (pathname === `${ANIM_ROUTE_PREFIX}/media`) {
       return serveMedia(state, req, parsed.searchParams.get('p'))
@@ -343,6 +365,8 @@ function buildState(state: AnimWebState): unknown {
           layerCount: s.layers.length,
         })),
         revisions: record.history.slice(-20).map(h => ({ note: h.note ?? undefined, opCount: h.ops.length })),
+        // 渲染状态（0.6.0 §3.1）：总览页据此展示「已渲染 / 渲染后已修改」
+        ...(record.lastRender !== undefined ? { lastRender: record.lastRender } : {}),
         renders: renders.filter(r => r.specId === specId),
       }
     }),
@@ -396,6 +420,165 @@ function serveMedia(state: AnimWebState, req: KernelRequest, rawParam: string | 
   }
 }
 
+/* ---------------------------------------------------------------- 总览页 */
+
+/**
+ * 工作台总览页（0.6.0 规划 §6.1）：`GET /dsh-anim/` 直接 serve 的单文件页面。
+ *
+ * 刻意做成自包含 HTML（内联 CSS/JS、零构建产物依赖）：本路由在 tsx 直跑源码、
+ * esbuild 打包、离线 tgz 三种形态下行为完全一致，不存在「lib/ 资产没跟上的
+ * 部署漂移」。页面只消费 /api/state（3s 轮询）与 /media，鉴权与卡片同款
+ * （同源 cookie）。headless 形态整条路由不存在，零副作用。
+ */
+const WORKBENCH_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>动画工作台 · dsh-anim-studio</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; font: 14px/1.6 var(--dsw-font-body, system-ui, sans-serif);
+    background: var(--dsw-alias-bg-canvas, #16181c); color: var(--dsw-alias-label-primary, #e8eaed);
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--dsw-alias-label-tertiary, #9aa0a6); margin: 0 0 20px; font-size: 12px; }
+  h2 { font-size: 14px; margin: 24px 0 10px; color: var(--dsw-alias-label-secondary, #c4c7cc); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .card {
+    border: 1px solid var(--dsw-alias-border-l1, rgba(127,127,127,.3)); border-radius: 10px;
+    padding: 12px 14px; background: var(--dsw-alias-bg-input, rgba(127,127,127,.06));
+    display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  }
+  .card .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--dsw-alias-label-tertiary, #9aa0a6); font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .scenes { font-size: 12px; color: var(--dsw-alias-label-secondary, #c4c7cc); }
+  .bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: rgba(127,127,127,.15); }
+  .bar span { height: 100%; }
+  .bar span:nth-child(4n+1) { background: #4c9aff; } .bar span:nth-child(4n+2) { background: #ffb020; }
+  .bar span:nth-child(4n+3) { background: #5dd39e; } .bar span:nth-child(4n+4) { background: #b58cff; }
+  .render { font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+  a { color: var(--dsw-alias-interactive-primary, #4c9aff); text-decoration: none; word-break: break-all; }
+  .state { border-radius: 999px; padding: 0 8px; font-size: 11px; line-height: 18px; }
+  .running { background: rgba(76,154,255,.2); color: #79b2ff; }
+  .completed { background: rgba(93,211,158,.18); color: #5dd39e; }
+  .failed, .killed { background: rgba(255,122,107,.18); color: #ff7a6b; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(127,127,127,.2)); }
+  th { color: var(--dsw-alias-label-tertiary, #9aa0a6); font-weight: 500; font-size: 12px; }
+  .empty { color: var(--dsw-alias-label-tertiary, #9aa0a6); padding: 16px 0; }
+  .unreachable { color: #ff7a6b; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>动画工作台</h1>
+<p class="sub">dsh-anim-studio · 本页展示当前宿主进程内的工作台状态，3 秒自动刷新</p>
+<div id="unreachable" class="unreachable" hidden>工作台服务不可达（可能由宿主重启）。</div>
+<h2>片子（specs）</h2>
+<div id="specs" class="grid"><div class="empty">加载中…</div></div>
+<h2>渲染任务簿（本进程）</h2>
+<div id="jobs"></div>
+<script>
+(function () {
+  'use strict';
+  var media = function (p) { return '/dsh-anim/media?p=' + encodeURIComponent(p); };
+  var fmtMs = function (ms) {
+    if (ms === undefined || ms === null) return '—';
+    return ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000).toFixed(1) + 's';
+  };
+  var esc = function (s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  };
+
+  function renderSpec(spec) {
+    var latest = spec.renders && spec.renders.length ? spec.renders[spec.renders.length - 1] : null;
+    var lastRender = spec.lastRender;
+    var stateText = '未渲染';
+    if (latest) {
+      if (latest.status === 'running') stateText = '渲染中 ' + (latest.percent || 0) + '%';
+      else if (lastRender && lastRender.specVersionAtRender === spec.version) stateText = '已渲染（与当前版本一致）';
+      else if (lastRender) stateText = '渲染后已修改（v' + lastRender.specVersionAtRender + ' → v' + spec.version + '）';
+      else stateText = latest.status === 'completed' ? '已渲染' : latest.status === 'failed' ? '上次渲染失败' : '上次已终止';
+    }
+    var html = '<div class="card">';
+    html += '<div class="title">' + esc(spec.meta && spec.meta.title || spec.specId) + '</div>';
+    html += '<div class="meta"><span>' + esc(spec.specId) + '</span><span>v' + spec.version + '</span>'
+      + '<span>' + esc(fmtMs(spec.durationMs)) + '</span><span>' + spec.sceneCount + ' 幕</span></div>';
+    if (Array.isArray(spec.scenes) && spec.scenes.length > 0 && spec.durationMs > 0) {
+      html += '<div class="bar" title="各幕时长占比">';
+      for (var i = 0; i < spec.scenes.length; i++) {
+        var s = spec.scenes[i];
+        html += '<span style="width:' + Math.max(2, (s.durationMs || 0) / spec.durationMs * 100).toFixed(2) + '%" title="' + esc(s.name || s.id) + ' · ' + esc(fmtMs(s.durationMs)) + '"></span>';
+      }
+      html += '</div>';
+      html += '<div class="scenes">' + spec.scenes.map(function (s) { return esc(s.name || s.id); }).join(' · ') + '</div>';
+    }
+    html += '<div class="meta"><span>' + esc(stateText) + '</span></div>';
+    if (latest && latest.status === 'completed' && latest.outputPath) {
+      html += '<div class="render"><a href="' + media(latest.outputPath) + '" target="_blank" rel="noreferrer">▶ 打开成片</a>';
+      if (latest.contactSheet) html += '<a href="' + media(latest.contactSheet) + '" target="_blank" rel="noreferrer">拼贴图</a>';
+      html += '<span class="meta">' + esc(fmtMs(latest.durationMs)) + '</span></div>';
+    }
+    html += '<div class="render"><a href="#" data-spec="' + esc(spec.specId) + '" class="view-spec">查看 spec JSON</a>';
+    if (spec.revisions && spec.revisions.length) html += '<span class="meta">' + spec.revisions.length + ' 条近期修改</span>';
+    html += '</div></div>';
+    return html;
+  }
+
+  function renderJobs(renders) {
+    if (!renders || renders.length === 0) return '<div class="empty">本进程暂无渲染/预览任务（宿主重启后任务簿清空，属设计内行为）。</div>';
+    var rows = '';
+    for (var i = renders.length - 1; i >= 0; i--) {
+      var j = renders[i];
+      rows += '<tr><td>' + esc(j.jobId) + '</td><td>' + esc(j.kind === 'preview' ? '抽帧' : '渲染') + '</td>'
+        + '<td><span class="state ' + esc(j.status) + '">' + esc(j.status) + (j.status === 'running' ? ' ' + (j.percent || 0) + '%' : '') + '</span></td>'
+        + '<td>' + esc(j.specId || '') + '</td>'
+        + '<td>' + (j.outputPath ? '<a href="' + media(j.outputPath) + '" target="_blank" rel="noreferrer">' + esc(j.outputPath.split(/[\\\\/]/).pop()) + '</a>' : '—') + '</td>'
+        + '<td>' + esc(j.error ? j.error : '') + '</td></tr>';
+    }
+    return '<table><thead><tr><th>jobId</th><th>类别</th><th>状态</th><th>spec</th><th>产物</th><th>错误</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+
+  function paint(data) {
+    document.getElementById('unreachable').hidden = true;
+    var specs = document.getElementById('specs');
+    specs.innerHTML = (!data.specs || data.specs.length === 0)
+      ? '<div class="empty">暂无 spec——在会话里让 AI 做一支片子，这里就会出现它的名片。</div>'
+      : data.specs.map(renderSpec).join('');
+    Array.prototype.forEach.call(specs.querySelectorAll('.view-spec'), function (el) {
+      el.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        window.open('/dsh-anim/api/spec?id=' + encodeURIComponent(el.getAttribute('data-spec')), '_blank', 'noreferrer');
+      });
+    });
+    document.getElementById('jobs').innerHTML = renderJobs(data.renders);
+  }
+
+  var misses = 0;
+  function tick() {
+    fetch('/dsh-anim/api/state').then(function (res) {
+      if (!res.ok) throw new Error(String(res.status));
+      return res.json();
+    }).then(function (data) {
+      misses = 0;
+      paint(data);
+    }).catch(function () {
+      misses += 1;
+      if (misses >= 2) document.getElementById('unreachable').hidden = false;
+    });
+  }
+  tick();
+  setInterval(tick, 3000);
+})();
+</script>
+</body>
+</html>
+`
+
 /* ---------------------------------------------------------------- 挂载 */
 
 /** webServer 服务的最小结构面（宿主侧类型不在本包类型面上，与 jobs 同一待遇）。 */
@@ -410,6 +593,13 @@ interface AnimWebServerService {
 /**
  * 在宿主 webServer 上挂 `/dsh-anim` 前缀路由。webServer 是可选服务：
  * 用 ctx.inject 等它出现，headless 形态永远等不到、也就永远不注册。
+ *
+ * 鉴权（0.6.0 真机体检 N9）：`/dsh-anim/*` 此前完全绕开宿主鉴权——宿主只对
+ * 自有路由（`/`、`/api/*`）做 token/cookie 校验，插件的媒体/状态路由一直
+ * 是裸奔的（渲染产物与会话 spec 可被本机任意进程读取）。修复方式：宿主的
+ * `connection` 服务（dsh-client-connection）暴露 `requestRejection(req)`——
+ * 与 `/api` 前缀完全同款的 Host/Origin fence + 签名 cookie 校验；捕获盒里有
+ * 该服务就逐请求校验，没有（老宿主/结构变更）则退回现状并保持可用。
  */
 export function mountAnimWebRoutes(ctx: Context, state: AnimWebState): void {
   const kernel = createAnimKernel(state)
@@ -421,7 +611,16 @@ export function mountAnimWebRoutes(ctx: Context, state: AnimWebState): void {
         server.register({
           kind: 'prefix',
           path: ANIM_ROUTE_PREFIX,
-          handler: (req, res) => void handleAnimRequest(kernel, req, res),
+          handler: (req, res) => {
+            const auth = state.auth?.value as { requestRejection?: (r: unknown) => number | undefined } | undefined
+            const rejection = typeof auth?.requestRejection === 'function' ? auth.requestRejection(req) : undefined
+            if (rejection !== undefined && rejection !== 200) {
+              res.writeHead(rejection)
+              res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+              return
+            }
+            return void handleAnimRequest(kernel, req, res)
+          },
         }),
       'dsh-anim-studio: /dsh-anim 路由',
     )

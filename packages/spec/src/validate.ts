@@ -259,6 +259,81 @@ function validateLayer(c: Collector, path: string, l: unknown, index: number): v
       c.warn(`图层 ${String(l.id)}（math）未提供 LaTeX 公式（props.tex），渲染为空`)
     }
   }
+  // chart 图层（0.6.0 规划 §5.1）：数据是图表的本体，形态错误直接报错——
+  // 「渲出来一张空图」比写库失败更难排查
+  if (l.type === 'chart' && props) {
+    if (props.chartType !== undefined && props.chartType !== 'bar' && props.chartType !== 'line') {
+      c.fail(`${p}/props/chartType`, `chartType 应为 "bar" 或 "line"，实际为 ${JSON.stringify(props.chartType)}`)
+    }
+    const data = props.data
+    if (!Array.isArray(data) || data.length === 0) {
+      c.fail(`${p}/props/data`, 'chart 的 data 应为非空数组，如 [{ label: "一月", value: 42 }]')
+    } else {
+      data.forEach((d, i) => {
+        if (!isRecord(d)) {
+          c.fail(`${p}/props/data/${i}`, '数据项应为对象 { label, value }')
+          return
+        }
+        if (typeof d.label !== 'string' || d.label.trim() === '') {
+          c.fail(`${p}/props/data/${i}/label`, '数据项的 label 应为非空字符串')
+        }
+        if (!isFiniteNumber(d.value)) {
+          c.fail(`${p}/props/data/${i}/value`, `数据项的 value 应为有限数字，实际为 ${JSON.stringify(d.value)}`)
+        }
+      })
+    }
+    if (props.maxValue !== undefined && (!isFiniteNumber(props.maxValue) || props.maxValue <= 0)) {
+      c.fail(`${p}/props/maxValue`, 'maxValue 应为 > 0 的数字')
+    }
+    if (props.palette !== undefined && (!Array.isArray(props.palette) || !props.palette.every(x => typeof x === 'string'))) {
+      c.fail(`${p}/props/palette`, 'palette 应为颜色字符串数组，如 ["#4C9AFF", "#FFB020"]')
+    }
+  }
+  // curve 图层：points 语义与 line 相同（soft），smoothness 形态在这里查
+  if (l.type === 'curve' && props) {
+    const pts = props.points
+    if (!Array.isArray(pts) || pts.length < 2 || !pts.every(q => Array.isArray(q) && q.length === 2 && q.every(Number.isFinite))) {
+      c.warn(`图层 ${String(l.id)}（curve）的 points 需要至少两个 [x, y] 点，否则曲线不可见`)
+    }
+    if (props.stroke === undefined) {
+      c.warn(`图层 ${String(l.id)}（curve）未指定 stroke，渲染端将按主题文字色兜底，否则曲线不可见`)
+    }
+    if (props.smoothness !== undefined && (!isFiniteNumber(props.smoothness) || props.smoothness < 0 || props.smoothness > 1)) {
+      c.fail(`${p}/props/smoothness`, 'curve 的 smoothness 应为 0~1 的数字（0=折线，1=最大化平滑）')
+    }
+  }
+  // grid 图层：spacing 形态
+  if (l.type === 'grid' && props) {
+    const sp = props.spacing
+    if (sp !== undefined) {
+      const ok = isFiniteNumber(sp) ? sp > 0 : Array.isArray(sp) && sp.length === 2 && sp.every(x => isFiniteNumber(x) && x > 0)
+      if (!ok) c.fail(`${p}/props/spacing`, 'grid 的 spacing 应为正数或 [宽间距, 高间距]（正数，像素）')
+    }
+  }
+  // followPath 的形态在这里查；引用关系（存在/不自引用/类型合法）需要全幕
+  // 图层清单，由 validateScene 统一查（与 group children 同款）
+  if (props && props.followPath !== undefined && typeof props.followPath !== 'string') {
+    c.fail(`${p}/props/followPath`, 'followPath 应为被跟随图层的 id 字符串（line/arrow/curve）')
+  }
+  // filters 的形态体检（0.6.0 规划 §5.4）：数值范围错了给软警告，渲染端会
+  // 摘除非法项——滤镜是强调手段，写错不该阻塞整幕
+  if (props && isRecord(props.filters)) {
+    const f = props.filters
+    const ratioKeys = ['brightness', 'contrast', 'saturate']
+    for (const [k, v] of Object.entries(f)) {
+      if (v === undefined) continue
+      if (!isFiniteNumber(v)) {
+        c.fail(`${p}/props/filters/${k}`, `滤镜 ${k} 应为数字，实际为 ${JSON.stringify(v)}`)
+        continue
+      }
+      if ((k === 'grayscale' || k === 'invert' || k === 'sepia') && (v < 0 || v > 1)) {
+        c.warn(`滤镜 ${k}=${v} 应在 0~1 之间，超出部分渲染端将按边界处理`)
+      }
+      if (ratioKeys.includes(k) && v < 0) {
+        c.warn(`滤镜 ${k}=${v} 为负数（倍率语义 1=原样），渲染端将摘除该项`)
+      }
+    }
+  }
   // group 的 children 字段形态在这里查；引用关系（存在/不自引用/不嵌套/
   // 不跨组争用）需要全幕图层 id，由 validateScene 统一查。
   if (l.type === 'group' && props && props.children !== undefined) {
@@ -335,6 +410,29 @@ function validateScene(c: Collector, path: string, s: unknown, index: number): v
         }
       }
     }
+    // followPath 的引用体检（0.6.0 规划 §5.4）：被跟随图层必须存在、不能是
+    // 自己、类型必须是可采样的路径族（line/arrow/curve）。引用悬空 = 运动
+    // 无从谈起，写库期报错比渲染期警告便宜一个来回。
+    const PATH_TYPES: ReadonlySet<string> = new Set(['line', 'arrow', 'curve'])
+    const layerTypeOf = new Map<string, string>()
+    s.layers.forEach(l => {
+      if (isRecord(l) && typeof l.id === 'string' && typeof l.type === 'string') layerTypeOf.set(l.id, l.type)
+    })
+    s.layers.forEach((l, i) => {
+      if (!isRecord(l) || !isRecord(l.props)) return
+      const follow = l.props.followPath
+      if (typeof follow !== 'string') return
+      const path = `${p}/layers/${i}/props/followPath`
+      if (follow === l.id) {
+        c.fail(path, `图层 ${l.id} 的 followPath 不能指向自己`)
+      } else if (!ids.has(follow)) {
+        c.fail(path, `图层 ${l.id} 的 followPath 引用了本幕不存在的图层 ${follow}（只能引用同一场景内的 line/arrow/curve 图层）`)
+      } else if (!PATH_TYPES.has(layerTypeOf.get(follow) ?? '')) {
+        c.fail(path, `图层 ${l.id} 的 followPath 引用了 ${follow}（类型 ${layerTypeOf.get(follow)}）——只能跟随 line/arrow/curve 图层`)
+      } else if (Array.isArray(l.tracks) && !l.tracks.some(t => isRecord(t) && t.target === 'props.progress')) {
+        c.warn(`图层 ${l.id} 配置了 followPath 但没有 props.progress 轨道（0→1）——运动位置由 progress 驱动，缺轨道时图层将停在路径起点`)
+      }
+    })
   }
   // 转场 kind 此前不校验（写错静默无转场）；扩族后集合仍是闭合的，写错
   // 必须报出来——「渲染不报错、看片才发现没有转场」比显式失败更误导
