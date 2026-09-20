@@ -36,6 +36,8 @@ export interface Config {
   tts?: TtsConfig
   /** 重复发起护栏阈值（0.6.0 规划 §3.3）：缺省 3 软提示 / 6 硬拒绝（同参）、15/30（同 spec 窗口内）。 */
   guard?: { softAt?: number; hardAt?: number; specSoftAt?: number; specHardAt?: number; windowMs?: number }
+  /** 新建 spec 的缺省画质（0.6.0）：模型建片不写 fps/width/height 时生效；模型显式传参或用户在会话里指定时以参数为准。 */
+  defaults?: { fps?: number; width?: number; height?: number }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -60,6 +62,11 @@ export const Config: Schema<Config> = Schema.object({
     specHardAt: Schema.number().description('同一 spec 在窗口内第 N 次起拒绝执行（默认 30）'),
     windowMs: Schema.number().description('计数窗口毫秒（默认 600000 = 10 分钟）'),
   }).description('重复发起护栏（防模型死循环）：spec 被 patch 后计数自动重置，正当的修改-复查循环不受误伤'),
+  defaults: Schema.object({
+    fps: Schema.number().description('新建 spec 的缺省帧率（未配置为 30）'),
+    width: Schema.number().description('新建 spec 的缺省画布宽（未配置为 1280）'),
+    height: Schema.number().description('新建 spec 的缺省画布高（未配置为 720）'),
+  }).description('新建 spec 的缺省画质：模型建片不带 fps/width/height 时生效；模型显式传参或用户在会话里指定时仍以参数为准'),
 })
 
 const DEFAULT_OUTPUT_DIR = './.dsh/anim'
@@ -221,6 +228,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     outputDir,
     ...(tts ? { tts } : {}),
     ...(config.guard ? { guard: config.guard } : {}),
+    ...(config.defaults ? { defaults: config.defaults } : {}),
   }
   // jobs 服务捕获（0.5.0 §2.1 真机调查结论）：cordis 4 按 inject 声明**许可**
   // 服务属性访问（未声明=抛错），而把 jobs 写进本插件的 inject 会在宿主缺失

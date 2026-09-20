@@ -289,6 +289,11 @@ function indexMediaFromResult(media: { add(path: string): void } | undefined, re
  */
 export function registerAnimTools(ctx: Context, options: RegisterOptions): Disposable {
   const { deps, sink, sessionsDir, hydrate } = options
+  // 缺省画质的实际生效值（0.6.0）：工具描述带真实档位——模型读描述就知道
+  // 本次部署的缺省，不用用户每次口述；模型显式传参仍优先
+  const defaultFps = deps.defaults?.fps ?? 30
+  const defaultWidth = deps.defaults?.width ?? 1280
+  const defaultHeight = deps.defaults?.height ?? 720
   /**
    * 每次工具调用构造自己的 emit：闭包绑定当次 agent，后台渲染在 job 里
    * 异步发事件时归因也不会被其他会话的工具调用覆盖（优化清单 O3）。
@@ -361,14 +366,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
       name: 'anim_create_spec',
       description:
         '新建一份动画 spec（时间线文档）。给定标题与画布参数，返回 specId；之后所有操作都用这个 id。一份 spec = 一支片子。'
+        + `画布与帧率在此刻定死并贯穿全片（预览/渲染/段缓存都以它为准）：本部署缺省 ${defaultWidth}×${defaultHeight} @ ${defaultFps}fps（宿主可用 defaults 配置改），用户对画质有要求时在这里传参，建完再改要走 anim_patch 且全量重渲。`
         + '坐标系为「中心原点」：后续写图层的 props.x/y 时，原点在画布中心（x 右正、y 下正），不要按 web 的左上角原点。'
         + '旁白字幕：用 anim_patch 往 /narration/cues 写 [{ atMs, text, durationMs? }]（atMs 是全片绝对毫秒，durationMs 缺省按 4 字/秒估算），渲染时自动出底部字幕条（字号随画布自适应、超宽自动折行，一条建议 ≤40 字）；写了字幕的片子，画布底部字幕带是保留区，正文图层的 y 要避开。',
       parameters: {
         specId: { type: 'string', required: true, description: 'spec 标识，建议用短横线命名，如 gradient-descent' },
         title: { type: 'string', required: true, description: '片名' },
-        fps: { type: 'number', description: '帧率，默认 30' },
-        width: { type: 'number', description: '画布宽，默认 1280' },
-        height: { type: 'number', description: '画布高，默认 720' },
+        fps: { type: 'number', description: `帧率，缺省 ${defaultFps}` },
+        width: { type: 'number', description: `画布宽，缺省 ${defaultWidth}` },
+        height: { type: 'number', description: `画布高，缺省 ${defaultHeight}` },
         background: { type: 'string', description: '背景色，如 #101418' },
         fontFamily: { type: 'string', description: '字体族，中文建议 Noto Sans CJK SC' },
       },

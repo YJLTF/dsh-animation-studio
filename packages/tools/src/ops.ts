@@ -31,6 +31,8 @@ export interface AnimDeps {
   tts?: TtsService
   /** 护栏阈值覆盖（0.6.0 §3.3）：不配置用 DEFAULT_GUARD_THRESHOLDS。 */
   guard?: Partial<GuardThresholds>
+  /** 新建 spec 的缺省画质（0.6.0）：模型建片不带 fps/width/height 时生效。 */
+  defaults?: { fps?: number; width?: number; height?: number }
 }
 
 export type Emit = (event: AnimEvent) => void
@@ -78,13 +80,18 @@ export type CreateSpecResult = {
 }
 
 export function opCreateSpec(deps: AnimDeps, args: CreateSpecArgs, emit: Emit): CreateSpecResult {
+  // 缺省画质三层：模型显式传参 > 宿主 defaults 配置 > 内置 30fps / 1280×720。
+  // 生效值随回执（fps/size）返回，模型与面板看到的都是实际落库值
   const spec: AnimationSpec = {
     version: 1,
     meta: {
       id: args.specId,
       title: args.title,
-      fps: args.fps ?? 30,
-      size: { width: args.width ?? 1280, height: args.height ?? 720 },
+      fps: args.fps ?? deps.defaults?.fps ?? 30,
+      size: {
+        width: args.width ?? deps.defaults?.width ?? 1280,
+        height: args.height ?? deps.defaults?.height ?? 720,
+      },
       background: args.background ?? DEFAULT_THEME.colors.background,
       locale: 'zh-CN',
     },

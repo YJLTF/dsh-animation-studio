@@ -53,7 +53,7 @@ import type { AnimationSpec, LayerType, Scene } from '../packages/spec/src/index
 import { foldEvents, SpecStore } from '../packages/store/src/index.ts'
 import { AnimRendererRegistry } from '../packages/tools/src/index.ts'
 import type { AnimEvent } from '../packages/tools/src/events.ts'
-import { AnimOpError, coerceScene, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
+import { AnimOpError, coerceScene, opCreateSpec, opDraftScene, opGet, opPreview, opRender, opAssetImport, opPlan, reconcileOutline, scanSegmentCache, sliceSpeechForScenes } from '../packages/tools/src/ops.ts'
 import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools/src/ops.ts'
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
@@ -666,6 +666,8 @@ check('preset: anim-studio 预设文件齐全且含 persona 方法论锚点', ()
   for (const anchor of ['stop:"specEnd"', '{"kind":"back"}', 'props.code', 'narration/cues', 'fontFamily', 'scene.exit']) {
     assert.ok(agent.includes(anchor), `persona 视频技巧应提到 ${anchor}`)
   }
+  // 0.6.0 缺省画质可配置：方法论要指向工具描述的真实档位（defaults 配置）
+  assert.ok(agent.includes('缺省档位以工具描述为准'), 'persona 应说明画质缺省看工具描述（defaults 配置）')
 })
 
 /* ------------------------------------------------------------------ host */
@@ -1062,6 +1064,32 @@ await checkA('sliceSpeechForScenes: 语音轨按选中幕过滤并平移到切�
   )
   assert.equal(cross.tracks[0]?.startMs, 0, '1500 − 2000 → 钳到 0')
   assert.equal(cross.tracks[0]?.durationMs, 2500, '尾巴裁到窗口右缘（4000 − 1500）')
+})
+
+await checkA('opCreateSpec: 缺省画质三层生效——参数 > defaults 配置 > 内置 30fps/1280×720（0.6.0）', async () => {
+  const emitted: AnimEvent[] = []
+  const emit = (event: AnimEvent): void => { emitted.push(event) }
+  const store = new SpecStore()
+  const registry = new AnimRendererRegistry()
+  // 未配置：内置缺省
+  const bare: AnimDeps = { store, renderers: registry, outputDir: '.tmp' }
+  const r1 = opCreateSpec(bare, { specId: 'q1', title: '未配置' }, emit)
+  assert.equal(r1.fps, 30)
+  assert.deepEqual(r1.size, { width: 1280, height: 720 })
+  // 配置 defaults：生效
+  const configured: AnimDeps = { store, renderers: registry, outputDir: '.tmp', defaults: { fps: 60, width: 1920, height: 1080 } }
+  const r2 = opCreateSpec(configured, { specId: 'q2', title: '配置生效' }, emit)
+  assert.equal(r2.fps, 60, 'defaults.fps 生效')
+  assert.deepEqual(r2.size, { width: 1920, height: 1080 }, 'defaults 宽高生效')
+  // 模型显式传参：优先于 defaults
+  const r3 = opCreateSpec(configured, { specId: 'q3', title: '参数优先', fps: 24, width: 640 }, emit)
+  assert.equal(r3.fps, 24, '显式 fps 覆盖 defaults')
+  assert.equal(r3.size.width, 640, '显式宽覆盖 defaults')
+  assert.equal(r3.size.height, 1080, '未传的高度仍用 defaults')
+  // 落库的 spec meta 与回执一致
+  const meta = store.get('q2').meta
+  assert.equal(meta.fps, 60)
+  assert.deepEqual(meta.size, { width: 1920, height: 1080 })
 })
 
 await checkA('opPreview: 同参重复发起护栏——第 3 次软提示、第 6 次硬拒绝、version 重置（0.6.0 §3.3）', async () => {
@@ -2602,8 +2630,7 @@ await checkA('codegen: chart/curve/grid 图层 + filters/shadow/followPath/lette
   assert.deepEqual(warnings.filter(w => w.includes('不支持')), [], '新属性不被白名单误伤')
 })
 
-check('validateSpec: chart 数据形态硬校验 + followPath 引用体检（0.6.0 §5）', () => {
-  const spec = demoSpec()
+check('validateSpec: chart 数据形态硬校验 + followPath 引用体检（0.6.0 §5）', () => {  const spec = demoSpec()
   spec.scenes = [{
     id: 'v', name: '校验', durationMs: 2000,
     layers: [

@@ -98,6 +98,12 @@ dsh plugin --profile web add ./dsh-animation-studio-<版本>.tgz
   name: dsh-animation-studio
   config:
     outputDir: ./.dsh/anim   # 渲染产物与中间工作目录的根，默认 ./.dsh/anim
+    # 新建 spec 的缺省画质（可选）：模型建片不带 fps/宽高时生效；
+    # 模型显式传参或用户在会话里指定时仍以参数为准。未配置为 30fps / 1280×720
+    # defaults:
+    #   fps: 30
+    #   width: 1920
+    #   height: 1080
     # 配音（TTS，可选）：不配置则旁白只出字幕、不发声
     tts:
       # 命令模板（数组，逐项替换占位符后直接执行，不经 shell）：
@@ -135,7 +141,7 @@ dsh plugin --profile web add ./dsh-animation-studio-<版本>.tgz
 ```
 你：用动画讲一下"梯度下降"的直觉，30 秒以内，中文。
 AI：anim_diagnose   → 环境自检
-    anim_create_spec → 建立时间线文档（30fps，1280x720）
+    anim_create_spec → 建立时间线文档（缺省画质见 defaults 配置，未配置 30fps 1280x720）
     anim_plan        → 写分镜大纲，工具做节奏体检（太短/太长/缺意图会提示）
     anim_draft_scene → 逐幕写入图层与关键帧（可反复调用）
     anim_preview     → 低分辨率抽几帧自查
