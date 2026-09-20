@@ -206,6 +206,12 @@ export interface AnimWebState {
   media: MediaIndex
   /** 渲染产物默认根目录：其中的媒体文件天然可服务。 */
   outputDir: string
+  /**
+   * 宿主 `connection` 服务的捕获盒（0.6.0 N9 鉴权）：按引用读——捕获时机
+   * 可能晚于路由注册。服务在则逐请求 requestRejection（Host/Origin fence +
+   * 签名 cookie），与宿主 `/api` 前缀同款。
+   */
+  auth?: { value?: unknown }
 }
 
 const MEDIA_TYPES: Record<string, string> = {
@@ -587,6 +593,13 @@ interface AnimWebServerService {
 /**
  * 在宿主 webServer 上挂 `/dsh-anim` 前缀路由。webServer 是可选服务：
  * 用 ctx.inject 等它出现，headless 形态永远等不到、也就永远不注册。
+ *
+ * 鉴权（0.6.0 真机体检 N9）：`/dsh-anim/*` 此前完全绕开宿主鉴权——宿主只对
+ * 自有路由（`/`、`/api/*`）做 token/cookie 校验，插件的媒体/状态路由一直
+ * 是裸奔的（渲染产物与会话 spec 可被本机任意进程读取）。修复方式：宿主的
+ * `connection` 服务（dsh-client-connection）暴露 `requestRejection(req)`——
+ * 与 `/api` 前缀完全同款的 Host/Origin fence + 签名 cookie 校验；捕获盒里有
+ * 该服务就逐请求校验，没有（老宿主/结构变更）则退回现状并保持可用。
  */
 export function mountAnimWebRoutes(ctx: Context, state: AnimWebState): void {
   const kernel = createAnimKernel(state)
@@ -598,7 +611,16 @@ export function mountAnimWebRoutes(ctx: Context, state: AnimWebState): void {
         server.register({
           kind: 'prefix',
           path: ANIM_ROUTE_PREFIX,
-          handler: (req, res) => void handleAnimRequest(kernel, req, res),
+          handler: (req, res) => {
+            const auth = state.auth?.value as { requestRejection?: (r: unknown) => number | undefined } | undefined
+            const rejection = typeof auth?.requestRejection === 'function' ? auth.requestRejection(req) : undefined
+            if (rejection !== undefined && rejection !== 200) {
+              res.writeHead(rejection)
+              res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+              return
+            }
+            return void handleAnimRequest(kernel, req, res)
+          },
         }),
       'dsh-anim-studio: /dsh-anim 路由',
     )

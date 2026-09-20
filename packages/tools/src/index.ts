@@ -230,6 +230,10 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   // 宿主没有 jobs 时子插件静默不启动，主插件照常挂载、渲染维持同步回退。
   const jobsBox: { value?: unknown } = {}
   captureOptionalService(ctx, ['jobs'], jobsBox)
+  // 路由鉴权捕获（0.6.0 N9）：宿主 connection 服务在则 /dsh-anim 逐请求做
+  // requestRejection（与 /api 同款），不在则退回现状（路由保持可用）
+  const authBox: { value?: unknown } = {}
+  captureOptionalService(ctx, ['connection'], authBox)
   const hydrate = makeSessionHydrator(store, { sessionsDir })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
@@ -238,7 +242,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   ctx.effect(() => registerAnimTools(ctx, { deps, sink: resolveEventSink(ctx, { sessionsDir }), sessionsDir, hydrate, tracker, media, jobsBox }))
   ctx.effect(() => mountMotionCanvas(ctx, outputDir))
   // /dsh-anim 路由：宿主有 webServer（dsh web）才挂得上，headless 形态整段不存在
-  mountAnimWebRoutes(ctx, { store, tracker, media, outputDir })
+  mountAnimWebRoutes(ctx, { store, tracker, media, outputDir, auth: authBox })
 }
 
 /**
