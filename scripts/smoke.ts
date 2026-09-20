@@ -2101,9 +2101,9 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
   }
   const { spec: expanded, warnings } = expandNarration(spec)
   assert.equal(expanded.narration, undefined, '展开后顶层 narration 摘除')
-  assert.deepEqual(expanded.scenes[0]!.subtitles, [{ text: '跨幕字幕', startMs: 1000, endMs: 2000 }])
+  assert.deepEqual(expanded.scenes[0]!.subtitles, [{ text: '跨幕字幕', startMs: 1000, endMs: 2000, continues: true }])
   assert.equal(expanded.scenes[1]!.subtitles!.length, 2)
-  assert.deepEqual(expanded.scenes[1]!.subtitles![0], { text: '跨幕字幕', startMs: 0, endMs: 200 })
+  assert.deepEqual(expanded.scenes[1]!.subtitles![0], { text: '跨幕字幕', startMs: 0, endMs: 200 }, '幕 b 内自然结束的段不带 continues')
   assert.equal(expanded.scenes[1]!.subtitles![1]!.text, '长'.repeat(85), '超长 cue 不截断（折行在渲染端做）')
   assert.equal(expanded.scenes[1]!.subtitles![1]!.startMs, 500, '全局 2500ms 在幕 b 的本地时间是 500ms')
   assert.ok(warnings.some(w => w.includes('5000')), JSON.stringify(warnings))
@@ -2117,13 +2117,49 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
   const solo = { ...expanded, scenes: [expanded.scenes[1]!] }
   const tsx = generateProject(solo).files.find(f => f.path.startsWith('scenes/s0-'))!.content
   assert.ok(tsx.includes('"跨幕字幕"'), `solo 切片后字幕应保留：\n${tsx}`)
-  // 跨幕字幕的幕 b 段是 [0,200)：时段 <300ms 时渐变自动减半为 100ms
-  assert.ok(tsx.includes('delay(0, nsub0tx().opacity(1, 0.1)'), tsx)
+  // 跨幕字幕的幕 b 段是 [0,200)：起点是延续——首帧即全显（初值 opacity={1}）、
+  // 不吃淡入；但 cue 在幕 b 内自然结束，淡出照常（切幕守则只管幕边界）
+  assert.ok(tsx.includes('opacity={1} />)'), `跨幕段初值应全显：\n${tsx}`)
+  assert.ok(!tsx.includes('delay(0, nsub0tx().opacity(1,'), '跨幕延续段不吃淡入')
+  assert.ok(tsx.includes('delay(0.1, nsub0tx().opacity(0, 0.1)'), tsx)
+  // 幕 a 段 [1000,2000)：continues=true → 不提前淡出，顶到切幕帧
+  const aTsx = generateProject({ ...expanded, scenes: [expanded.scenes[0]!] }).files.find(f => f.path.startsWith('scenes/s0-'))!.content
+  assert.ok(!aTsx.includes('nsub0tx().opacity(0,'), `幕 a 延续段应顶到切幕不淡出：\n${aTsx}`)
   // 与本幕交集不足 30ms 的尾巴不生成
   const edge = demoSpec()
   edge.scenes = spec.scenes
   edge.narration = { cues: [{ atMs: 1980, text: '擦边', durationMs: 40 }] }
   assert.equal(expandNarration(edge).spec.scenes[1]!.subtitles, undefined)
+})
+
+check('codegen: 字幕切幕守则——淡出提前到幕尾前收完、正点 cue 不受影响', () => {
+  const spec = demoSpec()
+  spec.scenes[0].subtitles = [
+    { text: '顶到幕尾的', startMs: 100, endMs: 2000 }, // endMs 被钳到 2000-120=1880
+    { text: '中间的', startMs: 600, endMs: 1000 },
+  ]
+  const { files } = generateProject(spec)
+  const tsx = files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  // 顶到幕尾的：fadeOutAt = 1880-150 = 1730，1.88s（幕尾前 120ms）已完全消失
+  assert.ok(tsx.includes('delay(1.73, nsub0bg().opacity(0, 0.15)'), `幕尾前应提前收完淡出：\n${tsx}`)
+  assert.ok(tsx.includes('delay(1.73, nsub0tx().opacity(0, 0.15)'), tsx)
+  // 中间的：不顶幕尾，fade 时刻按 cue 原时段
+  assert.ok(tsx.includes('delay(0.6, nsub1bg().opacity(0.6, 0.15)'), tsx)
+  assert.ok(tsx.includes('delay(0.85, nsub1tx().opacity(0, 0.15)'), tsx)
+  // 擦边字幕：钳完剩不足 30ms 整条不生成
+  const skim = demoSpec()
+  skim.scenes[0].subtitles = [{ text: '擦边', startMs: 1970, endMs: 2000 }]
+  const skimTsx = generateProject(skim).files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  assert.ok(!skimTsx.includes('nsub0bg'), '幕尾 30ms 内的残余 cue 不生成')
+  // continues=true（跨幕延续）：不提前淡出、顶到切幕帧
+  const cont = demoSpec()
+  cont.scenes[0].subtitles = [{ text: '延续', startMs: 1500, endMs: 2000, continues: true }]
+  const contTsx = generateProject(cont).files.find(f => f.path === 'scenes/s0-intro.tsx')!.content
+  assert.ok(!contTsx.includes('nsub0bg().opacity(0,'), `延续段不做淡出：\n${contTsx}`)
+  assert.ok(contTsx.includes('delay(1.5, nsub0bg().opacity(0.6, 0.15)'), contTsx)
+  // 延续段的 lastEnd 按淡入完成时刻（1650）计，不拿 endMs 撑——tail waitFor
+  // 恰好补到 2s，场景不会提前收场也不会拖长
+  assert.ok(contTsx.includes('yield* waitFor(0.35)'), `tail 应补足到 2s：\n${contTsx}`)
 })
 
 check('codegen: 字幕条/转场扩族/exit 退场落进 TSX——绝对时间 delay、不与尾部 waitFor 打架', () => {

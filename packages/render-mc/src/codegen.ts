@@ -57,7 +57,7 @@ export interface GenerateResult {
  * text letterSpacing、image radius、motion path（followPath+progress）——
  * 生成语义整体扩面，旧段自然失效。
  */
-export const CODEGEN_VERSION = 6
+export const CODEGEN_VERSION = 7
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -717,6 +717,8 @@ export interface SubtitleCue {
   text: string
   startMs: number
   endMs: number
+  /** 被幕尾截断、在后幕延续：渲染端不做出幕淡出（切幕守则，0.6.0）。 */
+  continues?: boolean
 }
 
 /**
@@ -1189,9 +1191,24 @@ function genSceneFile(
   // 场景内本地毫秒），只存在于生成的 TSX 里。
   // 超宽自动折行（wrapSubtitleText）：底条按最宽行计算、随行数增高，底边
   // 锚定在「画布底边上方 36px」——行数变多时向上生长，不越过画布下缘。
+  // 切幕守则（0.6.0）：字幕归属本幕，非延续字幕最晚在切幕前完全消失——
+  // 淡出收点提前到「min(cue 结束，幕尾 - CUT_GUARD)」。原实现淡出恰好收在
+  // 幕尾，采样帧上还挂着残影，切幕瞬间就「闪一下」。跨幕 cue（expandNarration
+  // 打了 continues 标记）反向处理：本幕不淡出、顶到切幕帧，后幕段从本地
+  // 0ms 起播不吃淡入（首帧即全显）——字幕跨切幕连续，幕切了字幕不闪。
+  const CUT_GUARD = 120
   let maxBandH = 0
   let bandUsed = false
-  for (const [i, cue] of (scene.subtitles ?? []).entries()) {
+  // 字幕最后一个任务的完成时刻（喂给 lastEnd 口径）：延续段没有出幕淡出，
+  // 不能拿 endMs 撑时间线，否则 tail 归零、场景提前收场；要拿真实的
+  // 「淡入完成时刻」算（淡入淡出任务就是字幕在时间线上的全部占用）
+  let subtitleTaskEnd = 0
+  for (const [i, cueRaw] of (scene.subtitles ?? []).entries()) {
+    const continuesPastCut = cueRaw.continues === true
+    const endMs = continuesPastCut ? cueRaw.endMs : Math.min(cueRaw.endMs, duration - CUT_GUARD)
+    if (endMs - cueRaw.startMs <= 30) continue
+    const continuesFromStart = cueRaw.startMs <= 0
+    const cue = { ...cueRaw, startMs: cueRaw.startMs, endMs }
     const bg = `nsub${i}bg`
     const tx = `nsub${i}tx`
     const fontSize = subtitleStyle.fontSize
@@ -1208,18 +1225,26 @@ function genSceneFile(
     components.add('Txt')
     coreImports.add('createRef')
     setup.push(`const ${bg} = createRef<Rect>();`)
-    setup.push(`view.add(<Rect ref={${bg}} x={0} y={${y}} width={${num(w)}} height={${h}} radius={${Math.round(h / 4)}} fill={${JSON.stringify(subtitleStyle.mutedFill)}} opacity={0} />);`)
+    // 跨幕延续的 cue：初值直接全显、不吃淡入（MC 不吃 0 时长补间）
+    setup.push(`view.add(<Rect ref={${bg}} x={0} y={${y}} width={${num(w)}} height={${h}} radius={${Math.round(h / 4)}} fill={${JSON.stringify(subtitleStyle.mutedFill)}} opacity={${continuesFromStart ? 0.6 : 0}} />);`)
     setup.push(`const ${tx} = createRef<Txt>();`)
     // MC 的 lineHeight 数字语义是 px，倍数要走字符串（'140' → 1.4 倍）；
     // textWrap='pre' 是 \n 分行的开关（默认 DOM 布局会折叠换行符）
-    setup.push(`view.add(<Txt ref={${tx}} x={0} y={${y}} text={${JSON.stringify(lines.join('\n'))}} fontSize={${fontSize}} lineHeight={'140'} textWrap={'pre'} fill={${JSON.stringify(subtitleStyle.textColor)}} opacity={0} />);`)
+    setup.push(`view.add(<Txt ref={${tx}} x={0} y={${y}} text={${JSON.stringify(lines.join('\n'))}} fontSize={${fontSize}} lineHeight={'140'} textWrap={'pre'} fill={${JSON.stringify(subtitleStyle.textColor)}} opacity={${continuesFromStart ? 1 : 0}} />);`)
     const fadeIn = 150
-    const fadeOut = cue.endMs - cue.startMs < 2 * fadeIn ? Math.round((cue.endMs - cue.startMs) / 2) : fadeIn
-    const fadeOutAt = Math.max(cue.startMs, cue.endMs - fadeOut)
-    tasks.push(`delay(${sec(cue.startMs)}, ${bg}().opacity(0.6, ${sec(fadeOut)})),`)
-    tasks.push(`delay(${sec(cue.startMs)}, ${tx}().opacity(1, ${sec(fadeOut)})),`)
-    tasks.push(`delay(${sec(fadeOutAt)}, ${bg}().opacity(0, ${sec(fadeOut)})),`)
-    tasks.push(`delay(${sec(fadeOutAt)}, ${tx}().opacity(0, ${sec(fadeOut)})),`)
+    const fadeOut = endMs - cue.startMs < 2 * fadeIn ? Math.round((endMs - cue.startMs) / 2) : fadeIn
+    const fadeOutAt = Math.max(cue.startMs, endMs - fadeOut)
+    if (!continuesFromStart) {
+      subtitleTaskEnd = Math.max(subtitleTaskEnd, cue.startMs + fadeOut)
+      tasks.push(`delay(${sec(cue.startMs)}, ${bg}().opacity(0.6, ${sec(fadeOut)})),`)
+      tasks.push(`delay(${sec(cue.startMs)}, ${tx}().opacity(1, ${sec(fadeOut)})),`)
+    }
+    // 延续段不做出幕淡出：字幕顶到切幕帧，随场景切换消失，无残影无黑档
+    if (!continuesPastCut) {
+      subtitleTaskEnd = Math.max(subtitleTaskEnd, endMs)
+      tasks.push(`delay(${sec(fadeOutAt)}, ${bg}().opacity(0, ${sec(fadeOut)})),`)
+      tasks.push(`delay(${sec(fadeOutAt)}, ${tx}().opacity(0, ${sec(fadeOut)})),`)
+    }
   }
 
   // 字幕安全区提醒（软警告）：有字幕的幕，画布底部这一横条是字幕带，正文
@@ -1252,14 +1277,15 @@ function genSceneFile(
     }
   }
 
-  // 补齐到场景时长，让「留白」也进时间线
+  // 补齐到场景时长，让「留白」也进时间线。字幕只按真实任务完成时刻计入
+  // （subtitleTaskEnd）——延续段没有出幕淡出任务，不能拿 endMs 撑 lastEnd
   const lastEnd = scene.layers.reduce((max, layer) => {
     if (layer.type === 'audio') return max
     for (const track of layer.tracks) {
       for (const t of tweensOf(track)) max = Math.max(max, t.startMs + t.durationMs)
     }
     return max
-  }, Math.max(scene.transition?.durationMs ?? 0, ...(scene.subtitles ?? []).map(c => c.endMs), exitCoveredDuration ? duration : 0))
+  }, Math.max(scene.transition?.durationMs ?? 0, subtitleTaskEnd, exitCoveredDuration ? duration : 0))
   // 没有任何 yield 的场景时长为 0，渲染时会直接被跳过——务必至少撑住声明时长
   const tail = duration - lastEnd
   const needsWaitFor = tasks.length === 0 || tail > 1
@@ -1460,6 +1486,8 @@ export interface SubtitleCue {
   text: string
   startMs: number
   endMs: number
+  /** 被幕尾截断、在后幕延续：渲染端不做出幕淡出（切幕守则，0.6.0）。 */
+  continues?: boolean
 }
 
 /**
@@ -1509,7 +1537,10 @@ export function expandNarration(spec: AnimationSpec, options: { displayMs?: numb
       const start = Math.max(cue.atMs, sceneStart) - sceneStart
       const end = Math.min(cue.atMs + cue.durationMs, sceneStart + sceneDur) - sceneStart
       if (end - start <= 30) continue
-      subs.push({ text: cue.text, startMs: start, endMs: end })
+      // 被幕尾截断（原 cue 终点越过本幕窗口）→ 在后幕延续：渲染端顶到切幕
+      // 帧不淡出，配合后幕段首帧全显，字幕跨切幕连续不闪（切幕守则）
+      const continues = cue.atMs + cue.durationMs > sceneStart + sceneDur + 1
+      subs.push({ text: cue.text, startMs: start, endMs: end, ...(continues ? { continues: true } : {}) })
     }
     scenes.push(subs.length > 0 ? { ...scene, subtitles: subs } : scene)
   }

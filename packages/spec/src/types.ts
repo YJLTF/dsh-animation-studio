@@ -299,7 +299,14 @@ export interface Scene {
    * 展开之后字幕就是场景数据的一部分，场景级增量渲染的切片与指纹天然
    * 正确（改字幕 → 场景 JSON 变 → 指纹变 → 重渲该幕）。
    */
-  subtitles?: Array<{ text: string; startMs: number; endMs: number }>
+  subtitles?: Array<{
+    text: string
+    startMs: number
+    endMs: number
+    /** cue 被本幕幕尾截断、在后幕延续（切幕守则）：渲染端不做出幕淡出，
+     * 字幕顶到切幕帧，与后幕首帧全显的延续段接成连续字幕（0.6.0）。 */
+    continues?: boolean
+  }>
   background?: string
 }
 
