@@ -65,7 +65,7 @@ function BackgroundTicket(props: { receipt: Receipt; openFile?: ToolViewProps['o
   const outputPath = str(props.receipt, 'outputPath') ?? ''
   const specId = str(props.receipt, 'specId')
   const sessionId = str(props.receipt, 'sessionId')
-  const { status, unreachable } = useJobPolling(jobId)
+  const { status, unreachable } = useJobPolling(jobId, sessionId)
 
   const title = `渲染${specId ? `：${specId}` : ''}`
   if (status !== null && status.status === 'completed') {

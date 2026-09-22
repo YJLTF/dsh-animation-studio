@@ -58,6 +58,7 @@ import type { AnimDeps, AnimJobHandle, AnimJobsService } from '../packages/tools
 import type { AnimRenderer } from '../packages/tools/src/render.ts'
 import { previewClipFastPath } from '../packages/tools/src/ops.ts'
 import { runWithRetries, synthesizeNarration, type TtsService } from '../packages/tools/src/tts.ts'
+import { replaySidecarEvents } from '../packages/tools/src/register.ts'
 import { createAnimKernel, MediaIndex, RenderTracker } from '../packages/tools/src/web.ts'
 import type { KernelResponse } from '../packages/tools/src/web.ts'
 
@@ -1552,6 +1553,105 @@ await checkA('/dsh-anim 内核：渲染任务簿 + 状态 API + 媒体放行', a
   // 杂项：POST 405、未知路径 404
   assert.equal((await kernel({ method: 'POST', url: '/dsh-anim/api/state', headers: {} })).status, 405)
   assert.equal((await kernel({ method: 'GET', url: '/dsh-anim/other', headers: {} })).status, 404)
+})
+
+await checkA('/dsh-anim 挂载回放：sidecar 事件重建媒体索引与任务簿，跨重启卡片可用（0.6.1）', async () => {
+  // 目录布局：成片在 outputDir 内；拼贴图与段视频在 outputDir 外（自定义导出目录）
+  const tmpRoot = mkdtempSync(join(tmpdir(), 'anim-sidecar-'))
+  const outputDir = join(tmpRoot, 'output')
+  mkdirSync(outputDir)
+  const sessionsDir = join(outputDir, 'sessions')
+  mkdirSync(sessionsDir)
+  const outsideSheet = join(tmpRoot, 'exported.contact.jpg')
+  writeFileSync(outsideSheet, 'jpegdata')
+  const outsideClip = join(tmpRoot, 'scene1.clip.mp4')
+  writeFileSync(outsideClip, 'clipdata')
+
+  // sidecar：渲染完成（outputPath + contactSheet）+ 预览完成（frames + clip）
+  // + 一条只有 start 的渲染（重启时没跑完）+ 一行坏 JSON（扫描必须容错跳过）
+  const sidecar = join(sessionsDir, 'session-demo.jsonl')
+  writeFileSync(
+    sidecar,
+    JSON.stringify({
+      type: 'anim/render-finished',
+      data: { specId: 'demo', jobId: 'anim-render-1', outputPath: join(outputDir, 'demo.mp4'), contactSheet: outsideSheet },
+    }) + '\n{broken json\n'
+      + JSON.stringify({
+        type: 'anim/preview-finished',
+        data: {
+          specId: 'demo',
+          jobId: 'anim-preview-1',
+          frames: [{ atMs: 0, path: join(outputDir, 'f0.png') }],
+          clip: { path: outsideClip, sceneId: 's1', sceneIndex: 0, durationMs: 2000 },
+        },
+      }) + '\n'
+      + JSON.stringify({
+        type: 'anim/render-start',
+        data: { specId: 'demo', jobId: 'anim-render-2', outputPath: join(outputDir, 'half.mp4') },
+      }) + '\n'
+      + JSON.stringify({
+        type: 'anim/render-progress',
+        data: { specId: 'demo', jobId: 'anim-render-2', done: 5, total: 100, percent: 5 },
+      }) + '\n',
+  )
+
+  const store = new SpecStore()
+  store.create('demo', demoSpec())
+  const media = new MediaIndex()
+  const tracker = new RenderTracker()
+  replaySidecarEvents(sessionsDir, { media, tracker })
+  const kernel = createAnimKernel({ store, tracker, media, outputDir })
+  const mediaOf = (p: string): Promise<KernelResponse> =>
+    kernel({ method: 'GET', url: `/dsh-anim/media?p=${encodeURIComponent(p)}`, headers: {} })
+  const sheetRes = await mediaOf(outsideSheet)
+  assert.equal(sheetRes.status, 200, 'sidecar 里出现过的拼贴图（outputDir 外）可服务')
+  assert.equal(sheetRes.headers['content-type'], 'image/jpeg')
+  assert.equal((await mediaOf(outsideClip)).status, 200, 'sidecar 里出现过的段视频（outputDir 外）可服务')
+  assert.equal(
+    (await mediaOf(join(tmpRoot, 'unlisted.jpg'))).status,
+    404,
+    '白名单边界不变：sidecar 没出现过的 outputDir 外文件仍 404',
+  )
+  // 任务簿：完成的任务带全部结果字段；重启时没跑完的如实落为 failed
+  const jobRes = await kernel({ method: 'GET', url: '/dsh-anim/api/job?id=anim-render-1&session=session-demo', headers: {} })
+  assert.equal(jobRes.status, 200)
+  const job = (JSON.parse((await drain(jobRes)).toString('utf8')) as { job: { status: string; contactSheet?: string; sessionId?: string } }).job
+  assert.equal(job.status, 'completed', '回放的任务簿讲得出完成态')
+  assert.equal(job.contactSheet, outsideSheet, '完成态带拼贴图路径')
+  assert.equal(job.sessionId, 'session-demo', '账目归属会话')
+  const deadRes = await kernel({ method: 'GET', url: '/dsh-anim/api/job?id=anim-render-2&session=session-demo', headers: {} })
+  const dead = (JSON.parse((await drain(deadRes)).toString('utf8')) as { job: { status: string; error?: string } }).job
+  assert.equal(dead.status, 'failed', '重启时仍在 running 的任务落为 failed')
+  assert.ok(dead.error && dead.error.includes('重启'), '失败原因可读')
+
+  // 跨会话同号任务分簿（0.6.1）：另一个会话的 anim-render-1 互不串账
+  const sidecarB = join(sessionsDir, 'session-other.jsonl')
+  const otherSheet = join(tmpRoot, 'other.contact.jpg')
+  writeFileSync(otherSheet, 'otherjpeg')
+  writeFileSync(
+    sidecarB,
+    JSON.stringify({
+      type: 'anim/render-finished',
+      data: { specId: 'other', jobId: 'anim-render-1', outputPath: join(outputDir, 'other.mp4'), contactSheet: otherSheet },
+    }) + '\n',
+  )
+  const mediaB = new MediaIndex()
+  const trackerB = new RenderTracker()
+  replaySidecarEvents(sessionsDir, { media: mediaB, tracker: trackerB })
+  const kernelB = createAnimKernel({ store, tracker: trackerB, media: mediaB, outputDir })
+  const jobOf = async (q: string): Promise<{ status: number; body: { job?: { contactSheet?: string; sessionId?: string } } }> => {
+    const res = await kernelB({ method: 'GET', url: `/dsh-anim/api/job?${q}`, headers: {} })
+    return { status: res.status, body: JSON.parse((await drain(res)).toString('utf8')) as { job?: { contactSheet?: string; sessionId?: string } } }
+  }
+  const forDemo = await jobOf('id=anim-render-1&session=session-demo')
+  assert.equal(forDemo.status, 200)
+  assert.equal(forDemo.body.job?.contactSheet, outsideSheet, 'demo 会话查到自己的拼贴图')
+  const forOther = await jobOf('id=anim-render-1&session=session-other')
+  assert.equal(forOther.status, 200)
+  assert.equal(forOther.body.job?.contactSheet, otherSheet, 'other 会话查到自己的拼贴图，不串账')
+  const noSession = await jobOf('id=anim-render-1')
+  assert.equal(noSession.status, 200, '缺 session 参数时取最近一条（旧卡片兜底）')
+  assert.equal(noSession.body.job?.sessionId, 'session-other', '无会话参数取最近回放的账目')
 })
 
 /* ------------------------------------- 0.4.0 M0：别名收敛 / 大纲对账 / 警告与成本预期 */

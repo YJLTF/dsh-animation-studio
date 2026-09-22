@@ -120,6 +120,8 @@ export const mediaUrl = (path: string): string => `/dsh-anim/media?p=${encodeURI
 /** /dsh-anim/api/state 里的一条渲染任务。 */
 export interface RenderStatus {
   jobId: string
+  /** 归属会话（0.6.1 分簿记账），旧簿子条目缺省。 */
+  sessionId?: string
   specId: string
   status: 'running' | 'completed' | 'killed' | 'failed'
   outputPath: string
@@ -149,12 +151,14 @@ export interface RenderStatus {
 
 /**
  * 查一条渲染/预览任务。0.6.0 起优先走单任务端点 `/dsh-anim/api/job?id=`
- * （不再为找一条记录拉全量 state）；端点 404（旧版插件/宿主重启清簿）时
- * 回退全量 state 查找。都拿不到返回 null。
+ * （不再为找一条记录拉全量 state）；0.6.1 起带 `&session=` 精确对号——
+ * jobId 只在会话内唯一，跨会话同号任务按会话分簿。端点 404（旧版插件/
+ * 宿主重启清簿）时回退全量 state 查找。都拿不到返回 null。
  */
-export async function fetchRenderStatus(jobId: string, signal?: AbortSignal): Promise<RenderStatus | null> {
+export async function fetchRenderStatus(jobId: string, signal?: AbortSignal, sessionId?: string): Promise<RenderStatus | null> {
+  const sessionQuery = sessionId !== undefined ? `&session=${encodeURIComponent(sessionId)}` : ''
   try {
-    const res = await fetch(`/dsh-anim/api/job?id=${encodeURIComponent(jobId)}`, { signal })
+    const res = await fetch(`/dsh-anim/api/job?id=${encodeURIComponent(jobId)}${sessionQuery}`, { signal })
     if (res.ok) {
       const data: unknown = await res.json()
       const job = (data as { job?: unknown }).job
@@ -172,7 +176,9 @@ export async function fetchRenderStatus(jobId: string, signal?: AbortSignal): Pr
   if (!Array.isArray(renders)) return null
   for (const item of renders) {
     const job = item as RenderStatus
-    if (job && typeof job === 'object' && job.jobId === jobId) return job
+    if (job && typeof job === 'object' && job.jobId === jobId && (sessionId === undefined || job.sessionId === undefined || job.sessionId === sessionId)) {
+      return job
+    }
   }
   return null
 }

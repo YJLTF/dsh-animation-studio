@@ -11,7 +11,7 @@ import { useEffect, useState } from 'react'
 
 import { fetchRenderStatus, type RenderStatus } from '../protocol.ts'
 
-export function useJobPolling(jobId: string | undefined): { status: RenderStatus | null; unreachable: boolean } {
+export function useJobPolling(jobId: string | undefined, sessionId?: string): { status: RenderStatus | null; unreachable: boolean } {
   const [status, setStatus] = useState<RenderStatus | null>(null)
   const [unreachable, setUnreachable] = useState(false)
 
@@ -23,7 +23,7 @@ export function useJobPolling(jobId: string | undefined): { status: RenderStatus
     let misses = 0
     async function tick(): Promise<void> {
       try {
-        const job = await fetchRenderStatus(id)
+        const job = await fetchRenderStatus(id, undefined, sessionId)
         if (!alive) return
         setUnreachable(job === null)
         if (job === null) {
@@ -55,7 +55,7 @@ export function useJobPolling(jobId: string | undefined): { status: RenderStatus
       alive = false
       if (timer) clearInterval(timer)
     }
-  }, [jobId])
+  }, [jobId, sessionId])
 
   return { status, unreachable }
 }

@@ -4,7 +4,7 @@
 
 你用自然语言说"做一支讲梯度下降的 30 秒短片"，AI 就通过 10 个 `anim_*` 工具完成 **分镜 → 时间线 → 动画 → 预览 → 微调 → 渲染出 MP4** 的完整流程——中途可以随时抽查画面、把某个关键帧挪几百毫秒、或者撤销上一步。模型全程不写动画代码，只读写一份数据文档。
 
-基于 **dsh 0.1.6-alpha.1** 真机实证开发（类型开发基线 0.1.5-rc.2，peer 依赖声明为 `>=0.1.5-rc.2`），**0.1.6-alpha.2** 兼容性已验证——宿主挂载冒烟（工具注册、执行链路、sidecar 落盘、会话恢复、web 路由、client 卡片）在其内置生态（cordis 4.0.2 / dsh-tools 0.1.6-alpha.2 / schemastery 3.18.2）下全绿。可无缝配合 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
+基于 **dsh 0.1.6-alpha.1** 真机实证开发（类型开发基线 0.1.5-rc.2，peer 依赖声明为 `>=0.1.5-rc.2`），**0.1.6-alpha.2 与 0.1.7-alpha.1** 兼容性已验证——宿主挂载冒烟（工具注册、执行链路、sidecar 落盘、会话恢复、web 路由、client 卡片）在其内置生态（cordis 4.0.2 / dsh-tools 0.1.6-alpha.2 / schemastery 3.18.2）下全绿；0.6.1 针对 0.1.7 手风琴 DOM 的样式变更（mask 裁剪 fixed 定位）把卡片灯箱迁到 `<dialog>` 顶层渲染，并对宿主 DOM 结构不再做假设（详见 [docs/0.6.1-规划.md](docs/0.6.1-规划.md)）。可无缝配合 [dsh-plugin-offline-packager](https://github.com/YJLTF/dsh-plugin-offline-packager) 打成自包含离线安装包。
 
 ```
 模型 ──anim_*工具──▶ AnimationSpec (JSON IR) ──▶ 渲染适配器 ──▶ MP4
@@ -220,7 +220,8 @@ pnpm smoke       # 纯逻辑冒烟 + 构建 + 真实 cordis 宿主挂载冒烟�
 - **转场与缓动**：`transition.kind` 支持 `none/fade/slideLeft/slideUp/slideRight/slideDown/zoomIn`；`scene.exit`（fade/slide 系列）在幕尾整体退场；缓动另有 `bounce/elastic/back` 及各自 In/InOut 变体（强调类入场优先 out 形态）。
 - **旁白字幕**：字幕字号按画布高度约 4% 自适应（与正文字号解耦），超宽自动折行；底部字幕带是保留区，建议一条 cue ≤40 字、正文图层的 y 避开字幕带（重叠时渲染给软警告）。未配置 TTS 时旁白只出字幕（设计内形态）。
 - **字体**：font 资产导入后 text/code 图层 `fontFamily` 填 assetId 即生效；远端 http(s) 字体 URL 需要目标服务器允许跨源（CORS）。
-- **后台任务**：dsh 0.1.6-alpha.2+ 的 web profile 自带 jobs 子系统，插件经「捕获子插件」拿到服务并注册署名 controller 后，`anim_render` / `anim_preview` 自动转后台任务（真机已验证）；宿主没有 jobs 或发布失败时自动走同步路径（设计内行为），`anim_diagnose` 的 host 报告（`jobsOnCtx`）可确认当前部署的形态。
+- **后台任务**：dsh 0.1.6-alpha.2+ 的 web profile 自带 jobs 子系统，插件经「捕获子插件」拿到服务并注册署名 controller 后，`anim_render` / `anim_preview` 自动转后台任务（真机已验证）；宿主没有 jobs 或发布失败时自动走同步路径（设计内行为），`anim_diagnose` 的 host 报告（`jobsOnCtx`）可确认当前部署的形态。任务簿按「会话 :: jobId」分账（jobId 跨会话同号），卡片轮询用回执里的 sessionId 精确对号。
+- **重启自愈**：宿主重启会杀掉所有后台任务并清空进程内状态，插件挂载时从 sidecar 事件回放重建任务簿与媒体索引——旧会话的渲染/预览卡片照常显示完成态（视频、拼贴图、帧清单），重启时未完成的任务如实标为 failed；自定义导出目录（outputDir 之外）的产物链接也照常可点。
 - **媒体放行**：`/dsh-anim/media` 只放行「outputDir 内」或「工具回执里出现过的精确路径」+ 扩展名白名单（`mp4/webm/mov/png/jpg/jpeg/gif/webp/svg/mp3/wav/ogg/m4a/flac`）。
 - **插件事件不进宿主会话日志**：宿主读回对未知事件类型 fail-closed，而宿主 `session.append` 不提供 ignorable 入口，写 anim/* 事件会毒化整个会话；事件因此只写插件 sidecar。极旧版本写入过 anim/* 事件的宿主日志，用 `python scripts/repair-session-log.py <session.v3.jsonl.zstd>` 补 ignorable 标记后仍可作恢复回退源（自动备份）。完整事故记录见 `docs/`。
 - **渲染环境**：渲染依赖 Motion Canvas 3.17 的编辑器 UI 自动化（官方无 CLI）；Edge 152+ 的新 headless 配合 SwiftShader 可完整出帧；`headless: false` 仅作调试后门（Linux 无显示时需要 Xvfb）。浏览器与 vite dev server 常驻复用（空闲 10 分钟回收）。

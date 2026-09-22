@@ -72,7 +72,7 @@ function PreviewTicket(props: { receipt: Receipt }): ReactNode {
   const jobId = str(props.receipt, 'jobId')
   const specId = str(props.receipt, 'specId')
   const sessionId = str(props.receipt, 'sessionId')
-  const { status, unreachable } = useJobPolling(jobId)
+  const { status, unreachable } = useJobPolling(jobId, sessionId)
 
   if (status !== null && status.status === 'completed') {
     const frames = list(status as unknown as Receipt, 'frames')

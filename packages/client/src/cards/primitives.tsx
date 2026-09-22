@@ -7,7 +7,7 @@
  */
 
 import type { ReactNode, Ref } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { formatMs, isSettled, mediaUrl, num, readArgs, str, type Receipt, type ToolViewProps } from '../protocol.ts'
 import { badge, caption, headRow, link, linkRow, muted, progressBarInner, progressBarOuter, preBox, row, thumbLightbox, titleStyle, videoBox, warnBox, card } from './styles.ts'
@@ -147,6 +147,13 @@ export function ContactSheet(props: { path: string; onSeek?: (fraction: number) 
 /**
  * 缩略图灯箱（0.6.0 规划 §6.2）：点缩略图在卡内模态放大——此前只能跳新标签，
  * 会话流的上下文被打断；灯箱内左右翻页、Esc/点背景关闭。
+ *
+ * 0.6.1 起用 <dialog>.showModal() 顶层渲染：dsh 0.1.7 的工具调用手风琴把
+ * 卡片包进 overflow:auto + 渐隐 mask（O_Ebla_fadeTop/Bottom）的滚动体里，
+ * mask/containment 祖先会让 position:fixed 退化为相对该祖先定位并被裁剪，
+ * 灯箱被困在折叠体小盒里（真机实证）。top layer 高于一切祖先的裁剪与层叠
+ * 上下文，是唯一不依赖宿主 DOM 结构假设的逃逸方式；Esc 关闭也由 cancel
+ * 事件原生承担。
  */
 export function Lightbox(props: {
   items: Array<{ src: string; caption?: string }>
@@ -154,10 +161,14 @@ export function Lightbox(props: {
   onClose: () => void
   onNavigate: (index: number) => void
 }): ReactNode {
+  const dialogRef = useRef<HTMLDialogElement | null>(null)
+  useEffect(() => {
+    const dlg = dialogRef.current
+    if (dlg && !dlg.open) dlg.showModal()
+  })
   useEffect(() => {
     if (props.index === null) return
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') props.onClose()
       if (event.key === 'ArrowRight' && props.index !== null) props.onNavigate(Math.min(props.items.length - 1, props.index + 1))
       if (event.key === 'ArrowLeft' && props.index !== null) props.onNavigate(Math.max(0, props.index - 1))
     }
@@ -168,12 +179,15 @@ export function Lightbox(props: {
   const bounded = Math.min(props.index, props.items.length - 1)
   const item = props.items[bounded]!
   return (
-    <div
+    <dialog
+      ref={dialogRef}
       style={{
-        position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.82)',
+        position: 'fixed', inset: 0, width: '100%', height: '100%', maxWidth: '100vw', maxHeight: '100vh',
+        margin: 0, border: 'none', padding: 0, background: 'rgba(0,0,0,0.82)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 10,
       }}
       onClick={props.onClose}
+      onCancel={event => { event.preventDefault(); props.onClose() }}
     >
       <img
         style={{ maxWidth: '92vw', maxHeight: '84vh', borderRadius: 6 }}
@@ -198,7 +212,7 @@ export function Lightbox(props: {
           关闭（Esc）
         </button>
       </div>
-    </div>
+    </dialog>
   )
 }
 
