@@ -15,7 +15,7 @@ import { safeName } from '@dsh-anim/spec'
 
 import { probe } from './ctx-probe.ts'
 import type { AnimDeps } from './ops.ts'
-import { registerAnimTools, resolveEventSink } from './register.ts'
+import { registerAnimTools, indexMediaFromResult, replaySidecarEvents, resolveEventSink } from './register.ts'
 import type { AnimRenderer } from './render.ts'
 import { AnimRendererRegistry } from './render.ts'
 import { createTtsService, type TtsConfig } from './tts.ts'
@@ -162,13 +162,16 @@ function restoreFromSession(ctx: Context, store: SpecStore): void {
  */
 export function makeSessionHydrator(
   store: SpecStore,
-  options: { sessionsDir?: string } = {},
+  options: { sessionsDir?: string; media?: { add(path: string): void } } = {},
 ): (agent: unknown) => void {
   const hydrated = new Set<string>()
   const fold = (events: Array<{ type: string; data: unknown }>): boolean => {
     const animEvents = events.filter(e => typeof e.type === 'string' && e.type.startsWith('anim/'))
     if (animEvents.length === 0) return false
     store.adopt(foldEvents(animEvents))
+    // 产物路径顺手进媒体索引（0.6.1）：这条路径服务的是没有 sidecar 的旧
+    // 会话（宿主日志兜底源），其 outputDir 之外的产物在重启后同样会 404
+    for (const e of animEvents) indexMediaFromResult(options.media, e.data)
     return true
   }
   return agent => {
@@ -242,7 +245,11 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   // requestRejection（与 /api 同款），不在则退回现状（路由保持可用）
   const authBox: { value?: unknown } = {}
   captureOptionalService(ctx, ['connection'], authBox)
-  const hydrate = makeSessionHydrator(store, { sessionsDir })
+  // Web 面进程内状态跨重启回放（0.6.1）：sidecar 事件把媒体索引与渲染任务簿
+  // 填回来，旧会话卡片的产物链接与完成态在重启后依旧可用；走宿主日志兜底恢复
+  // 的老会话则在 hydrate 时按事件补登记
+  replaySidecarEvents(sessionsDir, { media, tracker })
+  const hydrate = makeSessionHydrator(store, { sessionsDir, media })
 
   ctx.effect(() => ctx.reflect.provide(REGISTRY_NAME, registry))
   // 异步 effect：cordis 会 await 拿到注销函数；不能把 disposer 直接传给

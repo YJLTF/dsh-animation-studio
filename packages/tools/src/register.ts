@@ -11,8 +11,8 @@
  *    场合被调用，不能依赖任何运行时状态。
  */
 
-import { appendFileSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 
 import type { Context, Disposable } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -258,7 +258,7 @@ export interface RegisterOptions {
    */
   hydrate?: (agent: unknown) => void
   /** 渲染任务簿：渲染事件流过的同时记账，/dsh-anim/api/state 读它讲进度。 */
-  tracker?: { observe(event: AnimEvent): void }
+  tracker?: { observe(event: AnimEvent, sessionKey?: string): void }
   /** 产物媒体索引：工具回执里出现过的文件路径才可被 /dsh-anim/media 服务。 */
   media?: { add(path: string): void }
   /**
@@ -269,19 +269,77 @@ export interface RegisterOptions {
 }
 
 /**
- * 回执媒体采集：结果对象里的 outputPath / frames[].path 全部进媒体索引。
+ * 回执媒体采集：结果对象里的产物路径全部进媒体索引——成片 outputPath、
+ * 全片拼贴图 contactSheet、抽帧 frames[].path、单幕直放 clip.path（0.6.1 补
+ * 后两者：拼贴图/段视频同样允许落在 outputDir 之外的自定义目录，此前漏登记
+ * 导致媒体路由对它们 404、卡片 onError 静默隐藏）。
  * 放在工具包装层而不是 ops 层——新增一个返回产物的 op 时不用记得登记。
+ * 事件载荷与回执同构（render-finished / preview-finished），sidecar 回填复用。
  */
-function indexMediaFromResult(media: { add(path: string): void } | undefined, result: unknown): void {
+export function indexMediaFromResult(media: { add(path: string): void } | undefined, result: unknown): void {
   if (!media || typeof result !== 'object' || result === null) return
   const record = result as Record<string, unknown>
   if (typeof record.outputPath === 'string') media.add(record.outputPath)
+  if (typeof record.contactSheet === 'string') media.add(record.contactSheet)
   if (Array.isArray(record.frames)) {
     for (const frame of record.frames) {
       const path = (frame as { path?: unknown } | null)?.path
       if (typeof path === 'string') media.add(path)
     }
   }
+  const clip = record.clip as { path?: unknown } | null | undefined
+  if (clip !== null && typeof clip === 'object' && typeof clip.path === 'string') media.add(clip.path)
+}
+
+/**
+ * 挂载时从 sidecar 事件文件回放，重建 Web 面的进程内状态：
+ * - 媒体索引：工具回执的产物路径（outputPath / contactSheet / frames / clip）
+ *   是「工具成功时」登记的，宿主一重启索引就空，旧会话卡片里 outputDir 之外的
+ *   产物（自定义导出目录的成片/拼贴图）从此 404；
+ * - 渲染任务簿：后台票据卡靠 /api/job 读簿子重建完成态，簿子空了卡片就永远
+ *   卡在「排队/启动中」的假运行态。回放后仍在 running 的任务如实落为 failed
+ *   （进程死亡即任务死亡）。
+ *
+ * sidecar 里落盘的事件与工具回执同源，按同一条白名单语义回填——
+ * 「本插件落盘事件里出现过的路径才可服务」的边界不变，只是补上了跨重启的
+ * 一致性。扫描失败不拖垮挂载，最坏退回「重启后旧卡片不可用」的现状。
+ */
+export function replaySidecarEvents(
+  sessionsDir: string,
+  sinks: {
+    media?: { add(path: string): void }
+    tracker?: { observe(event: AnimEvent, sessionKey?: string): void; markInterrupted(reason: string): void }
+  },
+): void {
+  let entries: string[]
+  try {
+    entries = readdirSync(sessionsDir)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.jsonl')) continue
+    // 文件名即 safeName(会话 id)（见 EventSink 的落盘约定），任务簿按它分账
+    const sessionKey = entry.slice(0, -'.jsonl'.length)
+    let text: string
+    try {
+      text = readFileSync(resolve(sessionsDir, entry), 'utf8')
+    } catch {
+      continue
+    }
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        const event = JSON.parse(line) as { type?: unknown; data?: unknown }
+        if (typeof event.type !== 'string' || !event.type.startsWith('anim/')) continue
+        indexMediaFromResult(sinks.media, event.data)
+        sinks.tracker?.observe(event as unknown as AnimEvent, sessionKey)
+      } catch {
+        /* 坏行跳过：sidecar 可能被外部编辑截断 */
+      }
+    }
+  }
+  sinks.tracker?.markInterrupted('宿主重启时任务未完成（随进程终止），可用 job_output 重新收集或重试')
 }
 
 /**
@@ -297,12 +355,15 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
   /**
    * 每次工具调用构造自己的 emit：闭包绑定当次 agent，后台渲染在 job 里
    * 异步发事件时归因也不会被其他会话的工具调用覆盖（优化清单 O3）。
+   * 会话键一并传给任务簿——jobId 跨会话同号，分簿才不会撞账（0.6.1）。
    */
   const emitFor = (exec: { agent?: unknown } | undefined): Emit => {
     const agent = exec?.agent
+    const session = (agent as { session?: { id?: unknown } } | undefined)?.session
+    const sessionKey = typeof session?.id === 'string' && session.id !== '' ? safeName(session.id) : undefined
     return event => {
       sink.append(event, agent)
-      options.tracker?.observe(event)
+      options.tracker?.observe(event, sessionKey)
     }
   }
   const disposers: Array<() => void> = []

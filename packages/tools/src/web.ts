@@ -38,6 +38,8 @@ export const ANIM_ROUTE_PREFIX = '/dsh-anim'
 /** 一条渲染/预览任务的可展示状态（/api/state 的 renders 项）。 */
 export interface RenderStatusView {
   jobId: string
+  /** 归属会话（safeName 后的会话 id）。冒烟/无宿主环境缺省。 */
+  sessionId?: string
   specId: string
   status: 'running' | 'completed' | 'killed' | 'failed'
   outputPath: string
@@ -75,17 +77,29 @@ export interface RenderStatusView {
 
 /**
  * 渲染任务的内存簿。事件在流过 sink 的同时灌进这里，/api/state 才能把
- * 「已转后台」的任务讲出进度。只反映本进程见过的任务：宿主重启后簿子
- * 是空的——重启也确实杀掉了所有后台任务，语义刚好一致。
+ * 「已转后台」的任务讲出进度。宿主重启后进程内任务确实全部死亡，但卡片
+ * 还要从簿子里读「当时的结果」才能重建完成态（视频/拼贴图/帧清单）——
+ * 0.6.1 起挂载时从 sidecar 回放事件把簿子填回来（replaySidecarEvents），
+ * 重启时仍在 running 的任务如实落为 failed（进程死亡即任务死亡）。
+ *
+ * 记账键是「会话 :: jobId」：jobId（anim-render-1 之类）只在单个会话内
+ * 唯一，宿主是「一个 profile 多个会话」的形态，跨会话同号任务在 live 并发
+ * 与 sidecar 回放时都会撞号（0.6.1 真机实证：回放后二叉树的渲染卡轮询到
+ * 排序会话的账），按会话分簿才能对号入座。
  */
 export class RenderTracker {
   readonly #jobs = new Map<string, RenderStatusView>()
 
-  observe(event: AnimEvent): void {
+  static #key(sessionKey: string | undefined, jobId: string): string {
+    return `${sessionKey ?? ''}\u0000${jobId}`
+  }
+
+  observe(event: AnimEvent, sessionKey?: string): void {
     if (event.type === 'anim/render-start') {
       const d = event.data
-      this.#jobs.set(d.jobId, {
+      this.#jobs.set(RenderTracker.#key(sessionKey, d.jobId), {
         jobId: d.jobId,
+        ...(sessionKey !== undefined ? { sessionId: sessionKey } : {}),
         specId: d.specId,
         status: 'running',
         outputPath: d.outputPath,
@@ -96,7 +110,7 @@ export class RenderTracker {
     }
     if (event.type === 'anim/render-progress') {
       const d = event.data
-      const job = this.#jobs.get(d.jobId)
+      const job = this.#jobs.get(RenderTracker.#key(sessionKey, d.jobId))
       if (job && job.status === 'running') {
         job.percent = d.percent
         job.done = d.done
@@ -106,8 +120,12 @@ export class RenderTracker {
     }
     if (event.type === 'anim/render-finished') {
       const d = event.data
-      const job = this.#jobs.get(d.jobId)
-      if (!job) return
+      let job = this.#jobs.get(RenderTracker.#key(sessionKey, d.jobId))
+      if (!job) {
+        // 正常流里 start 先行；sidecar 回放遇到截断文件（只有 finished）时就地立账
+        job = { jobId: d.jobId, ...(sessionKey !== undefined ? { sessionId: sessionKey } : {}), specId: d.specId, status: 'running', outputPath: d.outputPath, percent: 0, startedAt: Date.now() }
+        this.#jobs.set(RenderTracker.#key(sessionKey, d.jobId), job)
+      }
       job.status = d.status ?? 'completed'
       job.finishedAt = Date.now()
       if (d.frameCount !== undefined) job.frameCount = d.frameCount
@@ -125,8 +143,9 @@ export class RenderTracker {
     // 预览任务与渲染同簿（§5.3）：条目小得多，没有进度，完成时带帧清单
     if (event.type === 'anim/preview-start') {
       const d = event.data
-      this.#jobs.set(d.jobId, {
+      this.#jobs.set(RenderTracker.#key(sessionKey, d.jobId), {
         jobId: d.jobId,
+        ...(sessionKey !== undefined ? { sessionId: sessionKey } : {}),
         specId: d.specId,
         status: 'running',
         outputPath: '',
@@ -138,8 +157,11 @@ export class RenderTracker {
     }
     if (event.type === 'anim/preview-finished') {
       const d = event.data
-      const job = this.#jobs.get(d.jobId)
-      if (!job) return
+      let job = this.#jobs.get(RenderTracker.#key(sessionKey, d.jobId))
+      if (!job) {
+        job = { jobId: d.jobId, ...(sessionKey !== undefined ? { sessionId: sessionKey } : {}), specId: d.specId, status: 'running', outputPath: '', percent: 0, kind: 'preview', startedAt: Date.now() }
+        this.#jobs.set(RenderTracker.#key(sessionKey, d.jobId), job)
+      }
       job.status = d.status ?? 'completed'
       job.finishedAt = Date.now()
       if (job.status === 'completed') job.percent = 100
@@ -153,6 +175,20 @@ export class RenderTracker {
   /** 全部任务，按开始时间升序。 */
   snapshot(): RenderStatusView[] {
     return [...this.#jobs.values()].sort((a, b) => a.startedAt - b.startedAt)
+  }
+
+  /**
+   * sidecar 回放后收尾：仍在 running 的任务已随上次进程死亡，永远等不到
+   * finished 事件，如实落为 failed——卡片据此显示失败与产物路径，而不是
+   * 伪装成还在排队。只在挂载回放路径上调用，不影响本进程新任务。
+   */
+  markInterrupted(reason: string): void {
+    for (const job of this.#jobs.values()) {
+      if (job.status !== 'running') continue
+      job.status = 'failed'
+      job.error = reason
+      job.finishedAt = Date.now()
+    }
   }
 }
 
@@ -318,9 +354,16 @@ export function createAnimKernel(state: AnimWebState): (req: KernelRequest) => P
       return json(200, buildState(state))
     }
     if (pathname === `${ANIM_ROUTE_PREFIX}/api/job`) {
-      // 单任务查询（0.6.0 规划 §6.4）：卡片轮询不再为找一条记录拉全量 state
+      // 单任务查询（0.6.0 规划 §6.4）：卡片轮询不再为找一条记录拉全量 state。
+      // jobId 跨会话同号（0.6.1 起分簿记账），卡片用回执里的 sessionId 精确
+      // 对号；缺 session 时取最近一条（无宿主会话信息的旧卡片兜底）。
       const id = parsed.searchParams.get('id')
-      const job = id ? state.tracker.snapshot().find(j => j.jobId === id) : undefined
+      const session = parsed.searchParams.get('session')
+      const candidates = state.tracker.snapshot().filter(j => j.jobId === id)
+      const job = (session !== null
+        ? candidates.filter(j => j.sessionId === session)
+        : candidates
+      ).at(-1)
       if (!job) return json(404, { error: `任务不在簿中：${id ?? '(缺 id)'}` })
       return json(200, { job })
     }
@@ -478,7 +521,7 @@ const WORKBENCH_HTML = `<!doctype html>
 <div id="unreachable" class="unreachable" hidden>工作台服务不可达（可能由宿主重启）。</div>
 <h2>片子（specs）</h2>
 <div id="specs" class="grid"><div class="empty">加载中…</div></div>
-<h2>渲染任务簿（本进程）</h2>
+<h2>渲染任务簿</h2>
 <div id="jobs"></div>
 <script>
 (function () {
@@ -530,7 +573,7 @@ const WORKBENCH_HTML = `<!doctype html>
   }
 
   function renderJobs(renders) {
-    if (!renders || renders.length === 0) return '<div class="empty">本进程暂无渲染/预览任务（宿主重启后任务簿清空，属设计内行为）。</div>';
+    if (!renders || renders.length === 0) return '<div class="empty">暂无渲染/预览任务记录。</div>';
     var rows = '';
     for (var i = renders.length - 1; i >= 0; i--) {
       var j = renders[i];
