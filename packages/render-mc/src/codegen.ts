@@ -56,8 +56,10 @@ export interface GenerateResult {
  * v6（0.6.0）：chart/curve/grid 三种新图层、filters/shadow 节点级属性、
  * text letterSpacing、image radius、motion path（followPath+progress）——
  * 生成语义整体扩面，旧段自然失效。
+ * v8：字幕 cue 反重叠钳制（终点钳到下一条 cue 起点），同输入下字幕时段
+ * 变了，旧段必须失效。
  */
-export const CODEGEN_VERSION = 7
+export const CODEGEN_VERSION = 8
 
 const COMMON_PROPS = ['x', 'y', 'opacity', 'scale', 'rotation'] as const
 
@@ -712,7 +714,7 @@ function easeExpr(
 
 /* ------------------------------------------------------------ 场景生成 */
 
-/** 一条字幕在本幕内的呈现时段（本地毫秒），由 planSubtitles 换算。 */
+/** 一条字幕在本幕内的呈现时段（本地毫秒），由 expandNarration 换算。 */
 export interface SubtitleCue {
   text: string
   startMs: number
@@ -1481,15 +1483,6 @@ export function collectAudioTracks(spec: AnimationSpec): { cues: AudioTrackCue[]
   return { cues, warnings }
 }
 
-/** 一条字幕在本幕内的呈现时段（本地毫秒）。 */
-export interface SubtitleCue {
-  text: string
-  startMs: number
-  endMs: number
-  /** 被幕尾截断、在后幕延续：渲染端不做出幕淡出（切幕守则，0.6.0）。 */
-  continues?: boolean
-}
-
 /**
  * 旁白字幕展开（§4.3）：把顶层 `narration.cues`（**全片绝对毫秒**）展开成
  * 各幕的 `scene.subtitles`（场景内本地毫秒），返回的 spec 不再带 narration。
@@ -1502,10 +1495,13 @@ export interface SubtitleCue {
  *
  * 规则：cue 缺省时长按中文语速估（≈4 字/秒，下限 1200ms）；配音渲染传
  * options.displayMs（与 cues 对齐的实测音频时长，0.5.0 §5）时显示时长取
- * 「估算与实测的较大者」——宁可字比声先消失，不让「声还在字没了」；跨幕 cue
- * 每幕各出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；
- * 超 80 字软警告（渲染端自动折行，不再截断——过长字幕画面偏挤，建议拆 cue）；
- * 起点越出全片时长给软警告。原 spec 不被修改。
+ * 「估算与实测的较大者」——宁可字比声先消失，不让「声还在字没了」。
+ * 反重叠钳制：cue 按 atMs 排序后，每条终点钳到下一条 cue 的起点——取大者
+ * 时长本就可能越过下一条 cue 的起点（真机 55/59 份回执命中），两条字幕同时
+ * 可见时渲染端画在同一位置、文字叠文字；宁可字幕早收，不叠。跨幕 cue 每幕
+ * 各出一份（画面独立，只能如此）；与本幕交集不足 30ms 的尾巴不生成；超 80 字
+ * 软警告（渲染端自动折行，不再截断——过长字幕画面偏挤，建议拆 cue）；起点
+ * 越出全片时长给软警告。原 spec 不被修改。
  */
 export function expandNarration(spec: AnimationSpec, options: { displayMs?: number[] } = {}): { spec: AnimationSpec; warnings: string[] } {
   const warnings: string[] = []
@@ -1515,15 +1511,21 @@ export function expandNarration(spec: AnimationSpec, options: { displayMs?: numb
   const expanded = cues.map((cue, i) => {
     const spokenMs = options.displayMs?.[i] ?? 0
     const estimated = cue.durationMs ?? Math.max(1200, Math.round((cue.text.length / 4) * 1000))
-    const durationMs = Math.max(estimated, spokenMs)
     if (cue.atMs >= totalMs) {
       warnings.push(`旁白 cue ${i}（${cue.atMs}ms）起于全片时长（${totalMs}ms）之外，不会出现`)
     }
     if (cue.text.length > 80) {
       warnings.push(`旁白 cue ${i} 超过 80 字，一条 cue 建议不超过 40 字（渲染时会自动折行，但整屏都是字幕观感偏挤）`)
     }
-    return { atMs: cue.atMs, durationMs, text: cue.text }
+    return { atMs: cue.atMs, durationMs: Math.max(estimated, spokenMs), text: cue.text }
   })
+  // displayMs 按原始 cue 序号对齐（上面取大者），排序必须放在取值之后
+  expanded.sort((a, b) => a.atMs - b.atMs)
+  for (let i = 0; i < expanded.length - 1; i++) {
+    const cue = expanded[i]!
+    const nextAt = expanded[i + 1]!.atMs
+    if (cue.atMs + cue.durationMs > nextAt) cue.durationMs = nextAt - cue.atMs
+  }
   const scenes: Scene[] = []
   let cursor = 0
   for (const scene of spec.scenes) {

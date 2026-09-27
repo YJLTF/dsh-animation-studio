@@ -634,9 +634,26 @@ export async function muxAudioTracks(
       '-movflags', '+faststart',
       tmp,
     ])
-    renameSync(tmp, videoPath)
+    renameWithRetries(tmp, videoPath)
   } finally {
     rmSync(tmp, { force: true })
+  }
+}
+
+/**
+ * Windows 上 rename 目标若正被占用（典型：杀软对新落盘 mp4 的扫描锁，真机
+ * 2026-09-25 实证 EPERM），一次性 rename 即失败、成片静默降级为无声版。
+ * 指数退避重试若干次仍失败才放行原错误。
+ */
+function renameWithRetries(from: string, to: string, attempts = 9): void {
+  for (let i = 0; ; i++) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (err) {
+      if (i >= attempts - 1) throw err
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(250 * 2 ** i, 4000))
+    }
   }
 }
 

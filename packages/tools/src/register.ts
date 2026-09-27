@@ -383,7 +383,32 @@ export function registerAnimTools(ctx: Context, options: RegisterOptions): Dispo
     }
     return result
   }
+  /**
+   * dsh 0.1.7-rc.2 对 `output.presentationMeta` 做无损 JSON 校验：含 `undefined`
+   * 值字段的对象会判死整个工具输出（`ToolOutputError: presentationMeta returned
+   * non-lossless JSON`）。真机事故（2026-09-25）：anim_get 的 presentationMeta
+   * 按 `value.path ?? undefined` 直取字段，读摘要/整份时 path/view/durationMs
+   * 皆 undefined，导致 anim_get 全军覆没、模型全程读不到 spec。
+   * 统一在注册层做无损清洗，任何工具的 presentationMeta 都不再裸暴露 undefined。
+   */
+  const lossless = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(lossless)
+    if (value !== null && typeof value === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (v !== undefined) out[k] = lossless(v)
+      }
+      return out
+    }
+    return value
+  }
   const register = (definition: Parameters<typeof ctx.tools.register>[0]) => {
+    // 单一收口（续）：presentationMeta 同样过一道无损清洗（理由见 lossless 注释）
+    const output = definition.output as { presentationMeta?: ((args: never, value: unknown) => unknown) | undefined } | undefined
+    if (output?.presentationMeta) {
+      const originalMeta = output.presentationMeta
+      output.presentationMeta = ((args: never, value: unknown) => lossless(originalMeta(args, value))) as never
+    }
     // 单一收口：每个工具执行前做会话懒恢复（事件归因由 emitFor 按调用绑定）
     const originalExecute = definition.execute as ((args: never, exec: never) => unknown) | undefined
     if (originalExecute) {
