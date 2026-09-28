@@ -2232,6 +2232,31 @@ check('expandNarration: cue 展开为各幕 scene.subtitles（本地毫秒）—
   assert.equal(expandNarration(edge).spec.scenes[1]!.subtitles, undefined)
 })
 
+check('expandNarration: 反重叠钳制——cue 终点不越过下一条起点，乱序输入先排序（真机 55/59 份回执字幕叠字的回归）', () => {
+  const spec = demoSpec()
+  spec.scenes = [{ id: 'a', name: '一', durationMs: 8000, layers: [] }] as never
+  spec.narration = {
+    cues: [
+      { atMs: 0, text: '这条估算有四秒长会压过下一条' }, // est ≈ 3500ms，旧逻辑 [0, 3500) 压过 2500
+      { atMs: 2500, text: '下一条其实在这个点开始' },
+      { atMs: 2000, text: '乱序输入' }, // 故意乱序：排序后它夹在 0 与 2500 之间
+    ],
+  }
+  const { spec: expanded } = expandNarration(spec)
+  const subs = expanded.scenes[0]!.subtitles ?? []
+  // 排序后起点 0 / 2000 / 2500；每条终点钳到下一条起点，严格不相交
+  assert.deepEqual(subs.map(s => [s.startMs, s.endMs]), [[0, 2000], [2000, 2500], [2500, 5250]])
+  for (let i = 0; i < subs.length - 1; i++) {
+    assert.ok(subs[i]!.endMs <= subs[i + 1]!.startMs, `cue ${i} 与下一条重叠: ${JSON.stringify(subs.slice(i, i + 2))}`)
+  }
+  // 配音时长（displayMs 按原始序号对齐）参与取大者、随后同样被钳制
+  const spoken = demoSpec()
+  spoken.scenes = [{ id: 'a', name: '一', durationMs: 8000, layers: [] }] as never
+  spoken.narration = { cues: [{ atMs: 0, text: '短' }, { atMs: 1200, text: '紧随其后' }] }
+  const withSpeech = expandNarration(spoken, { displayMs: [3000, 1000] }).spec
+  assert.deepEqual(withSpeech.scenes[0]!.subtitles!.map(s => [s.startMs, s.endMs]), [[0, 1200], [1200, 2400]])
+})
+
 check('codegen: 字幕切幕守则——淡出提前到幕尾前收完、正点 cue 不受影响', () => {
   const spec = demoSpec()
   spec.scenes[0].subtitles = [
